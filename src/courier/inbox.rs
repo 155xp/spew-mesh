@@ -92,11 +92,17 @@ impl<L: Links> Courier<L> {
             .attach(&c.store, conn.id(), &opened.session.id)
             .map_err(store_err)?;
         if let Some(limits) = &p.serve {
-            // A re-open (after a lost connection) keeps the runs already counted this hour.
-            c.gates
-                .entry(opened.session.id.clone())
-                .and_modify(|g| g.update(limits))
-                .or_insert_with(|| crate::responder::limits::Gate::new(limits));
+            // A re-open (after a lost connection) keeps the runs already counted this hour, also when the session
+            // had lapsed and this is a new one.
+            let carried = opened
+                .session
+                .client_session
+                .clone()
+                .and_then(|cs| c.ended_gates.remove(&(opened.session.client.clone(), cs)));
+            let gate = c.gates.entry(opened.session.id.clone()).or_insert_with(|| {
+                carried.unwrap_or_else(|| crate::responder::limits::Gate::new(limits))
+            });
+            gate.update(limits);
         }
         for gone in &opened.merged {
             self.waits.wake(gone);

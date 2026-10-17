@@ -122,6 +122,9 @@ pub(crate) struct Core {
     remote: RemotePresence,
     guard: Guard,
     gates: HashMap<String, crate::responder::limits::Gate>,
+    /// Gates of ended responder sessions by (client, client session), for runs counted this hour: a responder
+    /// whose session lapsed (6.4 rule 3) re-opens as a new session and keeps its counts.
+    ended_gates: HashMap<(String, String), crate::responder::limits::Gate>,
     waiting_asks: HashMap<String, usize>,
     in_flight: HashSet<i64>,
     pumping: HashSet<String>,
@@ -220,6 +223,7 @@ impl<L: Links> Courier<L> {
                 remote,
                 guard: Guard::default(),
                 gates: HashMap::new(),
+                ended_gates: HashMap::new(),
                 waiting_asks: HashMap::new(),
                 in_flight: HashSet::new(),
                 pumping: HashSet::new(),
@@ -464,13 +468,8 @@ impl<L: Links> Courier<L> {
                 return;
             }
         }
-        let name = c
-            .store
-            .session(id)
-            .ok()
-            .flatten()
-            .map(|s| s.name)
-            .unwrap_or_default();
+        let ended = c.store.session(id).ok().flatten();
+        let name = ended.as_ref().map(|s| s.name.clone()).unwrap_or_default();
         tracing::info!(session = %name, reason = reason.as_str(), "session ended");
         warn_store(
             c.store.clear_cards(id),
@@ -487,7 +486,14 @@ impl<L: Links> Courier<L> {
             }
         }
         c.reg.forget(id);
-        c.gates.remove(id);
+        if let Some(gate) = c.gates.remove(id)
+            && let Some(record) = ended.filter(|s| s.kind == SessionKind::Responder)
+            && let Some(cs) = record.client_session
+        {
+            c.ended_gates
+                .retain(|_, g| g.limits().total_in_window(now) > 0);
+            c.ended_gates.insert((record.client, cs), gate);
+        }
         for sid in &ids {
             self.waits.wake(sid);
             self.waits.forget(sid);

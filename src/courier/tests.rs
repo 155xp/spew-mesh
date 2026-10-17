@@ -1229,6 +1229,45 @@ async fn a_responders_own_limits_apply_when_questions_arrive() {
 }
 
 #[tokio::test]
+async fn a_responder_that_lapsed_and_re_opened_keeps_its_counts() {
+    let net = MemNet::new();
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    let one = GateSettings {
+        from: ServeFrom::Room,
+        max_runs_per_person_per_hour: 1,
+        max_runs_per_hour: 30,
+    };
+    let open = |client_session: &str| {
+        let mut p = responder_open(&maya, SessionKind::Responder, Some(one));
+        p.client_session = Some(client_session.into());
+        maya.courier.open_session(&maya.conn(), p).unwrap()
+    };
+    let first = open("serve-a");
+    let to = (first.session.as_str(), first.name.as_str());
+    assert!(accepted(
+        &deliver(&maya, envelope("ask", None, None, to)).await
+    ));
+    maya.courier.close_session(&first.token).unwrap();
+
+    // The same serve process opens again and gets a new session: sam's run this hour still counts.
+    let again = open("serve-a");
+    assert_ne!(again.session, first.session);
+    let to = (again.session.as_str(), again.name.as_str());
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::Busy
+    ));
+    maya.courier.close_session(&again.token).unwrap();
+
+    // Another serve process starts with its own counts.
+    let other = open("serve-b");
+    let to = (other.session.as_str(), other.name.as_str());
+    assert!(accepted(
+        &deliver(&maya, envelope("ask", None, None, to)).await
+    ));
+}
+
+#[tokio::test]
 async fn asks_from_own_devices_count_only_toward_the_total() {
     let net = MemNet::new();
     let sam = Node::new(&net, SAM_MAC, "sam", "sam-mac");

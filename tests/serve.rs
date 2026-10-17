@@ -266,11 +266,11 @@ impl Serve {
 
     // Ctrl-C, then the exit code.
     fn interrupt(&mut self) -> i32 {
-        let status = Command::new("kill")
-            .args(["-INT", &self.child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        kill("-INT", self.child.id());
+        self.exit_code()
+    }
+
+    fn exit_code(&mut self) -> i32 {
         let deadline = Instant::now() + WAIT;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -286,6 +286,23 @@ impl Drop for Serve {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn kill(signal: &str, pid: u32) {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// A stopped daemon, continued when dropped so the [`Mesh`] can stop it.
+struct Paused(u32);
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        kill("-CONT", self.0);
     }
 }
 
@@ -527,6 +544,31 @@ fn a_reconnecting_serve_leaves_a_stopped_daemon_stopped() {
     assert_eq!(code(&asked), 0, "{}", stderr(&asked));
     assert!(stdout(&asked).contains("answer 1"), "{}", stdout(&asked));
     assert_eq!(serve.interrupt(), 0);
+}
+
+#[test]
+fn a_second_ctrl_c_stops_serve_at_once() {
+    let mesh = Mesh::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = mesh.api();
+    let mut serve = mesh.serve(&["claude", "--cwd", api.to_str().unwrap()]);
+    serve.wait_for("Serving claude in");
+
+    // With the daemon not answering, the first Ctrl-C waits up to 5 s for `session.close`; the second ends serve.
+    let pid = rt.block_on(async { mesh.client().await.status().await.unwrap().pid });
+    kill("-STOP", pid);
+    let paused = Paused(pid);
+    let started = Instant::now();
+    kill("-INT", serve.child.id());
+    std::thread::sleep(Duration::from_millis(300));
+    kill("-INT", serve.child.id());
+    assert_eq!(serve.exit_code(), 130);
+    assert!(
+        started.elapsed() < runloop::CLOSE_WAIT,
+        "{:?}",
+        started.elapsed()
+    );
+    drop(paused);
 }
 
 // ---------------------------------------------------------------------------------------------------------

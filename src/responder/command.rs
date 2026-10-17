@@ -169,24 +169,35 @@ async fn serve(
     }
 }
 
-// Turns `stop` true on Ctrl-C, SIGTERM or SIGHUP.
+// Turns `stop` true on Ctrl-C, SIGTERM or SIGHUP, and exits with 130 on a second one, so a daemon that doesn't
+// answer can't hold a stopping serve. By then the loop has dropped the run, which killed its process group.
 async fn stop_on_signal(stop: watch::Sender<bool>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    async fn on(kind: SignalKind) {
-        match signal(kind) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            // Without the handler the default action applies, which ends the process anyway.
-            Err(_) => std::future::pending::<()>().await,
+    use tokio::signal::unix::{Signal, SignalKind, signal};
+    async fn next(s: &mut Option<Signal>) {
+        let got = match s {
+            Some(s) => s.recv().await,
+            None => None,
+        };
+        // Without the handler the default action applies, which ends the process anyway.
+        if got.is_none() {
+            std::future::pending::<()>().await;
         }
     }
-    tokio::select! {
-        _ = on(SignalKind::interrupt()) => {}
-        _ = on(SignalKind::terminate()) => {}
-        _ = on(SignalKind::hangup()) => {}
+    let mut int = signal(SignalKind::interrupt()).ok();
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut hup = signal(SignalKind::hangup()).ok();
+    for first in [true, false] {
+        tokio::select! {
+            _ = next(&mut int) => {}
+            _ = next(&mut term) => {}
+            _ = next(&mut hup) => {}
+        }
+        if first {
+            let _ = stop.send(true);
+        } else {
+            std::process::exit(130);
+        }
     }
-    let _ = stop.send(true);
 }
 
 // Writes the loop's events to the terminal and the log. Peer text is cut to one clean line (10).

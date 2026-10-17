@@ -780,7 +780,12 @@ async fn a_device_that_leaves_every_shared_room_loses_its_mail_and_presence() {
     // A reply to a device that left is refused at once instead of waiting a day in the outbox.
     let too_late = maya.reply(&token, &later_id, "thanks", None).await;
     assert_eq!(too_late.status, SendStatus::Refused);
-    assert_eq!(too_late.code.as_deref(), Some("no-such-session"));
+    assert_eq!(too_late.code.as_deref(), Some(NOT_SHARED));
+    assert!(
+        too_late.note.contains("no longer in a shared room"),
+        "{}",
+        too_late.note
+    );
 
     let stored = maya
         .courier

@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::outbox::retry_delay_ms;
 use super::outbox::{Attempt, read_deliver_response};
-use super::{Core, Courier, RECEIPT_WAIT, refusal_reason, render, store_err, warn_store};
+use super::{
+    Core, Courier, NOT_SHARED, RECEIPT_WAIT, refusal_reason, render, store_err, warn_store,
+};
 use crate::address::{Address, is_card};
 use crate::control::protocol::{
     AnswerView, AskParams, ReplyParams, RpcError, SendResult, SendStatus, TellParams,
@@ -76,7 +78,18 @@ enum Sent {
     Delivered,
     Queued(String),
     Refused(RefusalCode),
+    /// The target's device left every room we share (4.3); nothing went out.
+    NotShared,
 }
+
+impl Sent {
+    fn is_refused(&self) -> bool {
+        matches!(self, Sent::Refused(_) | Sent::NotShared)
+    }
+}
+
+/// Why mail to a device that left every shared room fails, in the words of 4.3.
+const NOT_SHARED_REASON: &str = "that device is no longer in a shared room";
 
 struct Outgoing {
     kind: MessageKind,
@@ -264,7 +277,7 @@ impl<L: Links> Courier<L> {
         // A reply goes to whoever wrote, without resolving an address; a device that has left every shared room
         // can't take it, and queueing it would only let it expire a day later (4.3).
         if !c.roster.admission().is_admitted(&device) {
-            return Ok((msg, Sent::Refused(RefusalCode::NoSuchSession), None));
+            return Ok((msg, Sent::NotShared, None));
         }
         if !c.guard.allows(&msg.conversation, now) {
             return Ok((msg, Sent::Refused(RefusalCode::ConversationLimit), None));
@@ -366,7 +379,7 @@ impl<L: Links> Courier<L> {
         let (msg, sent, attempt) = {
             let mut c = self.core();
             let routed = self.route(&mut c, &sender, &target, out)?;
-            if waiting_ask && !matches!(routed.1, Sent::Refused(_)) {
+            if waiting_ask && !routed.1.is_refused() {
                 *c.waiting_asks.entry(routed.0.id.clone()).or_default() += 1;
             }
             routed
@@ -404,6 +417,11 @@ impl<L: Links> Courier<L> {
                 Some(code.as_str().to_string()),
                 Some(refusal_reason(*code).to_string()),
             ),
+            Sent::NotShared => (
+                SendStatus::Refused,
+                Some(NOT_SHARED.to_string()),
+                Some(NOT_SHARED_REASON.to_string()),
+            ),
         };
         SendResult {
             status,
@@ -438,6 +456,7 @@ impl<L: Links> Courier<L> {
             Sent::Refused(code) => {
                 format!("{} refused it: {}.", target.address, refusal_reason(*code))
             }
+            Sent::NotShared => format!("Not sent to {}: {NOT_SHARED_REASON}.", target.address),
         }
     }
 
@@ -502,7 +521,7 @@ impl<L: Links> Courier<L> {
         let started = Instant::now();
         let sender_id = sender.id.clone();
         let (msg, sent) = self.send_one(sender, target.clone(), out, true).await?;
-        if let Sent::Refused(_) = sent {
+        if sent.is_refused() {
             let unread = self.unread_count(&self.core(), &sender_id);
             return Ok(self.result(
                 &msg,
@@ -595,21 +614,13 @@ impl<L: Links> Courier<L> {
                 ),
             ),
             Some((MessageState::Refused, code)) => {
-                let code = code.and_then(|c| RefusalCode::from_name(&c));
-                let mut r = self.result(
-                    &msg,
-                    &target,
-                    &Sent::Refused(code.unwrap_or(RefusalCode::NoSuchSession)),
-                    String::new(),
-                    unread_after(&c),
-                );
-                r.note = match code {
-                    Some(code) => {
-                        format!("{} refused it: {}.", target.address, refusal_reason(code))
-                    }
-                    None => format!("{} is no longer in a room you share.", target.address),
+                // The only code kept that isn't a peer's refusal is the one for a device that left (4.3).
+                let sent = match code.and_then(|c| RefusalCode::from_name(&c)) {
+                    Some(code) => Sent::Refused(code),
+                    None => Sent::NotShared,
                 };
-                return Ok(r);
+                let note = Self::sent_note(&target, &sent);
+                return Ok(self.result(&msg, &target, &sent, note, unread_after(&c)));
             }
             Some((MessageState::Expired, _)) => (
                 SendStatus::Expired,

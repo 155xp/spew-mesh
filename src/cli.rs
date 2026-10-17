@@ -19,9 +19,10 @@ use crate::agents::setup::{ClientPaths, Options as SetupOptions, Setup, Wiring, 
 use crate::control::client::{Client, ClientError, ConnectOptions, wait_for_exit};
 use crate::control::protocol::{
     AskParams, DirectoryQuery, FetchParams, LoginResult, ReplyParams, SendStatus, SessionOpen,
-    TellParams,
+    Status, TellParams, method,
 };
 use crate::daemon::DaemonOptions;
+use crate::daemon::status::NetworkDetails;
 use crate::identity::DeviceIdentity;
 use crate::paths::{Home, user_home_from_env};
 use crate::settings::{Env, PROJECT_ENV, Settings};
@@ -414,8 +415,35 @@ async fn sign_in(client: &Client) -> Result<LoginResult, ClientError> {
     client.login(|url| SystemBrowser.open(url)).await
 }
 
+/// `daemon.status` with its network object in full; a daemon that sends less leaves the extra fields empty.
+pub async fn full_status(client: &Client) -> anyhow::Result<(Status, NetworkDetails)> {
+    let value = client
+        .call_value(method::DAEMON_STATUS, serde_json::json!({}))
+        .await?;
+    let network = match value.get("network") {
+        Some(n) => serde_json::from_value(n.clone()).context("the daemon's network status")?,
+        None => NetworkDetails::default(),
+    };
+    let status = serde_json::from_value(value).context("the daemon's status")?;
+    Ok((status, network))
+}
+
+// How a stop is meant to last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    // `daemon stop` and `uninstall`: reconnecting MCP servers and responders leave it stopped (6.1, 12).
+    StayStopped,
+    // A restart the command does itself right after.
+    Restart,
+}
+
 // Stops a running daemon and waits for it to exit; false when none was running.
-async fn stop_daemon(home: &Home) -> anyhow::Result<bool> {
+async fn stop_daemon(home: &Home, how: Stop) -> anyhow::Result<bool> {
+    // Written first, so a client that sees the daemon go doesn't start it again.
+    if how == Stop::StayStopped {
+        home.mark_stopped()
+            .context("can't record that the daemon is stopped")?;
+    }
     let Ok(client) = Client::connect(home, &ConnectOptions::existing()).await else {
         return Ok(false);
     };
@@ -470,7 +498,7 @@ fn setup(
     block_on(async {
         // A new name takes effect when the daemon starts again.
         if renamed {
-            stop_daemon(home).await?;
+            stop_daemon(home, Stop::Restart).await?;
         }
         let client = connect(home).await?;
         let status = client.status().await?;
@@ -505,7 +533,7 @@ fn uninstall(home: &Home, purge: bool) -> anyhow::Result<ExitCode> {
     for line in &report.lines {
         println!("{line}");
     }
-    if block_on(stop_daemon(home))? {
+    if block_on(stop_daemon(home, Stop::StayStopped))? {
         println!("Stopped the spew mesh daemon.");
     }
     if purge {
@@ -719,8 +747,9 @@ async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
     }
     match Client::connect(home, &ConnectOptions::existing()).await {
         Ok(client) => {
-            let status = client.status().await?;
-            print!("{}", output::status_details(&status, now_ms()));
+            let (status, network) = full_status(&client).await?;
+            print!("{}", output::status_details(&status, &network, now_ms()));
+            fixes += output::network_fixes(&network);
             if status.version != crate::control::client::own_version() {
                 fixes += 1;
                 println!(
@@ -732,6 +761,11 @@ async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
             if status.roster.problem.is_some() {
                 fixes += 1;
             }
+        }
+        Err(ClientError::NotRunning) if home.is_stopped() => {
+            println!(
+                "daemon: stopped with `spew mesh daemon stop`; any spew mesh command, a new agent session or an agent's mesh tool starts it"
+            );
         }
         Err(ClientError::NotRunning) => {
             println!("daemon: not running; any spew mesh command or agent session starts it");
@@ -775,7 +809,7 @@ fn daemon(home: &Home, command: DaemonCommand) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }),
         DaemonCommand::Stop => block_on(async {
-            if stop_daemon(home).await? {
+            if stop_daemon(home, Stop::StayStopped).await? {
                 println!("Stopped the spew mesh daemon.");
             } else {
                 println!("The spew mesh daemon isn't running.");
@@ -785,8 +819,8 @@ fn daemon(home: &Home, command: DaemonCommand) -> anyhow::Result<ExitCode> {
         DaemonCommand::Status => block_on(async {
             match Client::connect(home, &ConnectOptions::existing()).await {
                 Ok(client) => {
-                    let status = client.status().await?;
-                    print!("{}", output::status_details(&status, now_ms()));
+                    let (status, network) = full_status(&client).await?;
+                    print!("{}", output::status_details(&status, &network, now_ms()));
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(ClientError::NotRunning) => {

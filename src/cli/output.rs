@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use crate::control::protocol::{Directory, Fetched, SendResult, SendStatus, SessionRow, Status};
+use crate::daemon::status::NetworkDetails;
 use crate::spew_api::DeviceInfo;
 use crate::text::{sanitize_line, sanitize_text};
 use crate::wire::{ActivityState, Reach, SessionKind};
@@ -170,7 +171,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// Daemon state in full, for `daemon status` and `doctor`.
-pub fn status_details(s: &Status, now: u64) -> String {
+pub fn status_details(s: &Status, net: &NetworkDetails, now: u64) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -204,25 +205,93 @@ pub fn status_details(s: &Status, now: u64) -> String {
     if let Some(problem) = &r.problem {
         let _ = writeln!(out, "fix: {}", line(problem));
     }
-    let mut network = format!("network: {}", line(&s.network.network));
-    if let Some(relay) = &s.network.relay {
-        let _ = write!(network, ", relay {}", line(relay));
-    }
-    let _ = writeln!(out, "{network}");
-    for link in &s.network.links {
-        let short = link.device.get(..10).unwrap_or(&link.device);
-        let rtt = link.rtt_ms.map(|r| format!(", {r} ms")).unwrap_or_default();
-        let _ = writeln!(out, "  link {short}: {}{rtt}", line(&link.path));
-    }
-    if !s.bound_sockets.is_empty() {
-        let _ = writeln!(out, "bound: {}", s.bound_sockets.join(", "));
-    }
+    out.push_str(&network(net, now));
     let _ = writeln!(
         out,
         "sessions: {}, unread: {}, queued: {}, online devices: {}",
         s.counts.sessions, s.counts.unread, s.counts.outbox, s.counts.online
     );
     out
+}
+
+/// The network part of `daemon status` and `doctor` (5.1, 5.3): mode, endpoint, home relay and its status,
+/// bound sockets, each admitted device's link, and problems as `fix:` lines when a person can act on them.
+pub fn network(net: &NetworkDetails, now: u64) -> String {
+    let mut out = String::new();
+    let mut head = format!("network: {}", line(&net.network));
+    if net.network == "off" {
+        head.push_str(" (no other device is admitted)");
+    }
+    if let Some(id) = &net.endpoint_id {
+        let _ = write!(head, ", endpoint {}", id.get(..10).unwrap_or(id));
+    }
+    let _ = writeln!(out, "{head}");
+    for relay in &net.relays {
+        let mut text = format!("  home relay {}: ", line(&relay.url));
+        if relay.connected {
+            text.push_str("connected");
+        } else {
+            text.push_str("not connected");
+            if let Some(e) = &relay.error {
+                let _ = write!(text, " ({})", line(e));
+            }
+        }
+        let _ = writeln!(out, "{text}");
+        if let Some(why) = &relay.auth_denied {
+            let _ = writeln!(
+                out,
+                "fix: relay {} refused relay_token: {}",
+                line(&relay.url),
+                line(why)
+            );
+        }
+    }
+    if !net.bound_sockets.is_empty() {
+        let _ = writeln!(out, "bound: {}", net.bound_sockets.join(", "));
+    }
+    for d in &net.devices {
+        let mut parts = vec![format!("{}@{}", line(&d.person), line(&d.name))];
+        if d.online {
+            parts.push("online".into());
+            if let Some(path) = &d.path {
+                parts.push(line(path));
+            }
+            if let Some(rtt) = d.rtt_ms {
+                parts.push(format!("{rtt} ms"));
+            }
+        } else {
+            match d.last_seen {
+                Some(t) => parts.push(format!("offline, last seen {} ago", age(now, t))),
+                None => parts.push("offline".into()),
+            }
+        }
+        let _ = writeln!(out, "  link {}", parts.join(", "));
+    }
+    if let Some(e) = &net.error {
+        let _ = writeln!(out, "fix: the network endpoint didn't start: {}", line(e));
+    }
+    for p in &net.problems {
+        let mark = if p.needs_fixing() { "fix" } else { "  note" };
+        let _ = writeln!(
+            out,
+            "{mark}: {} {} ago: {}",
+            line(&net.device_label(&p.device)),
+            age(now, p.at_ms),
+            line(&p.detail)
+        );
+    }
+    out
+}
+
+/// How many `fix:` lines [`network`] prints.
+pub fn network_fixes(net: &NetworkDetails) -> usize {
+    usize::from(net.error.is_some())
+        + net.problems.iter().filter(|p| p.needs_fixing()).count()
+        + net
+            .relays
+            .iter()
+            .filter(|r| r.auth_denied.is_some())
+            .count()
 }
 
 /// A send result for the terminal: what happened, the answer when one came, and the message id.
@@ -306,6 +375,84 @@ mod tests {
         assert_eq!(age(5_000, 1_000), "4s");
         assert_eq!(age(3 * 86_400_000, 0), "3d");
         assert_eq!(age(0, 9_000), "0s");
+    }
+
+    #[test]
+    fn the_network_shows_links_relays_and_what_to_fix() {
+        use crate::daemon::status::{DeviceLink, ProblemRow, RelayRow};
+        let net = NetworkDetails {
+            network: "n0".into(),
+            endpoint_id: Some("ab".repeat(32)),
+            relay: None,
+            relays: vec![RelayRow {
+                url: "https://relay.example.com/".into(),
+                connected: false,
+                error: Some("timed out".into()),
+                auth_denied: None,
+            }],
+            bound_sockets: vec!["0.0.0.0:7461".into()],
+            devices: vec![
+                DeviceLink {
+                    endpoint_id: "cd".repeat(32),
+                    name: "maya-mbp".into(),
+                    person: "maya".into(),
+                    online: true,
+                    last_seen: None,
+                    path: Some("direct".into()),
+                    rtt_ms: Some(4),
+                },
+                DeviceLink {
+                    endpoint_id: "ef".repeat(32),
+                    name: "lee-linux".into(),
+                    person: "lee".into(),
+                    online: false,
+                    last_seen: Some(1_000),
+                    path: None,
+                    rtt_ms: None,
+                },
+            ],
+            problems: vec![
+                ProblemRow {
+                    device: "ef".repeat(32),
+                    problem: "refused".into(),
+                    detail: "it refused the link: its roster doesn't admit this device".into(),
+                    at_ms: 1_000,
+                },
+                ProblemRow {
+                    device: "12".repeat(32),
+                    problem: "unreachable".into(),
+                    detail: "no link within 15 s".into(),
+                    at_ms: 1_000,
+                },
+            ],
+            ..NetworkDetails::default()
+        };
+        let text = network(&net, 61_000);
+        assert!(text.contains("network: n0, endpoint ababababab"), "{text}");
+        assert!(text.contains("home relay https://relay.example.com/: not connected (timed out)"));
+        assert!(text.contains("bound: 0.0.0.0:7461"));
+        assert!(
+            text.contains("link maya@maya-mbp, online, direct, 4 ms"),
+            "{text}"
+        );
+        assert!(text.contains("link lee@lee-linux, offline, last seen 1m ago"));
+        assert!(
+            text.contains("fix: lee@lee-linux 1m ago: it refused the link"),
+            "{text}"
+        );
+        assert!(
+            text.contains("note: 1212121212 1m ago: no link within 15 s"),
+            "{text}"
+        );
+        assert_eq!(network_fixes(&net), 1);
+        let off = network(
+            &NetworkDetails {
+                network: "off".into(),
+                ..NetworkDetails::default()
+            },
+            0,
+        );
+        assert_eq!(off, "network: off (no other device is admitted)\n");
     }
 
     #[test]

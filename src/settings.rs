@@ -145,7 +145,7 @@ pub struct PresenceSettings {
 pub struct ServeSettings {
     /// Run timeout.
     pub timeout_seconds: u64,
-    /// Claude Code and OpenCode turn cap.
+    /// Turn cap for Claude Code runs (`--max-turns`).
     pub max_turns: u32,
     /// Who may ask.
     pub from: ServeFrom,
@@ -417,7 +417,8 @@ impl Settings {
             None => defaults.roster.file,
             Some(f) => {
                 let expanded = expand_tilde(&f, user_home);
-                if f.starts_with('~') && expanded == Path::new(&f) {
+                // Only `~` and `~/...` expand; `~maya/x` is an ordinary relative path.
+                if (f == "~" || f.starts_with("~/")) && user_home.is_none() {
                     return Err(format!(
                         "[roster] file = \"{f}\" starts with ~ but HOME is not set"
                     ));
@@ -861,13 +862,25 @@ max_budget_usd = 1
     fn relative_roster_file_is_inside_home() {
         let s = parse("[roster]\nfile = \"team.toml\"\n").unwrap();
         assert_eq!(s.roster.file, PathBuf::from("/m/team.toml"));
-        let no_home = Settings::parse(
-            "[roster]\nfile = \"~/r.toml\"\n",
+        for needs_home in ["~", "~/r.toml"] {
+            let no_home = Settings::parse(
+                &format!("[roster]\nfile = \"{needs_home}\"\n"),
+                Path::new("s"),
+                &home(),
+                None,
+            )
+            .unwrap_err();
+            assert!(no_home.to_string().contains("HOME is not set"), "{no_home}");
+        }
+        // Only `~` and `~/...` expand; `~maya/x` is a relative path and never needs HOME.
+        let other_user = Settings::parse(
+            "[roster]\nfile = \"~maya/x\"\n",
             Path::new("s"),
             &home(),
             None,
-        );
-        assert!(no_home.is_err());
+        )
+        .unwrap();
+        assert_eq!(other_user.roster.file, PathBuf::from("/m/~maya/x"));
     }
 
     #[test]

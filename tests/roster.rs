@@ -3,11 +3,10 @@
 
 mod spew_api_mock;
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use spew_api_mock::{MockSpew, TestClock, browser};
+use spew_api_mock::{MockSpew, TestClock, sign_in_with};
 use spew_mesh::roster::spew::{
     Peers, PeersFetch, RefreshOutcome, SpewRosterCache, SpewRosterState, UnknownPeerRefresh,
     refresh,
@@ -338,11 +337,8 @@ async fn refresh_against_spew_handles_304_and_401() {
     let dir = tempfile::tempdir().unwrap();
     let clock = TestClock::at(T0);
     let api = mock.api(dir.path(), clock.clone());
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let signed = api
-        .login(&browser(vec![], seen), Duration::from_secs(10))
-        .await
-        .unwrap();
+    let (result, _) = sign_in_with(&api, vec![], Duration::from_secs(10)).await;
+    let signed = result.unwrap();
     let mut cache = SpewRosterCache::new(signed.me);
 
     assert_eq!(

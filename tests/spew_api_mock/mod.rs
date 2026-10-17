@@ -233,16 +233,22 @@ pub fn api_for(base: &str, dir: &std::path::Path, clock: Arc<TestClock>) -> Spew
     )
 }
 
-/// What the test browser does with the callback URL before delivering the real one.
+/// What the test browser does besides delivering the real callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detour {
+    /// Before it: the callback with a wrong state.
     WrongState,
+    /// Before it: the callback without a state.
     NoState,
+    /// Before it: another path on the listener.
     WrongPath,
+    /// After it: a second callback with the right state and a forged code.
+    SecondCallback,
 }
 
-/// A browser that follows the authorize URL to the mock's redirect, makes the detours first, then delivers the
-/// callback. The statuses the loopback listener answered are pushed to `seen`.
+/// A browser that follows the authorize URL to the mock's redirect, then makes the requests its detours ask for
+/// around the real callback. Every status it gets is pushed to `seen`, the authorize redirect first; a request
+/// that fails records 0. Nothing panics in the browser task, so a failure shows in the test's own asserts.
 pub fn browser(
     detours: Vec<Detour>,
     seen: Arc<Mutex<Vec<u16>>>,
@@ -252,42 +258,100 @@ pub fn browser(
         let detours = detours.clone();
         let seen = seen.clone();
         tokio::spawn(async move {
-            let http = reqwest::Client::builder()
+            let record = |status: u16| seen.lock().unwrap().push(status);
+            let Ok(http) = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap();
-            let resp = http.get(&url).send().await.unwrap();
-            assert_eq!(resp.status(), 302, "authorize should redirect");
-            let location = resp.headers()["location"].to_str().unwrap().to_string();
-            let callback = url::Url::parse(&location).unwrap();
-            for detour in detours {
-                let mut wrong = callback.clone();
-                match detour {
-                    Detour::WrongPath => wrong.set_path("/favicon.ico"),
-                    Detour::WrongState | Detour::NoState => {
-                        let pairs: Vec<(String, String)> = callback
-                            .query_pairs()
-                            .into_owned()
-                            .filter(|(k, _)| k != "state")
-                            .collect();
-                        let mut q = wrong.query_pairs_mut();
-                        q.clear();
-                        for (k, v) in &pairs {
-                            q.append_pair(k, v);
-                        }
-                        if detour == Detour::WrongState {
-                            q.append_pair("state", "not-the-state");
-                        }
-                    }
+            else {
+                return record(0);
+            };
+            let get = |target: url::Url| {
+                let http = http.clone();
+                async move {
+                    http.get(target)
+                        .send()
+                        .await
+                        .map_or(0, |r| r.status().as_u16())
                 }
-                let status = http.get(wrong).send().await.unwrap().status().as_u16();
-                seen.lock().unwrap().push(status);
+            };
+            let Ok(resp) = http.get(&url).send().await else {
+                return record(0);
+            };
+            record(resp.status().as_u16());
+            let Some(callback) = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| url::Url::parse(l).ok())
+            else {
+                return;
+            };
+            let with_query = |state: Option<&str>, code: Option<&str>| {
+                let mut target = callback.clone();
+                let pairs: Vec<(String, String)> = callback
+                    .query_pairs()
+                    .into_owned()
+                    .filter(|(k, _)| k != "state" && (code.is_none() || k != "code"))
+                    .collect();
+                let mut q = target.query_pairs_mut();
+                q.clear();
+                for (k, v) in &pairs {
+                    q.append_pair(k, v);
+                }
+                if let Some(code) = code {
+                    q.append_pair("code", code);
+                }
+                if let Some(state) = state {
+                    q.append_pair("state", state);
+                }
+                drop(q);
+                target
+            };
+            let state = callback
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.into_owned());
+            for detour in &detours {
+                let target = match detour {
+                    Detour::WrongPath => {
+                        let mut t = callback.clone();
+                        t.set_path("/favicon.ico");
+                        t
+                    }
+                    Detour::WrongState => with_query(Some("not-the-state"), None),
+                    Detour::NoState => with_query(None, None),
+                    Detour::SecondCallback => continue,
+                };
+                record(get(target).await);
             }
-            let status = http.get(callback).send().await.unwrap().status().as_u16();
-            seen.lock().unwrap().push(status);
+            record(get(callback.clone()).await);
+            if detours.contains(&Detour::SecondCallback) {
+                record(get(with_query(state.as_deref(), Some("forged-code"))).await);
+            }
         });
     }
+}
+
+/// Signs in through [`browser`] and checks that the authorize request redirected before anything else, so a
+/// broken redirect fails here instead of as a sign-in timeout.
+pub async fn sign_in_with(
+    api: &SpewApi,
+    detours: Vec<Detour>,
+    timeout: std::time::Duration,
+) -> (
+    Result<spew_mesh::spew_api::SignedIn, spew_mesh::spew_api::ApiError>,
+    Vec<u16>,
+) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let result = api.login(&browser(detours, seen.clone()), timeout).await;
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.first(),
+        Some(&302),
+        "authorize should redirect: {seen:?}"
+    );
+    (result, seen)
 }
 
 struct Request {

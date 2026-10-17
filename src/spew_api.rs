@@ -58,6 +58,8 @@ const MAX_TOKEN_LEN: usize = 8192;
 const MAX_CALLBACK_HEAD: usize = 8192;
 // A browser may open a connection it never uses; don't let one hold a handler for long.
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Longer than one refresh in another process can take (HTTP timeout 30 s), so waiting here means a stuck holder.
+const AUTH_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// base64url that accepts input with or without padding.
 const URL_SAFE_LENIENT: GeneralPurpose = GeneralPurpose::new(
@@ -346,6 +348,19 @@ impl fmt::Debug for StoredAuth {
 }
 
 impl StoredAuth {
+    fn client_only(url: &str, client_id: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            client_id: client_id.to_string(),
+            access_token: None,
+            refresh_token: None,
+            expires_at: None,
+            scope: None,
+            username: None,
+            display: None,
+        }
+    }
+
     fn me(&self) -> Option<Me> {
         let username = self.username.clone()?;
         Some(Me {
@@ -419,6 +434,29 @@ impl AuthStore {
         write_private(&self.path, &json).map_err(|e| self.err(e))
     }
 
+    /// The advisory lock file next to the auth file (`auth/spew.lock`).
+    pub fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+
+    /// Blocks until this process holds the exclusive advisory lock on [`AuthStore::lock_path`]. Dropping the
+    /// file releases it.
+    fn lock_blocking(lock_path: &Path) -> std::io::Result<std::fs::File> {
+        if let Some(dir) = lock_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            create_private_dir(dir)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path)?;
+        file.lock()?;
+        Ok(file)
+    }
+
     /// Deletes the file if it exists.
     pub fn remove(&self) -> Result<(), ApiError> {
         match std::fs::remove_file(&self.path) {
@@ -429,12 +467,7 @@ impl AuthStore {
     }
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -442,7 +475,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(dir)?;
+    builder.create(dir)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_private_dir(dir)?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -750,7 +792,8 @@ fn clean(s: &str) -> String {
     out
 }
 
-/// Client for one spew. Cheap to clone; clones share the token lock, so refreshes never overlap.
+/// Client for one spew. Cheap to clone. Token refreshes never overlap, within this process or across processes
+/// sharing the auth file.
 #[derive(Clone)]
 pub struct SpewApi {
     inner: Arc<Inner>,
@@ -762,9 +805,16 @@ struct Inner {
     store: AuthStore,
     clock: Arc<dyn Clock>,
     metadata: Mutex<Option<Metadata>>,
-    // Held across every read-refresh-write of the tokens: refresh tokens rotate, so two overlapping refreshes
-    // would make spew see a reuse and end the grant.
+    // With the file lock (`auth/spew.lock`), held across every read-refresh-write of the tokens: refresh tokens
+    // rotate, so two overlapping refreshes (two tasks, or the CLI and the daemon) would make spew see a reuse
+    // and end the grant.
     auth_lock: Mutex<()>,
+}
+
+/// Both auth locks: the in-process one, then the advisory file lock other processes honor.
+struct AuthLock<'a> {
+    _file: std::fs::File,
+    _local: tokio::sync::MutexGuard<'a, ()>,
 }
 
 impl fmt::Debug for SpewApi {
@@ -823,6 +873,25 @@ impl SpewApi {
             .store
             .load()?
             .filter(|a| a.url == self.inner.base.as_str()))
+    }
+
+    /// Takes both auth locks; hold the result across a read, refresh and write of the tokens.
+    async fn lock_auth(&self) -> Result<AuthLock<'_>, ApiError> {
+        let local = self.inner.auth_lock.lock().await;
+        let path = self.inner.store.lock_path();
+        let store = &self.inner.store;
+        let file = tokio::time::timeout(
+            AUTH_LOCK_TIMEOUT,
+            tokio::task::spawn_blocking(move || AuthStore::lock_blocking(&path)),
+        )
+        .await
+        .map_err(|_| store.err("another spew mesh process has held the auth lock for a minute"))?
+        .map_err(|e| store.err(format!("can't take the auth lock: {e}")))?
+        .map_err(|e| store.err(format!("can't take the auth lock: {e}")))?;
+        Ok(AuthLock {
+            _file: file,
+            _local: local,
+        })
     }
 
     /// Whether this device is signed in to this spew, from the auth file alone.
@@ -932,11 +1001,21 @@ impl SpewApi {
     /// await [`LoginFlow::complete`].
     pub async fn start_login(&self) -> Result<LoginFlow, ApiError> {
         let meta = self.metadata().await?;
-        // A broken auth file is replaced by signing in, so it doesn't block this.
-        let cached = self.load_matching().ok().flatten().map(|a| a.client_id);
-        let client_id = match cached {
-            Some(id) => id,
-            None => self.register_client(&meta).await?,
+        let client_id = {
+            let _lock = self.lock_auth().await?;
+            // A broken auth file is replaced by signing in, so it doesn't block this.
+            match self.load_matching().ok().flatten() {
+                Some(auth) => auth.client_id,
+                None => {
+                    let id = self.register_client(&meta).await?;
+                    // Cached at once so an abandoned sign-in doesn't register another client next time. Tokens
+                    // are written only when sign-in completes.
+                    self.inner
+                        .store
+                        .save(&StoredAuth::client_only(self.inner.base.as_str(), &id))?;
+                    id
+                }
+            }
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1136,7 +1215,7 @@ impl SpewApi {
 
     /// The access token to use now, refreshed first when it is about to expire.
     async fn current_token(&self) -> Result<String, ApiError> {
-        let _guard = self.inner.auth_lock.lock().await;
+        let _lock = self.lock_auth().await?;
         let auth = self.load_matching()?.ok_or(ApiError::NotSignedIn)?;
         let Some(access) = auth.access_token.clone() else {
             return Err(if auth.username.is_some() {
@@ -1157,7 +1236,7 @@ impl SpewApi {
     /// The access token to retry with after `used` got a 401: a newer one if another request already
     /// refreshed, else a fresh one.
     async fn token_after_401(&self, used: &str) -> Result<String, ApiError> {
-        let _guard = self.inner.auth_lock.lock().await;
+        let _lock = self.lock_auth().await?;
         let auth = self.load_matching()?.ok_or(ApiError::NotSignedIn)?;
         match auth.access_token.as_deref() {
             Some(current) if current != used => Ok(current.to_string()),
@@ -1432,7 +1511,7 @@ impl SpewApi {
         if report.was_signed_in {
             report.device_unregistered = self.unregister_self().await.is_ok();
         }
-        let _guard = self.inner.auth_lock.lock().await;
+        let _lock = self.lock_auth().await?;
         // unregister_self may have refreshed, so read the latest refresh token.
         let auth = self.load_matching().ok().flatten().unwrap_or(auth);
         if let Some(refresh) = &auth.refresh_token
@@ -1538,7 +1617,7 @@ impl LoginFlow {
             display: Some(me.display.clone()),
         };
         {
-            let _guard = api.inner.auth_lock.lock().await;
+            let _lock = api.lock_auth().await?;
             api.inner.store.save(&auth)?;
         }
         Ok(SignedIn {

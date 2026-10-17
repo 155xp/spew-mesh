@@ -6,17 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
-use spew_api_mock::{Detour, MockSpew, TestClock, api_for, browser, key_hex};
+use spew_api_mock::{Detour, MockSpew, TestClock, api_for, key_hex, sign_in_with};
 use spew_mesh::roster::spew::PeersFetch;
 use spew_mesh::spew_api::{ApiError, AuthStatus, SignedIn, SpewApi};
 
 const T0: u64 = 1_800_000_000_000;
 
 async fn sign_in(api: &SpewApi) -> SignedIn {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    api.login(&browser(vec![], seen.clone()), Duration::from_secs(10))
-        .await
-        .expect("sign-in")
+    let (result, seen) = sign_in_with(api, vec![], Duration::from_secs(10)).await;
+    assert_eq!(seen, vec![302, 200]);
+    result.expect("sign-in")
 }
 
 fn auth_json(dir: &std::path::Path) -> serde_json::Value {
@@ -31,15 +30,10 @@ async fn sign_in_happy_path() {
     let api = mock.api(dir.path(), TestClock::at(T0));
     assert_eq!(api.auth_status().unwrap(), AuthStatus::NotSignedIn);
 
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let signed = api
-        .login(&browser(vec![], seen.clone()), Duration::from_secs(10))
-        .await
-        .unwrap();
+    let signed = sign_in(&api).await;
     assert_eq!(signed.me.username, "sam");
     assert_eq!(signed.me.display, "Sam");
     assert_eq!(signed.projects[0].key, "spew");
-    assert_eq!(*seen.lock().unwrap(), vec![200]);
 
     mock.with(|s| {
         assert_eq!(s.clients.len(), 1, "one dynamic registration");
@@ -81,14 +75,33 @@ async fn bad_state_gets_400_and_the_listener_keeps_waiting() {
     let mock = MockSpew::start().await;
     let dir = tempfile::tempdir().unwrap();
     let api = mock.api(dir.path(), TestClock::at(T0));
-    let seen = Arc::new(Mutex::new(Vec::new()));
     let detours = vec![Detour::WrongState, Detour::NoState, Detour::WrongPath];
-    let signed = api
-        .login(&browser(detours, seen.clone()), Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert_eq!(signed.me.username, "sam");
-    assert_eq!(*seen.lock().unwrap(), vec![400, 400, 404, 200]);
+    let (result, seen) = sign_in_with(&api, detours, Duration::from_secs(10)).await;
+    assert_eq!(seen, vec![302, 400, 400, 404, 200]);
+    assert_eq!(result.unwrap().me.username, "sam");
+}
+
+#[tokio::test]
+async fn a_second_callback_after_the_first_is_ignored() {
+    let mock = MockSpew::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let api = mock.api(dir.path(), TestClock::at(T0));
+    let (result, seen) =
+        sign_in_with(&api, vec![Detour::SecondCallback], Duration::from_secs(10)).await;
+    assert_eq!(result.unwrap().me.username, "sam");
+    assert_eq!(seen[..2], [302, 200]);
+    // The browser may still be sending the second callback; give it time to land if it is going to.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    mock.with(|s| {
+        let exchanged: Vec<&str> = s
+            .token_requests
+            .iter()
+            .filter(|t| t["grant_type"] == "authorization_code")
+            .map(|t| t["code"].as_str())
+            .collect();
+        assert_eq!(exchanged.len(), 1, "one code exchanged");
+        assert_ne!(exchanged[0], "forged-code");
+    });
 }
 
 #[tokio::test]
@@ -105,7 +118,15 @@ async fn sign_in_gives_up_after_the_timeout() {
         .unwrap_err();
     assert!(matches!(err, ApiError::Login(_)), "{err}");
     assert_eq!(opened.lock().unwrap().len(), 1, "the URL was shown");
-    assert!(!dir.path().join("auth").join("spew.json").exists());
+    // The client id is kept, but no tokens.
+    let auth = auth_json(dir.path());
+    assert!(auth["client_id"].as_str().unwrap().starts_with("client-"));
+    assert!(auth.get("access_token").is_none() && auth.get("refresh_token").is_none());
+    assert_eq!(api.auth_status().unwrap(), AuthStatus::NotSignedIn);
+
+    // Trying again after giving up reuses that client.
+    sign_in(&api).await;
+    assert_eq!(mock.with(|s| s.clients.len()), 1);
 }
 
 #[tokio::test]
@@ -115,11 +136,8 @@ async fn a_scope_other_than_mesh_is_revoked_and_nothing_is_stored() {
         mock.with(|s| s.granted_scope = scope.map(str::to_string));
         let dir = tempfile::tempdir().unwrap();
         let api = mock.api(dir.path(), TestClock::at(T0));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let err = api
-            .login(&browser(vec![], seen), Duration::from_secs(10))
-            .await
-            .unwrap_err();
+        let (result, _) = sign_in_with(&api, vec![], Duration::from_secs(10)).await;
+        let err = result.unwrap_err();
         assert!(
             matches!(err, ApiError::MeshUnsupported(_)),
             "{scope:?}: {err}"
@@ -135,7 +153,9 @@ async fn a_scope_other_than_mesh_is_revoked_and_nothing_is_stored() {
             );
             assert_eq!(s.count("GET /api/mesh/v1/me"), 0);
         });
-        assert!(!dir.path().join("auth").join("spew.json").exists());
+        let auth = auth_json(dir.path());
+        assert!(auth.get("access_token").is_none() && auth.get("refresh_token").is_none());
+        assert!(auth.get("username").is_none() && auth.get("scope").is_none());
     }
 }
 
@@ -190,6 +210,35 @@ async fn refresh_rotates_and_reuse_means_sign_in_again() {
     let before = mock.with(|s| s.log.len());
     assert!(api.me().await.unwrap_err().is_signed_out());
     assert_eq!(mock.with(|s| s.log.len()), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_processes_never_present_the_same_refresh_token() {
+    let mock = MockSpew::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::at(T0);
+    let daemon = mock.api(dir.path(), clock.clone());
+    sign_in(&daemon).await;
+    // A second client on the same auth file has its own in-process lock, like the CLI next to the daemon;
+    // only the file lock keeps them apart.
+    let cli = mock.api(dir.path(), clock.clone());
+    clock.advance_secs(3600);
+    let (a, b) = tokio::join!(daemon.me(), cli.me());
+    a.unwrap();
+    b.unwrap();
+    mock.with(|s| {
+        let refreshes = s
+            .token_requests
+            .iter()
+            .filter(|t| t["grant_type"] == "refresh_token")
+            .count();
+        assert_eq!(
+            refreshes, 1,
+            "the second client used the first one's refresh"
+        );
+        assert!(s.grants.values().all(|g| g.alive), "no reuse, grant alive");
+    });
+    assert!(dir.path().join("auth").join("spew.lock").exists());
 }
 
 #[tokio::test]

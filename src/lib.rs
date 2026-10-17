@@ -25,3 +25,13 @@ pub fn install_crypto_provider() {
     // An error only means a provider is already installed, which is what we want.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crypto_provider_installs_once_and_again() {
+        super::install_crypto_provider();
+        super::install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+}

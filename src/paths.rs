@@ -279,6 +279,26 @@ pub fn open_private_append(path: &Path) -> Result<File, PathsError> {
         .map_err(PathsError::io("open", path))
 }
 
+/// Size over which `logs/mesh.log` moves to `mesh.log.1` at daemon start (11).
+pub const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Moves `log` to `<log>.1`, replacing an older one, when it holds more than `max_bytes` (11). Returns whether it
+/// moved.
+pub fn rotate_log(log: &Path, max_bytes: u64) -> Result<bool, PathsError> {
+    let len = match fs::metadata(log) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(PathsError::io("read", log)(error)),
+    };
+    if len <= max_bytes {
+        return Ok(false);
+    }
+    let mut rotated = log.as_os_str().to_owned();
+    rotated.push(".1");
+    fs::rename(log, &rotated).map_err(PathsError::io("rotate", log))?;
+    Ok(true)
+}
+
 /// Writes `bytes` to `path` atomically with mode 0600: a temporary file in the same folder, fsync, rename, and
 /// fsync of the folder.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PathsError> {
@@ -443,5 +463,20 @@ mod tests {
         file.write_all(b"b").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"ab");
         assert_eq!(mode_of(&path).unwrap(), Some(FILE_MODE));
+    }
+
+    #[test]
+    fn log_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mesh.log");
+        let old = tmp.path().join("mesh.log.1");
+        assert!(!rotate_log(&log, 4).unwrap());
+        fs::write(&log, b"1234").unwrap();
+        assert!(!rotate_log(&log, 4).unwrap());
+        fs::write(&old, b"older").unwrap();
+        fs::write(&log, b"12345").unwrap();
+        assert!(rotate_log(&log, 4).unwrap());
+        assert!(!log.exists());
+        assert_eq!(fs::read(&old).unwrap(), b"12345");
     }
 }

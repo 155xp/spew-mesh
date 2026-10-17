@@ -1,9 +1,7 @@
 //! The local roster, used before sign-in (C1): one private room holding only this device.
 
-use super::{
-    EndpointId, MAX_USERNAME, Me, NAME_RULE, Roster, RosterError, is_valid_person_name,
-    private_room, this_device_entry,
-};
+use super::{EndpointId, Me, Roster, RosterError, private_room, this_device_entry};
+use crate::address::{MAX_PERSON, PERSON_RULE, is_person, slugify};
 
 /// Version string of every local roster.
 pub const LOCAL_VERSION: &str = "local";
@@ -14,15 +12,15 @@ pub fn local_username(
     os_user: Option<&str>,
 ) -> Result<String, RosterError> {
     if let Some(name) = settings_username.filter(|n| !n.is_empty()) {
-        if !is_valid_person_name(name) {
+        if !is_person(name) {
             return Err(RosterError(format!(
-                "settings username {name:?} must be {NAME_RULE}"
+                "settings username {name:?} must be {PERSON_RULE}"
             )));
         }
         return Ok(name.to_string());
     }
     let slugged = os_user.map(slug).unwrap_or_default();
-    Ok(if !is_valid_person_name(&slugged) {
+    Ok(if !is_person(&slugged) {
         "local".to_string()
     } else {
         slugged
@@ -37,18 +35,9 @@ pub fn os_user_name() -> Option<String> {
         .find(|v| !v.is_empty())
 }
 
-/// Lowercase ASCII letters, digits and single hyphens, at most [`MAX_USERNAME`] characters.
+/// Lowercase ASCII letters, digits and single hyphens, at most [`MAX_PERSON`] characters ([`slugify`]).
 pub fn slug(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.truncate(MAX_USERNAME);
-    out.trim_end_matches('-').to_string()
+    slugify(s, MAX_PERSON)
 }
 
 /// The local roster: one private room with `me` and only this device. It admits nothing from the network.
@@ -91,7 +80,7 @@ mod tests {
     #[test]
     fn slugs() {
         assert_eq!(slug("--Ab__c  d--"), "ab-c-d");
-        assert_eq!(slug(&"a".repeat(60)).len(), MAX_USERNAME);
+        assert_eq!(slug(&"a".repeat(60)).len(), MAX_PERSON);
     }
 
     #[test]

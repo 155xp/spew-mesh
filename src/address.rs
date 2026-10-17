@@ -21,9 +21,10 @@ pub const MAX_ROOM: usize = 32;
 /// The word that means "yourself" wherever a person goes (2.2), so never a person name or room id.
 pub const ME: &str = "me";
 /// The person-name and room-id rule in words, for error messages (2).
-pub const PERSON_RULE: &str = "1 to 32 lowercase letters, digits, '.', '_' or '-', and not \"me\"";
+pub const PERSON_RULE: &str =
+    "1 to 32 lowercase ASCII letters, digits, '.', '_' or '-', and not \"me\"";
 /// The device-name rule in words, for error messages (2).
-pub const DEVICE_RULE: &str = "1 to 48 lowercase letters, digits, '.', '_' or '-'";
+pub const DEVICE_RULE: &str = "1 to 48 lowercase ASCII letters, digits, '.', '_' or '-'";
 /// The sender name reserved for the daemon's own notices (7.6).
 pub const RESERVED_NAME: &str = "mesh";
 /// The client kinds setup wires and serve runs (2, 9).

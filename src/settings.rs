@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use url::Url;
 
-use crate::address::{
-    DEVICE_RULE, MAX_PERSON, PERSON_RULE, is_client, is_device_name, is_person, is_room, slugify,
-};
+use crate::address::{DEVICE_RULE, PERSON_RULE, is_client, is_device_name, is_person, is_room};
 use crate::paths::{Home, expand_tilde};
 
 /// The default spew server (11, 14).
@@ -567,18 +565,6 @@ impl Settings {
             self.network.mdns = false;
         }
     }
-
-    /// `Me.username` for the local and file rosters (4.2): `username`, else the OS user name slugged, else
-    /// `local`.
-    pub fn local_username(&self, os_user: Option<&str>) -> String {
-        if let Some(name) = &self.username {
-            return name.clone();
-        }
-        os_user
-            .map(|u| slugify(u, MAX_PERSON))
-            .filter(|u| is_person(u))
-            .unwrap_or_else(|| "local".to_string())
-    }
 }
 
 /// The spew mesh variables from an environment (11).
@@ -1017,17 +1003,6 @@ max_budget_usd = 1
         assert!(Env::from_vars([("SPEW_MESH_LAN", "off")]).is_err());
         let bad_client = Env::from_vars([("SPEW_MESH_CLIENT", "not a slug")]).unwrap();
         assert_eq!(bad_client.client(), None);
-    }
-
-    #[test]
-    fn local_username() {
-        let mut s = parse("").unwrap();
-        assert_eq!(s.local_username(Some("Sam Smith")), "sam-smith");
-        assert_eq!(s.local_username(Some("日本")), "local");
-        assert_eq!(s.local_username(Some("Me")), "local");
-        assert_eq!(s.local_username(None), "local");
-        s.username = Some("maya".into());
-        assert_eq!(s.local_username(Some("sam")), "maya");
     }
 
     #[test]

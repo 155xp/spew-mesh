@@ -11,10 +11,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    DEVICE_NAME_RULE, DeviceEntry, EndpointId, MAX_DISPLAY, Me, Member, NAME_RULE, RelayUrl, Room,
-    RoomKind, Roster, RosterError, is_display_text, is_valid_device_name, is_valid_person_name,
-    is_valid_room_id, parse_endpoint_id, private_room,
+    DeviceEntry, EndpointId, MAX_DISPLAY, Me, Member, RelayUrl, Room, RoomKind, Roster,
+    RosterError, is_display_text, parse_endpoint_id, private_room,
 };
+use crate::address::{DEVICE_RULE, PERSON_RULE, is_device_name, is_person, is_room};
 
 /// How often the daemon checks the file's modification time (4.2).
 pub const POLL_SECONDS: u64 = 5;
@@ -119,9 +119,9 @@ pub fn parse(text: &str) -> Result<RosterFile, RosterError> {
     let mut people = BTreeMap::new();
     let mut seen_ids: BTreeMap<EndpointId, String> = BTreeMap::new();
     for person in raw.person {
-        if !is_valid_person_name(&person.name) {
+        if !is_person(&person.name) {
             return Err(RosterError(format!(
-                "person name {:?} must be {NAME_RULE}",
+                "person name {:?} must be {PERSON_RULE}",
                 person.name
             )));
         }
@@ -171,9 +171,9 @@ pub fn parse(text: &str) -> Result<RosterFile, RosterError> {
     }
     let mut rooms: Vec<(String, Vec<String>)> = Vec::new();
     for room in raw.room {
-        if !is_valid_room_id(&room.name) {
+        if !is_room(&room.name) {
             return Err(RosterError(format!(
-                "room name {:?} must be {NAME_RULE}",
+                "room name {:?} must be {PERSON_RULE}",
                 room.name
             )));
         }
@@ -215,9 +215,9 @@ pub fn parse(text: &str) -> Result<RosterFile, RosterError> {
 fn parse_device(person: &str, device: RawDevice) -> Result<DeviceEntry, RosterError> {
     let endpoint_id = parse_endpoint_id(&device.id)
         .map_err(|e| RosterError(format!("a device of {person:?}: {e}")))?;
-    if !is_valid_device_name(&device.name) {
+    if !is_device_name(&device.name) {
         return Err(RosterError(format!(
-            "device name {:?} of {person:?} must be {DEVICE_NAME_RULE}",
+            "device name {:?} of {person:?} must be {DEVICE_RULE}",
             device.name
         )));
     }

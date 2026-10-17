@@ -17,18 +17,14 @@ use serde::{Deserialize, Serialize};
 pub use diff::{MembershipChange, RoomsChanged};
 pub use iroh::{EndpointId, RelayUrl};
 
+use crate::address::{is_device_name, is_person, is_room};
+
 /// Id of every person's private room, which holds only their own devices. It can't collide with a project key
 /// or a file room name, because `@` is outside the name rules (2).
 pub const PRIVATE_ROOM_ID: &str = "@private";
 /// Display name of the private room.
 pub const PRIVATE_ROOM_NAME: &str = "private";
 
-/// Longest person name (2).
-pub const MAX_USERNAME: usize = 32;
-/// Longest device name (2).
-pub const MAX_DEVICE_NAME: usize = 48;
-/// Longest room id, a project key or a file room name (2).
-pub const MAX_ROOM_ID: usize = 32;
 /// Longest room display name.
 pub const MAX_ROOM_NAME: usize = 100;
 /// Longest display name of a person.
@@ -148,7 +144,7 @@ impl Roster {
     /// character sets; a person appears once per room; an endpoint id belongs to one person and one device
     /// name across all rooms; relay hints are http(s) URLs; sizes stay under fixed caps.
     pub fn validate(&mut self, me: &Me) -> Result<(), RosterError> {
-        if !is_valid_person_name(&me.username) {
+        if !is_person(&me.username) {
             return Err(RosterError::new(format!(
                 "invalid username {:?}",
                 me.username
@@ -182,7 +178,7 @@ impl Roster {
                     }
                 }
                 RoomKind::Team | RoomKind::Project => {
-                    if !is_valid_room_id(&room.id) {
+                    if !is_room(&room.id) {
                         return Err(RosterError::new(format!("invalid room id {:?}", room.id)));
                     }
                 }
@@ -207,7 +203,7 @@ impl Roster {
             }
             let mut usernames = BTreeSet::new();
             for member in &mut room.members {
-                if !is_valid_person_name(&member.username) {
+                if !is_person(&member.username) {
                     return Err(RosterError::new(format!(
                         "invalid username {:?} in room {:?}",
                         member.username, room.id
@@ -288,7 +284,7 @@ impl Room {
 }
 
 fn validate_device(device: &DeviceEntry) -> Result<(), RosterError> {
-    if !is_valid_device_name(&device.name) {
+    if !is_device_name(&device.name) {
         return Err(RosterError::new(format!(
             "invalid device name {:?}",
             device.name
@@ -310,34 +306,6 @@ fn validate_device(device: &DeviceEntry) -> Result<(), RosterError> {
     }
     Ok(())
 }
-
-/// The characters names may use (2): lowercase ASCII letters, digits, `.`, `_` and `-`. Names appear inside
-/// addresses (`person@device/name`), so `/`, `@` and `#` never can.
-fn name_chars(s: &str) -> bool {
-    s.bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// Whether `s` is a valid person name: 1 to 32 name characters, and never `me`, which is an address keyword.
-pub fn is_valid_person_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= MAX_USERNAME && s != "me" && name_chars(s)
-}
-
-/// Whether `s` is a valid room id (project key or file room name): the same rule as person names.
-pub fn is_valid_room_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= MAX_ROOM_ID && s != "me" && name_chars(s)
-}
-
-/// Whether `s` is a valid device name: 1 to 48 name characters.
-pub fn is_valid_device_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= MAX_DEVICE_NAME && name_chars(s)
-}
-
-/// The rule for person names and room ids, for messages.
-pub const NAME_RULE: &str =
-    "1 to 32 lowercase ASCII letters, digits, '.', '_' or '-', and not \"me\"";
-/// The rule for device names, for messages.
-pub const DEVICE_NAME_RULE: &str = "1 to 48 lowercase ASCII letters, digits, '.', '_' or '-'";
 
 /// Whether `s` is one printable line of at most `max` characters.
 pub fn is_display_text(s: &str, max: usize) -> bool {
@@ -612,26 +580,26 @@ mod tests {
 
     #[test]
     fn names() {
-        assert!(is_valid_person_name("sam"));
-        assert!(is_valid_person_name("a.b_c-1"));
-        assert!(is_valid_person_name("-sam"));
-        assert!(is_valid_person_name(&"a".repeat(32)));
-        assert!(!is_valid_person_name(&"a".repeat(33)));
-        assert!(!is_valid_person_name(""));
-        assert!(!is_valid_person_name("me"));
-        assert!(!is_valid_person_name("Sam"));
-        assert!(!is_valid_person_name("sam/x"));
-        assert!(!is_valid_person_name("sam@x"));
-        assert!(!is_valid_person_name("sám"));
-        assert!(is_valid_room_id("spew"));
-        assert!(!is_valid_room_id("me"));
-        assert!(!is_valid_room_id("spew#1"));
-        assert!(!is_valid_room_id(PRIVATE_ROOM_ID));
-        assert!(is_valid_device_name("maya-mbp"));
-        assert!(is_valid_device_name("me"));
-        assert!(is_valid_device_name(&"d".repeat(48)));
-        assert!(!is_valid_device_name(&"d".repeat(49)));
-        assert!(!is_valid_device_name("Maya-MBP"));
+        assert!(is_person("sam"));
+        assert!(is_person("a.b_c-1"));
+        assert!(is_person("-sam"));
+        assert!(is_person(&"a".repeat(32)));
+        assert!(!is_person(&"a".repeat(33)));
+        assert!(!is_person(""));
+        assert!(!is_person("me"));
+        assert!(!is_person("Sam"));
+        assert!(!is_person("sam/x"));
+        assert!(!is_person("sam@x"));
+        assert!(!is_person("sám"));
+        assert!(is_room("spew"));
+        assert!(!is_room("me"));
+        assert!(!is_room("spew#1"));
+        assert!(!is_room(PRIVATE_ROOM_ID));
+        assert!(is_device_name("maya-mbp"));
+        assert!(is_device_name("me"));
+        assert!(is_device_name(&"d".repeat(48)));
+        assert!(!is_device_name(&"d".repeat(49)));
+        assert!(!is_device_name("Maya-MBP"));
         assert!(is_display_text("Maya K", 64));
         assert!(!is_display_text("two\nlines", 64));
         assert!(!is_display_text("  ", 64));

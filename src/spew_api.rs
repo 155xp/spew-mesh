@@ -25,11 +25,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use url::{Host, Url};
 
+use crate::address::{DEVICE_RULE, is_device_name, is_person};
 use crate::roster::spew::{Peers, PeersFetch};
-use crate::roster::{
-    DEVICE_NAME_RULE, EndpointId, MAX_DISPLAY, Me, RelayUrl, is_display_text, is_valid_device_name,
-    is_valid_person_name,
-};
+use crate::roster::{EndpointId, MAX_DISPLAY, Me, RelayUrl, is_display_text};
 
 /// The only scope spew mesh asks for and accepts.
 pub const SCOPE: &str = "mesh";
@@ -572,7 +570,7 @@ impl MeResponse {
     /// The person as a roster [`Me`], after checking the username.
     pub fn to_me(&self) -> Result<Me, ApiError> {
         let username = &self.user.username;
-        if !is_valid_person_name(username) {
+        if !is_person(username) {
             return Err(ApiError::InvalidResponse(format!(
                 "username {:?} doesn't fit spew mesh names",
                 clean(username)
@@ -1336,9 +1334,9 @@ impl SpewApi {
         name: &str,
         platform: &str,
     ) -> Result<RegisteredDevice, ApiError> {
-        if !is_valid_device_name(name) {
+        if !is_device_name(name) {
             return Err(ApiError::Device(format!(
-                "device name {:?} must be {DEVICE_NAME_RULE}",
+                "device name {:?} must be {DEVICE_RULE}",
                 clean(name)
             )));
         }
@@ -1409,7 +1407,7 @@ impl SpewApi {
     ) -> Result<(), ApiError> {
         let mut body = serde_json::json!({ "relay": relay.map(|r| r.to_string()) });
         if let Some(name) = name {
-            if !is_valid_device_name(name) {
+            if !is_device_name(name) {
                 return Err(ApiError::Device(format!(
                     "bad device name {:?}",
                     clean(name)

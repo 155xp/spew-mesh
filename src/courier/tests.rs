@@ -945,6 +945,28 @@ async fn a_responder_answers_an_ask_only_once() {
     };
     assert_eq!(delivers(&maya), 1);
 
+    // The same goes for a reply to a tell.
+    let tell = envelope("tell", None, None, (&helper, &helper_name));
+    let tell_id = tell["id"].as_str().unwrap().to_string();
+    assert!(accepted(&deliver(&maya, tell).await));
+    let first = maya.reply(&token, &tell_id, "noted", None).await;
+    assert_eq!(first.status, SendStatus::Queued);
+    let again = maya
+        .courier
+        .reply(
+            &maya.conn(),
+            ReplyParams {
+                token: token.clone(),
+                id: tell_id.clone(),
+                text: "noted".into(),
+                wait_seconds: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(again.reason, Reason::Conflict);
+    assert_eq!(delivers(&maya), 2);
+
     // A live session's second reply still goes, as a tell.
     let (live_token, live, live_name) = maya.open("api", Some("team"));
     let ask = envelope("ask", None, None, (&live, &live_name));
@@ -955,7 +977,7 @@ async fn a_responder_answers_an_ask_only_once() {
         .reply(&live_token, &ask_id, "and one more thing", None)
         .await;
     assert_eq!(tell.status, SendStatus::Queued);
-    assert_eq!(delivers(&maya), 3);
+    assert_eq!(delivers(&maya), 4);
 }
 
 #[tokio::test]

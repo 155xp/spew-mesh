@@ -636,6 +636,8 @@ setup reports it. Configs name the `spew` binary by its absolute path.
   it; if they have (a running agent wrote it), it reads and applies the edit again, up to 3 times, then gives up
   and reports it.
 - Shell-form commands single-quote the path and write a single quote inside it as `'\''`.
+- A config file that is a symlink (a dotfiles setup) is edited at its target: the temporary file and the backup
+  go next to the target, and the manifest records both paths, so the link survives setup and uninstall.
 
 ### 8.1 Hook events
 
@@ -941,8 +943,9 @@ and ignores every failure.
 | event `session.deleted` | `end` | nothing |
 | `tool.execute.before`, for tools named `mesh_*` | none | adds the argument `_mesh_session` with the session id |
 
-- Sessions with a `parentID` are subagents. The plugin keeps a map from session to parent and always reports the
-  root session id, for events and for `_mesh_session`.
+- Sessions with a `parentID` are subagents. The plugin ignores their events (a subagent never sees peer
+  messages, and its idle doesn't mark the root idle), keeps a map from session to parent, and gives `mesh_*`
+  calls made in a subagent the root session id as `_mesh_session`.
 - The plugin never calls `client.session.prompt` or `promptAsync`, which would add a message or start a turn on
   its own.
 - The plugin card verifies with a mock model (as in 15) that a part appended in `chat.message` and text appended

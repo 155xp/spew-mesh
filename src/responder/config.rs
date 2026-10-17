@@ -94,6 +94,12 @@ impl ServeConfig {
             ));
         }
         validate_budget(self.max_budget_usd)?;
+        // Spec 8.4: OpenCode's edit path rules haven't been checked against a real run, so v0.1 doesn't offer it.
+        if self.allow_edits && self.client == ServeClient::Opencode {
+            return Err(ServeError::Invalid(
+                "--allow-edits isn't available for OpenCode yet; serve it read-only".into(),
+            ));
+        }
         if let Some(model) = &self.model {
             validate_model(model)?;
         }
@@ -119,6 +125,22 @@ pub(crate) fn validate_model(model: &str) -> Result<(), ServeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_is_served_read_only() {
+        let settings = ServeSettings::default();
+        let mut cfg = ServeConfig::new(ServeClient::Opencode, "/w", "/r", &settings);
+        assert!(cfg.validate().is_ok());
+        cfg.allow_edits = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("--allow-edits isn't available for OpenCode"),
+            "{err}"
+        );
+        let mut claude = ServeConfig::new(ServeClient::Claude, "/w", "/r", &settings);
+        claude.allow_edits = true;
+        assert!(claude.validate().is_ok());
+    }
 
     #[test]
     fn defaults_match_the_settings_defaults() {

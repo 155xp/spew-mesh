@@ -846,8 +846,7 @@ async fn opencode_failed_runs() {
         r#"{"type":"error","sessionID":"ses_02","error":{"name":"ProviderAuthError","data":{"message":"no credentials"}}}"#,
     );
     fake.set("exit", 3, "1");
-    let mut cfg = fake.config(ServeClient::Opencode);
-    cfg.allow_edits = true;
+    let cfg = fake.config(ServeClient::Opencode);
     let mut r = fake.start(cfg).await.unwrap();
     let f = r.answer(&question(Q1, C1, "q")).await.unwrap_err();
     assert!(
@@ -867,7 +866,7 @@ async fn opencode_failed_runs() {
     );
     assert_eq!(
         fake.env(1).get("OPENCODE_CONFIG_CONTENT"),
-        Some(&opencode::config_content(true))
+        Some(&opencode::config_content(false))
     );
 }
 

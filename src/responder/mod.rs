@@ -1,8 +1,10 @@
 //! serve: answering questions with headless agent runs (9).
 //!
-//! The command line, environment and permission set for each client (8.2 to 8.4), a runner that spawns
-//! each run in its own process group with a timeout and an output cap, the run limits and queue, the
-//! conversation map, and the prompt.
+//! [`Responder`] takes one question and returns the answer text, or a failure whose reply line ends the
+//! asker's wait. Underneath: the command line, environment and permission set for each client (8.2 to 8.4),
+//! a runner that spawns each run in its own process group with a timeout and an output cap, the run limits
+//! and queue, the conversation map, and the prompt. Taking questions from the daemon (`responder.take`) and
+//! sending answers back (`message.reply`) are wired on top of [`Responder::answer`].
 
 pub mod claude;
 pub mod codex;
@@ -13,12 +15,14 @@ pub mod memory;
 pub mod opencode;
 pub mod process;
 pub mod prompt;
+mod serve;
 
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 pub use config::{ServeConfig, ServeFrom, ServeSettings};
+pub use serve::{Answer, MAX_ANSWER_BYTES, Responder};
 
 /// The agent CLI a responder drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

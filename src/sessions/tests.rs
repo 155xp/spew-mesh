@@ -216,6 +216,36 @@ fn a_merge_keeps_the_newer_sessions_token_working() {
 }
 
 #[test]
+fn a_merge_keeps_the_newer_known_state() {
+    let s = store();
+    let mut reg = Registry::default();
+    let (_t, cwd) = folder("api");
+    let hooked = reg
+        .for_hook(
+            &s,
+            &hook(Client::Codex, MeshEvent::Start, "t-9", None, &cwd),
+            &ctx(1),
+        )
+        .unwrap()
+        .unwrap();
+    let mut older = s.session(&hooked.session.id).unwrap().unwrap();
+    older.state = crate::wire::ActivityState::Unknown;
+    s.put_session(&older).unwrap();
+    let a = reg.open(&s, &live("codex", &cwd), &ctx(2)).unwrap();
+    let mut newer = s.session(&a.session.id).unwrap().unwrap();
+    newer.state = crate::wire::ActivityState::Busy;
+    newer.state_since = 3;
+    s.put_session(&newer).unwrap();
+    let (survivor, _) = reg
+        .bind_client_session(&s, &a.session.id, "t-9", &ctx(4))
+        .unwrap();
+    assert_eq!(survivor.id, hooked.session.id);
+    let stored = s.session(&survivor.id).unwrap().unwrap();
+    assert_eq!(stored.state, crate::wire::ActivityState::Busy);
+    assert_eq!(stored.state_since, 3);
+}
+
+#[test]
 fn opencode_servers_without_the_plugin_are_one_session_per_process() {
     let s = store();
     let mut reg = Registry::default();

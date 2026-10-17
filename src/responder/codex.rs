@@ -93,7 +93,8 @@ pub fn codex_dir(real_binary: &Path, codex_home: &Path) -> PathBuf {
     for i in 0..parts.len().saturating_sub(2) {
         let is = |j: usize, name: &str| matches!(parts[j], Component::Normal(p) if p == name);
         if is(i, "node_modules") && is(i + 1, "@openai") && is(i + 2, "codex") {
-            return parts[..=i + 2].iter().collect();
+            let package: PathBuf = parts[..=i + 2].iter().collect();
+            return hoisted_platform_package(&package).unwrap_or(package);
         }
     }
     // `current` is usually a symlink to a versioned folder, and the binary's real path goes through
@@ -112,6 +113,41 @@ pub fn codex_dir(real_binary: &Path, codex_home: &Path) -> PathBuf {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| real_binary.to_path_buf())
+}
+
+/// The npm package that holds the native Codex binary when it sits outside the `@openai/codex` wrapper
+/// package. A global npm install nests it inside the wrapper (the spec's case), but a local or `--prefix`
+/// install hoists it next to the wrapper, where the sandbox can't see it and every command fails with
+/// `bwrap: execvp ... No such file or directory`. The wrapper finds it through Node's module lookup, so this
+/// looks in the same places: `<dir>/node_modules` for each ancestor `<dir>` that isn't a `node_modules` folder.
+fn hoisted_platform_package(package: &Path) -> Option<PathBuf> {
+    let name = platform_package()?;
+    if package
+        .join("node_modules")
+        .join("@openai")
+        .join(name)
+        .is_dir()
+    {
+        return None;
+    }
+    package
+        .ancestors()
+        .skip(1)
+        .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
+        .map(|dir| dir.join("node_modules").join("@openai").join(name))
+        .find(|candidate| candidate.is_dir())
+        .and_then(|found| std::fs::canonicalize(found).ok())
+}
+
+/// The platform package the npm wrapper runs on this computer (`@openai/<name>`).
+fn platform_package() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("codex-linux-x64"),
+        ("linux", "aarch64") => Some("codex-linux-arm64"),
+        ("macos", "x86_64") => Some("codex-darwin-x64"),
+        ("macos", "aarch64") => Some("codex-darwin-arm64"),
+        _ => None,
+    }
 }
 
 /// The model and provider a run uses.
@@ -368,10 +404,17 @@ pub fn exec_args(a: &ExecArgs<'_>) -> Vec<OsString> {
     push("--skip-git-repo-check");
     push("-C");
     v.push(a.cwd.as_os_str().to_owned());
+    // `--ignore-user-config` drops the person's opt-outs too. Codex 0.163.0 then clones its plugin marketplace
+    // from github.com and sends usage metrics to ab.chatgpt.com on every run. A serve run needs neither and
+    // should reach nothing but the model.
     for s in [
         "--ignore-user-config",
         "--disable",
         "hooks",
+        "--disable",
+        "plugins",
+        "-c",
+        "analytics.enabled=false",
         "--thread-source",
         PROFILE,
         "-c",
@@ -735,6 +778,60 @@ mod tests {
         );
     }
 
+    // A local npm install (`npm install --prefix <dir> @openai/codex`) hoists the platform package next to
+    // the wrapper; the sandbox must be allowed to read that package, where the native binary is.
+    #[test]
+    fn codex_dir_finds_a_hoisted_platform_package() {
+        let Some(name) = platform_package() else {
+            eprintln!(
+                "codex_dir_finds_a_hoisted_platform_package: skipped, no Codex package for this platform"
+            );
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let modules = tmp.path().join("tools").join("node_modules");
+        let wrapper = modules.join("@openai").join("codex");
+        std::fs::create_dir_all(wrapper.join("bin")).unwrap();
+        let script = wrapper.join("bin").join("codex.js");
+        std::fs::write(&script, "").unwrap();
+        let home = tmp.path().join("codex-home");
+
+        // No platform package anywhere: the wrapper package, as the spec says.
+        assert_eq!(codex_dir(&script, &home), wrapper);
+
+        let hoisted = modules.join("@openai").join(name);
+        std::fs::create_dir_all(hoisted.join("vendor")).unwrap();
+        assert_eq!(
+            codex_dir(&script, &home),
+            std::fs::canonicalize(&hoisted).unwrap()
+        );
+
+        // A nested one (a global install) wins, and the wrapper package covers it.
+        std::fs::create_dir_all(wrapper.join("node_modules").join("@openai").join(name)).unwrap();
+        assert_eq!(codex_dir(&script, &home), wrapper);
+    }
+
+    #[test]
+    fn codex_dir_finds_a_platform_package_further_up() {
+        let Some(name) = platform_package() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("node_modules");
+        let wrapper = outer
+            .join("tool")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        let platform = outer.join("@openai").join(name);
+        std::fs::create_dir_all(&platform).unwrap();
+        assert_eq!(
+            codex_dir(&wrapper.join("bin").join("codex.js"), tmp.path()),
+            std::fs::canonicalize(&platform).unwrap()
+        );
+    }
+
     #[test]
     fn codex_dir_follows_a_symlinked_current() {
         let tmp = tempfile::tempdir().unwrap();
@@ -939,6 +1036,10 @@ query_params = { api-version = "2026-01-01" }
                 "--ignore-user-config",
                 "--disable",
                 "hooks",
+                "--disable",
+                "plugins",
+                "-c",
+                "analytics.enabled=false",
                 "--thread-source",
                 "spew-mesh-serve",
                 "-c",
@@ -971,7 +1072,7 @@ query_params = { api-version = "2026-01-01" }
         };
         let args = strings(&exec_args(&base));
         assert_eq!(
-            args[14..],
+            args[18..],
             [
                 "-m",
                 "gpt-6",

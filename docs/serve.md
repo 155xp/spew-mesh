@@ -89,7 +89,7 @@ outside `--cwd`. Secret files are off limits: `.env` files, `*.pem` and `*.key` 
 `id_ed25519*`, and `.git/config`.
 
 `--allow-edits` also lets the run edit files inside `--cwd`, but never under `.git/` and never the secret files
-above. Use it only for a folder where you'd accept a colleague's agent making changes.
+above. It works with Claude Code and Codex; serve refuses it for OpenCode for now. Use it only for a folder where you'd accept a colleague's agent making changes.
 
 Each run's environment drops the variables that describe a parent agent session, so a run started from inside an
 agent doesn't act as that agent. Sign-in and provider variables stay.
@@ -131,8 +131,8 @@ on the computer, so serve defines a stricter permission profile on the command l
 it:
 
 ```text
-codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable hooks
-  --thread-source spew-mesh-serve
+codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable hooks --disable plugins
+  -c analytics.enabled=false --thread-source spew-mesh-serve
   -c 'default_permissions="spew-mesh-serve"' -c 'permissions.spew-mesh-serve=<profile>'
   [-m <model>] [-c 'model_provider="<id>"' -c 'model_providers.<id>=<inline table>']
   -o <run file> [resume <thread id>] -
@@ -149,7 +149,8 @@ workspace, and turns the network off:
 ```
 
 - `--ignore-user-config` keeps your `config.toml` out of the run: its MCP servers (mesh included), hooks and
-  `notify` don't load, and a `sandbox_mode` there can't switch the profile off. serve still reads `model` and
+  `notify` don't load, and a `sandbox_mode` there can't switch the profile off. It would also drop your own
+  opt-outs, so serve turns Codex plugins and analytics off on the command line; a run reaches only the model. serve still reads `model` and
   `model_provider` from it; `--model` wins. From the provider's table it copies only `name`, `base_url`,
   `env_key`, `wire_api` and `query_params`.
 - serve refuses to start when that provider table holds a header or token key (such as `http_headers` or
@@ -179,22 +180,22 @@ With these environment changes:
 - Dropped: `OPENCODE_PERMISSION` (it could widen the agent's permissions), `OPENCODE` and `OPENCODE_PID`.
 - `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so a repo's `opencode.json`, agents, plugins and MCP servers never load.
   `--pure` keeps every plugin out, spew mesh's own included.
-- `OPENCODE_CONFIG_CONTENT`, which outranks your global config, defines a deny-all agent that may only read, glob
-  and list:
+- `OPENCODE_CONFIG_CONTENT`, which outranks your global config, defines a deny-all agent that may only read and
+  glob (it also allows `list`, which OpenCode 1.19.3 doesn't have):
 
 ```json
 {"mcp":{"mesh":{"enabled":false}},"permission":{"*":"deny"},"agent":{"spew-mesh-serve":{"description":"Answers questions from other agents, read-only","mode":"primary","permission":{"*":"deny","read":{"*":"allow","*.env":"deny","*.env.*":"deny","*.pem":"deny","*.key":"deny","*id_rsa*":"deny","*id_ed25519*":"deny","*.git/config":"deny"},"glob":"allow","list":"allow"}}}}
 ```
 
 - Denied tools disappear from the model's tool list. Reads outside `--dir` are refused by OpenCode's
-  `external_directory` rule.
+  `external_directory` rule. OpenCode's `glob` still lists the names of secret files (never their contents);
+  Claude Code's Glob hides them.
 - If OpenCode can't find the agent, it falls back to its default agent with a warning. The top-level
   `"permission": {"*": "deny"}` keeps even that fallback from editing, running commands or reaching the network,
   and serve treats a run whose warning names the fallback as failed.
 - Your other global MCP servers still start, but their tools are denied.
-- `--allow-edits` adds `"edit": {"*": "allow", ".git/*": "deny", "*.env": "deny", "*.env.*": "deny", "*.pem":
-  "deny", "*.key": "deny"}` to the agent. These edit rules haven't been checked against a real model yet, so
-  prefer read-only with OpenCode for now.
+- `--allow-edits` isn't available for OpenCode yet: its edit path rules haven't been checked against a real
+  run, so serve refuses the flag and says to serve OpenCode read-only.
 - A non-zero exit or an `error` event is a failed run.
 
 ## Logs

@@ -850,8 +850,8 @@ computer, so serve defines a deny-by-default permission profile (a beta Codex fe
 inline on the command line where the person's config can't change it:
 
 ```text
-codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable hooks
-  --thread-source spew-mesh-serve
+codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable hooks --disable plugins
+  -c analytics.enabled=false --thread-source spew-mesh-serve
   -c 'default_permissions="spew-mesh-serve"' -c 'permissions.spew-mesh-serve=<profile>'
   [-m <model>] [-c 'model_provider="<id>"' -c 'model_providers.<id>=<inline table>']
   -o <run file> [resume <thread id>] -
@@ -874,13 +874,16 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
 - `<codex dir>` is the Codex install, which Codex re-runs inside its Linux sandbox. Resolve the real path of
   `codex` on PATH: when it contains a `node_modules/@openai/codex` component, use that folder (it holds the nested
   platform package); else when it is under `$CODEX_HOME/packages/standalone/current`, use that folder; else use
-  the binary's own folder.
+  the binary's own folder. A local or `--prefix` npm install puts the platform package next to the wrapper
+  instead of inside it, so serve finds it the way Node's module lookup does.
 - At start, `serve codex` checks the profile with `codex sandbox -C <cwd> -c 'permissions.spew-mesh-serve=<profile>'
   -P spew-mesh-serve -- cat <file>`: reading a file in `--cwd` must work, and reading a canary file serve writes
   outside `--cwd`, or a `.env` canary inside it, must fail. If either check fails (for example on a platform where the profile isn't enforced),
   it refuses to serve, and `doctor` shows the error.
 - `--ignore-user-config` is required. Codex silently ignores permission profiles when any loaded config sets
-  `sandbox_mode`, and the flag also keeps the person's MCP servers (mesh included) and `notify` out.
+  `sandbox_mode`, and the flag also keeps the person's MCP servers (mesh included) and `notify` out. It also drops
+  the person's own opt-outs, so serve turns plugins and analytics off on the command line (otherwise Codex
+  0.163.0 fetches its plugin catalogue from github.com and posts usage metrics on every run).
 - serve reads `model` and `model_provider` from the person's config.toml; `--model` wins. From the
   `[model_providers.<id>]` table it copies only `name`, `base_url`, `env_key`, `wire_api` and `query_params`.
   When that table holds any header or token key (`http_headers`, `env_http_headers`, `bearer_token_env_var` or
@@ -951,9 +954,9 @@ and ignores every failure.
   calls made in a subagent the root session id as `_mesh_session`.
 - The plugin never calls `client.session.prompt` or `promptAsync`, which would add a message or start a turn on
   its own.
-- The plugin card verifies with a mock model (as in 15) that a part appended in `chat.message` and text appended
-  in `tool.execute.after` reach the model; until verified, docs/agents.md says OpenCode sees messages through the
-  `messages` tool.
+- Verified on 1.19.3 with a mock model (15): the part appended in `chat.message`, with the id of the person's
+  last part plus `mesh`, is saved after the person's part and reaches the model, and text appended in
+  `tool.execute.after` reaches the model too.
 
 **Session identity.** The daemon keys an OpenCode session on its session id (`ses_...`), with the OpenCode process
 id (`pid` from the plugin) for rule 2 of 6.4. An OpenCode MCP server isn't tied to one session (one OpenCode
@@ -992,23 +995,22 @@ with these variables added to the environment:
                   "glob": "allow", "list": "allow"}}}}
 ```
 
-- Verified on 1.19.3 with a mock model: denied tools disappear from the model's tool list (only `glob`, `list`
-  and `read` remain; bash, edit, web fetch, subagents and MCP tools are gone), reads outside `--dir` are refused
+- Verified on 1.19.3 with a mock model: denied tools disappear from the model's tool list (only `glob` and
+  `read` remain, since 1.19.3 has no `list` tool and `read` lists folders; bash, edit, web fetch, subagents and MCP tools are gone), reads outside `--dir` are refused
   by OpenCode's `external_directory` rule, and `.env`, `.env.*` and nested `.env.local` reads are refused. Grep is
   left out because its permission matches the search pattern, not the files it reads.
 - An unknown `--agent` makes OpenCode fall back to its default agent with only a warning. The top-level
   `"permission": {"*": "deny"}` keeps even that fallback from editing, running commands or reaching the network,
   and serve treats a run whose stderr names the fallback as failed.
 - The person's other global MCP servers still start (their tools are denied); docs/serve.md says so.
-- `--allow-edits` adds `"edit": {"*": "allow", ".git/*": "deny", "*.env": "deny", "*.env.*": "deny", "*.pem":
-  "deny", "*.key": "deny"}` to the agent (edits outside `--dir` stay refused by `external_directory`). The serve
-  card checks with a mock model that the path rules hold for `edit`; if they don't, `--allow-edits` is refused
-  for OpenCode.
+- `--allow-edits` would add `"edit": {"*": "allow", ".git/*": "deny", "*.env": "deny", "*.env.*": "deny",
+  "*.pem": "deny", "*.key": "deny"}` to the agent (edits outside `--dir` stay refused by `external_directory`).
+  These path rules haven't been checked against a real run, so v0.1 refuses `--allow-edits` for OpenCode.
 - The JSON output is one event per line, each with `sessionID`. The first event gives the session id for the
   conversation map; follow-ups pass `--session`. The answer is the text parts after the last tool event. A
   non-zero exit or an `error` event is a failed run. serve reads only `type`, `sessionID`, `part.type`,
-  `part.text` and `error`. Until the opt-in test against OpenCode pins the wording, a stderr line naming the
-  agent with "not found" or "fall back"/"falling back" counts as the fallback warning.
+  `part.text` and `error`. A stderr line naming the agent with "not found" or "fall back"/"falling back" counts as
+  the fallback warning; 1.19.3 prints `! agent "spew-mesh-serve" not found. Falling back to default agent`.
 
 ### 8.5 spew card capture
 
@@ -1094,8 +1096,8 @@ setup never pre-approves `ask`, `tell` or `reply` in any client; `who` and `mess
 - Permissions: read-only by default. The agent can read and search inside `--cwd`, except secret files (`.env`
   files, keys, `.git/config`); it can't write files, reach the network, or read outside `--cwd`. Claude Code gets
   only its read and search tools under `--restricted`; Codex runs its shell commands in a sandbox that can read
-  only the repo; OpenCode gets only `read`, `glob` and `list` under a deny-all agent. `--allow-edits` also allows file edits inside `--cwd`, never under `.git/` or to secret
-  files. The exact flags per client are in 8.2 to 8.4 and docs/serve.md.
+  only the repo; OpenCode gets only `read` and `glob` under a deny-all agent. `--allow-edits` also allows file edits inside `--cwd`, never under `.git/` or to secret
+  files (Claude Code and Codex only in v0.1). The exact flags per client are in 8.2 to 8.4 and docs/serve.md.
 - Who may ask: `[serve] from = "room"` (default: anyone admitted who shares the responder's room) or `"own"`
   (only your own devices). Presence sent to a teammate's device leaves out a responder with `from = "own"`, so a
   teammate's ask finds no such session on their own device, and a deliver that arrives anyway gets `refused` with

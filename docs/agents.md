@@ -220,10 +220,12 @@ session.
 there, setup writes nothing more. Otherwise it writes the same `SKILL.md` to
 `<config folder>/skills/spew-mesh/SKILL.md`.
 
-**How messages arrive.** Use the `mesh_messages` tool. The plugin also appends messages to your next message and
-to tool output, but that path hasn't been checked against a real model yet, so for now treat the messages tool as
-the way an OpenCode session sees its messages. Every other mesh tool result ends with a line when messages are
-waiting.
+**How messages arrive.** The plugin adds waiting messages to your next message and to tool output, so the model
+sees them at its next step, as in Claude Code. The `mesh_messages` tool shows them too, and every other mesh tool
+result ends with a line when messages are waiting.
+
+**npm at startup.** OpenCode installs its `@opencode-ai/plugin` package from npm into the config folder when it
+starts. That is OpenCode's own behavior, not something setup adds.
 
 **Session identity.** One OpenCode process can run several sessions, and its tool calls carry no session id. The
 plugin pins it: its `tool.execute.before` hook writes the session id into the `_mesh_session` argument of every

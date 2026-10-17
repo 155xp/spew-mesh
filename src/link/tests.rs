@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
-    Connection, ConnectionError, PortmapperConfig, RecvStream, SendStream, presets,
+    Connection, ConnectionError, PortmapperConfig, RecvStream, SendStream, VarInt, presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use tokio::sync::{broadcast, mpsc};
@@ -1189,6 +1189,55 @@ async fn a_second_link_from_the_other_device_is_closed() {
         Response::Pong
     );
     assert!(a.links.status().links[0].dialed);
+    a.assert_no_event();
+}
+
+#[tokio::test]
+async fn a_dial_that_loses_to_the_peers_link_is_no_failure() {
+    // r (raw) is the designated dialer. a dials first; r holds that dial without answering hello, links the other
+    // way, and then closes a's dial with code 2.
+    let (kr, ka) = ordered(40, 41);
+    let raw = raw_endpoint(kr.clone()).await;
+    let raw_addrs = raw.bound_sockets();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn({
+        let server = raw.clone();
+        async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let _ = held_tx.send(conn);
+        }
+    });
+    let mut timing = fast();
+    timing.lazy_dial_after = Duration::ZERO;
+    let mut a = node(
+        ka.clone(),
+        admission(
+            ka.public(),
+            &[other(kr.public(), "maya", "maya-mbp").at(raw_addrs)],
+        ),
+        timing,
+    )
+    .await;
+    let a_addr = addr_of(&a);
+    let peer = async {
+        let held = tokio::time::timeout(WAIT, held_rx).await.unwrap().unwrap();
+        let link = tokio::time::timeout(WAIT, raw.connect(a_addr, ALPN))
+            .await
+            .unwrap()
+            .unwrap();
+        raw_serve(link.clone(), Hello::ours("raw-peer"));
+        // a registers r's link before it answers this hello.
+        assert!(matches!(raw_hello(&link).await, Response::Hello(_)));
+        held.close(VarInt::from_u32(2), b"duplicate");
+        link
+    };
+    let (answer, _link) = tokio::join!(a.links.call(kr.public(), Request::Ping), peer);
+    assert_eq!(answer.unwrap(), Response::Pong, "the call took r's link");
+    a.expect_up(kr.public()).await;
+    let status = a.links.status();
+    assert!(status.problems.is_empty(), "{:?}", status.problems);
+    assert_eq!(status.links.len(), 1);
+    assert!(!status.links[0].dialed);
     a.assert_no_event();
 }
 

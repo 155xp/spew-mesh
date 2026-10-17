@@ -738,9 +738,14 @@ impl Shared {
                 format!("no link within {} s", timeout.as_secs_f32()),
             )),
         };
-        result.map_err(|error| {
+        result.or_else(|error| {
             let mut st = self.lock();
             if let Some(ps) = st.peers.get_mut(&peer) {
+                // The dial lost to a link the peer opened meanwhile, which closes ours with code 2 (5.3): use that
+                // link, and report no failure, since nothing kept the devices apart.
+                if let Some(link) = &ps.link {
+                    return Ok(link.conn.clone());
+                }
                 ps.last_dial_failure = Some((Instant::now(), error.detail.clone()));
                 ps.problem = Some(LinkProblem {
                     device: peer.to_string(),
@@ -749,10 +754,10 @@ impl Shared {
                     at_ms: unix_ms(),
                 });
             }
-            match error.problem {
+            Err(match error.problem {
                 Problem::Protocol => CallError::Protocol(error.detail),
                 _ => CallError::Unreachable(error.detail),
-            }
+            })
         })
     }
 

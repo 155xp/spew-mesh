@@ -201,8 +201,9 @@ With these environment changes:
 ## Logs
 
 The terminal gets one line per question: taken, answered (with the cost when the client reports one), or failed
-with the reason. serve also writes its events to the daemon's log, `~/.spew/mesh/logs/mesh.log`, including the raw
-output of every failed run. `SPEW_MESH_LOG` sets the log filter (`info` by default; `debug` for more).
+with the reason. serve also writes its events to the daemon's log, `~/.spew/mesh/logs/mesh.log` (mode 0600),
+including up to 16 KiB each of a failed run's stdout and stderr. `SPEW_MESH_LOG` sets the log filter (`info` by
+default; `debug` for more).
 
 ## Stopping
 

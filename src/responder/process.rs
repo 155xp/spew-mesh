@@ -116,6 +116,8 @@ struct GroupGuard {
 }
 
 impl GroupGuard {
+    // The crate denies unsafe code; killing a process group needs libc::killpg (see SAFETY below).
+    #[allow(unsafe_code)]
     fn kill(&self) {
         // SAFETY: killpg only sends a signal. The group id is our child's pid, which can't be reused while
         // the child is unreaped.
@@ -133,6 +135,9 @@ impl Drop for GroupGuard {
     }
 }
 
+// The crate denies unsafe code; starting the run in its own session needs pre_exec and libc::setsid (see SAFETY
+// below).
+#[allow(unsafe_code)]
 async fn run_system(spec: RunSpec) -> io::Result<RunOutput> {
     let start = Instant::now();
     let mut cmd = tokio::process::Command::new(&spec.program);

@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     DeviceEntry, EndpointId, MAX_DISPLAY, MAX_ROOM_NAME, MAX_VERSION, Me, Member, RelayUrl, Room,
-    RoomKind, Roster, RosterError, is_display_text, is_valid_device_name, is_valid_person_name,
-    is_valid_room_id, parse_endpoint_id, private_room, this_device_entry,
+    RoomKind, Roster, RosterError, is_display_text, parse_endpoint_id, private_room,
+    this_device_entry,
 };
+use crate::address::{is_device_name, is_person, is_room};
 use crate::spew_api::{ApiError, SpewApi};
 
 /// The largest `ttl_secs` accepted from spew (4.2). Teammates stay admitted for 15 × `ttl_secs` while spew
@@ -427,7 +428,7 @@ fn clean(me: &Me, peers: &Peers) -> Result<Cleaned, RosterError> {
             );
             continue;
         }
-        if !is_valid_room_id(&room.id) {
+        if !is_room(&room.id) {
             report(
                 &mut dropped,
                 format!("room {}: id breaks the name rules", shown(&room.id)),
@@ -436,7 +437,7 @@ fn clean(me: &Me, peers: &Peers) -> Result<Cleaned, RosterError> {
         }
         let mut members = Vec::new();
         for member in &room.members {
-            if !is_valid_person_name(&member.username) {
+            if !is_person(&member.username) {
                 report(
                     &mut dropped,
                     format!(
@@ -492,7 +493,7 @@ fn clean_devices(
             );
             continue;
         };
-        if !is_valid_device_name(&device.name) {
+        if !is_device_name(&device.name) {
             report(
                 dropped,
                 format!(

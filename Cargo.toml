@@ -39,6 +39,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 url = "2.5"
 
+# CI runs `cargo clippy --all-targets -- -D warnings`, so every warning here fails the build. A module that
+# needs unsafe code (libc calls) allows it locally with #[allow(unsafe_code)] and a SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 [profile.dev]
 debug = "line-tables-only"
 

@@ -1097,8 +1097,9 @@ setup never pre-approves `ask`, `tell` or `reply` in any client; `who` and `mess
   only the repo; OpenCode gets only `read`, `glob` and `list` under a deny-all agent. `--allow-edits` also allows file edits inside `--cwd`, never under `.git/` or to secret
   files. The exact flags per client are in 8.2 to 8.4 and docs/serve.md.
 - Who may ask: `[serve] from = "room"` (default: anyone admitted who shares the responder's room) or `"own"`
-  (only your own devices). Others get `refused` with code `no-such-session`, and presence sent to a teammate's
-  device leaves out a responder with `from = "own"`, so it can't be seen either.
+  (only your own devices). Presence sent to a teammate's device leaves out a responder with `from = "own"`, so a
+  teammate's ask finds no such session on their own device, and a deliver that arrives anyway gets `refused` with
+  code `no-such-session`.
 - Cost limits: at most `[serve] max_runs_per_person_per_hour` (default 10) runs for any one asking person and
   `max_runs_per_hour` (default 30) in all; over either, `refused` with code `busy`. Claude Code runs also stop at
   `[serve] max_budget_usd` (default 0.50) each. Asks from your own devices count only toward the total.

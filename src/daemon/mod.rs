@@ -258,7 +258,9 @@ where
         key: identity.secret_key().clone(),
         name: identity.name().to_string(),
         platform: platform().to_string(),
-        pending: Arc::new(AtomicBool::new(false)),
+        // Starts pending so a registration that failed before a restart is tried again; the first
+        // refresh clears it when spew already lists this device.
+        pending: Arc::new(AtomicBool::new(true)),
     };
     let registration_pending = registration.pending.clone();
     let control = Arc::new(Control {

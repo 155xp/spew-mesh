@@ -1,11 +1,13 @@
-//! Per-stream helpers: a call's head, read before its body (5.5 step 2).
+//! Per-stream helpers: a call's head, read before its body (5.5 step 2), and a response written with a deadline.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use tokio::io::AsyncWrite;
 
-use crate::wire::CallKind;
+use crate::wire::{CallKind, Response, write_frame};
 
 /// What a call is, read without parsing its body: the kind, and the `id` a rate-limited `deliver` is refused
 /// with (5.5 step 2). Every other field is skipped without being built.
@@ -120,10 +122,34 @@ impl<'de> Deserialize<'de> for MaybeStr {
     }
 }
 
+/// How writing a response ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Written {
+    /// The whole frame was written.
+    Done,
+    /// The stream failed: reset by the peer, or the link is gone.
+    Failed,
+    /// The peer didn't take the frame within the limit.
+    TimedOut,
+}
+
+/// Writes one response frame, giving up after `limit` so a peer that stops reading can't hold the stream open.
+pub(crate) async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &Response,
+    limit: Duration,
+) -> Written {
+    match tokio::time::timeout(limit, write_frame(writer, response)).await {
+        Ok(Ok(())) => Written::Done,
+        Ok(Err(_)) => Written::Failed,
+        Err(_) => Written::TimedOut,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::parse_incoming;
+    use crate::wire::{Hello, parse_incoming, read_frame};
 
     fn head(json: &str) -> CallHead {
         CallHead::read(json.as_bytes())
@@ -170,6 +196,34 @@ mod tests {
             head(r#"{"t":"deliver","id":"a","id":"b"}"#).id.as_deref(),
             Some("b"),
             "the last id wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_nobody_reads_times_out() {
+        let limit = Duration::from_millis(50);
+        let response = Response::Hello(Hello::ours("sam-mac"));
+
+        // The reader never reads and the pipe holds less than the frame.
+        let (mut writer, _reader) = tokio::io::duplex(16);
+        assert_eq!(
+            write_response(&mut writer, &response, limit).await,
+            Written::TimedOut
+        );
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        assert_eq!(
+            write_response(&mut writer, &response, limit).await,
+            Written::Done
+        );
+        let payload = read_frame(&mut reader).await.unwrap();
+        assert_eq!(Response::parse(&payload).unwrap(), response);
+
+        let (mut writer, reader) = tokio::io::duplex(16);
+        drop(reader);
+        assert_eq!(
+            write_response(&mut writer, &response, limit).await,
+            Written::Failed
         );
     }
 }

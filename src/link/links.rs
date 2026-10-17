@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use super::config::{LinkConfig, Timing};
 use super::endpoint::{self, Gate, close, hint_addr};
 use super::limits::{Backoff, Gap, RateWindow};
-use super::stream::CallHead;
+use super::stream::{CallHead, Written, write_response};
 use super::{
     CallError, Inbound, LinkEvent, LinkInfo, LinkProblem, LinkStatus, Links, Peer, RelayInfo,
 };
@@ -39,7 +39,7 @@ use crate::wire::{
 /// Capacity of the link event channel; a receiver that falls this far behind gets `Lagged`.
 const EVENT_CAPACITY: usize = 1024;
 /// How long [`IrohLinks::shutdown`] waits for the endpoint to close.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// QUIC close code for a link whose `hello` failed for a reason other than versions. The spec lists only codes 1
 /// to 4; 0 is QUIC's "no error".
 const HELLO_FAILED: (u32, &[u8]) = (0, b"hello-failed");
@@ -1063,12 +1063,17 @@ impl Shared {
             Ok(Err(error)) => {
                 // Don't read the rest of an oversized or broken frame.
                 let _ = recv.stop(VarInt::from_u32(0));
-                respond(&mut send, &Response::from(&error)).await;
+                respond(
+                    &mut send,
+                    &Response::from(&error),
+                    self.timing().first_frame,
+                )
+                .await;
                 return;
             }
         };
         if let Some(response) = self.answer(&conn, id, &hello_done, &payload).await {
-            respond(&mut send, &response).await;
+            respond(&mut send, &response, self.timing().first_frame).await;
         }
     }
 
@@ -1290,8 +1295,17 @@ fn rate_limited(id: Option<&str>) -> Response {
     }
 }
 
-async fn respond(send: &mut SendStream, response: &Response) {
-    if write_frame(send, response).await.is_ok() {
-        let _ = send.finish();
+/// Answers a call and finishes the stream. A peer that doesn't take the answer within `limit` gets the stream
+/// reset, so it can't hold one of its 16 streams, and our send buffer, by not reading.
+async fn respond(send: &mut SendStream, response: &Response, limit: Duration) {
+    match write_response(send, response, limit).await {
+        Written::Done => {
+            let _ = send.finish();
+        }
+        // Reset by the peer, or the link is gone.
+        Written::Failed => {}
+        Written::TimedOut => {
+            let _ = send.reset(VarInt::from_u32(0));
+        }
     }
 }

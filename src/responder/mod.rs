@@ -1,14 +1,18 @@
 //! serve: answering questions with headless agent runs (9).
 //!
-//! The command line, environment and permission set for each client (8.2 to 8.4), and a runner that spawns
-//! each run in its own process group with a timeout and an output cap.
+//! The command line, environment and permission set for each client (8.2 to 8.4), a runner that spawns
+//! each run in its own process group with a timeout and an output cap, the run limits and queue, the
+//! conversation map, and the prompt.
 
 pub mod claude;
 pub mod codex;
 mod config;
 pub mod env;
+pub mod limits;
+pub mod memory;
 pub mod opencode;
 pub mod process;
+pub mod prompt;
 
 use std::fmt;
 use std::path::PathBuf;

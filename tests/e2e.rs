@@ -9,7 +9,7 @@ mod net_support;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -395,6 +395,7 @@ async fn a_card_ask_reaches_the_session_holding_the_card_on_another_device() {
 /// A fake `claude -p` for serve: records argv and stdin of call N as `<rec>/argv.N` and `stdin.N` and answers
 /// "answer N" in the session it was given (`--session-id` or `--resume`).
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+[ -n "$FAKE_PROBE" ] && exit 0
 PATH=/usr/bin:/bin
 rec="$FAKE_REC"
 n=$(cat "$rec/count" 2>/dev/null || echo 0)
@@ -418,11 +419,33 @@ struct Serve {
     rec: PathBuf,
 }
 
+// Writes an executable script, then runs it once with FAKE_PROBE set until it starts: a child another test thread
+// forked while the file was open for writing keeps it busy (ETXTBSY) until that child execs.
+fn write_exe(path: &Path, script: &str) {
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..250 {
+        match std::process::Command::new(path)
+            .env("FAKE_PROBE", "1")
+            .status()
+        {
+            Ok(status) => {
+                assert!(status.success(), "{}: {status}", path.display());
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+    panic!("{} stayed busy", path.display());
+}
+
 impl Serve {
     fn start(node: &Node, folder: &str) -> Serve {
         let exe = node.bin().join("claude");
-        std::fs::write(&exe, FAKE_CLAUDE).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exe(&exe, FAKE_CLAUDE);
         let rec = node.tmp.path().join("rec");
         std::fs::create_dir_all(&rec).unwrap();
         let mut child = node

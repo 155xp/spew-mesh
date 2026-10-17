@@ -13,7 +13,9 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode,
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::sync::broadcast;
 
-use super::config::{LinkConfig, MAX_INBOUND_STREAMS, MDNS_SERVICE};
+use super::config::{
+    LinkConfig, MAX_INBOUND_STREAMS, MDNS_SERVICE, RECEIVE_WINDOW, STREAM_RECEIVE_WINDOW,
+};
 use crate::roster::{Admission, AdmittedDevice};
 use crate::settings::NetworkMode;
 use crate::wire::{ALPN, CloseCode};
@@ -121,7 +123,8 @@ impl EndpointHooks for AdmissionHook {
 }
 
 /// The QUIC settings every link uses: keep-alive and idle timeout (5.3), 16 inbound bidirectional streams and no
-/// unidirectional ones (5.4).
+/// unidirectional ones, and receive windows sized to the frame limit rather than QUIC's bulk-transfer defaults
+/// (5.4).
 fn transport_config(config: &LinkConfig) -> Result<QuicTransportConfig, String> {
     let idle = config
         .timing
@@ -133,6 +136,8 @@ fn transport_config(config: &LinkConfig) -> Result<QuicTransportConfig, String> 
         .max_idle_timeout(Some(idle))
         .max_concurrent_bidi_streams(VarInt::from_u32(MAX_INBOUND_STREAMS))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW))
+        .receive_window(VarInt::from_u32(RECEIVE_WINDOW))
         .build())
 }
 
@@ -236,6 +241,36 @@ mod tests {
             rooms: BTreeSet::new(),
             relay: relay.map(|r| r.parse().unwrap()),
             addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+        }
+    }
+
+    #[test]
+    fn receive_windows_track_the_frame_limit() {
+        // One stream holds a whole frame and its 4-byte length prefix; all 16 streams fit the link's window.
+        assert!(STREAM_RECEIVE_WINDOW as usize >= crate::wire::MAX_FRAME + 4);
+        assert!(STREAM_RECEIVE_WINDOW as usize <= 2 * crate::wire::MAX_FRAME);
+        assert_eq!(RECEIVE_WINDOW, MAX_INBOUND_STREAMS * STREAM_RECEIVE_WINDOW);
+        let config = LinkConfig {
+            secret_key: iroh::SecretKey::from_bytes(&[7; 32]),
+            device_name: "sam-mac".into(),
+            network: crate::settings::NetworkSettings {
+                mode: NetworkMode::Local,
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 0,
+                mdns: false,
+                relays: Vec::new(),
+                relay_token: None,
+            },
+            timing: crate::link::Timing::default(),
+        };
+        let shown = format!("{:?}", transport_config(&config).unwrap());
+        for field in [
+            "stream_receive_window: 262144",
+            " receive_window: 4194304",
+            "max_concurrent_bidi_streams: 16",
+            "max_concurrent_uni_streams: 0",
+        ] {
+            assert!(shown.contains(field), "{field} in {shown}");
         }
     }
 

@@ -11,6 +11,11 @@ use crate::settings::NetworkSettings;
 pub const MDNS_SERVICE: &str = "spewmesh";
 /// Most inbound bidirectional streams open at once on one link (5.4).
 pub const MAX_INBOUND_STREAMS: u32 = 16;
+/// How much a peer may send on one stream before we read it: a whole 128 KiB frame with its length prefix, with
+/// room to spare, so receive memory tracks the frame limit (5.4).
+pub(crate) const STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
+/// How much a peer may send on one link before we read it: every inbound stream at its full window (4 MiB).
+pub(crate) const RECEIVE_WINDOW: u32 = MAX_INBOUND_STREAMS * STREAM_RECEIVE_WINDOW;
 
 /// Everything the link layer takes from the daemon at start.
 #[derive(Clone)]

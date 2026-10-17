@@ -2,10 +2,12 @@
 //! taking one question at a time and replying with the answer or the failure line.
 //!
 //! A keeper task owns the connection: it connects, opens the session with a stable `client_session` (so a
-//! re-open re-attaches the same session, 6.4 rule 3), and opens it again whenever the connection drops. The loop
+//! re-open re-attaches the same session, 6.4 rule 3), and opens it again whenever the connection drops. A
+//! reconnect starts a missing daemon only while `<home>/run/stopped` is absent (6.1), so `daemon stop` holds. The loop
 //! itself only takes, runs and replies, always with the newest open session. A reply that couldn't go out because
 //! the connection dropped is sent again once the session is back.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -473,6 +475,22 @@ fn lost(e: &ClientError) -> bool {
     matches!(e, ClientError::Disconnected | ClientError::Io(_))
 }
 
+/// `<home>/run/stopped`: while it exists, a reconnecting responder doesn't start a daemon (6.1). `daemon stop`
+/// writes it and a daemon that holds the lock removes it.
+pub fn stopped_file(home: &Home) -> PathBuf {
+    home.run_dir().join("stopped")
+}
+
+// The first connect may start a daemon; a reconnect starts one only while `run/stopped` is absent, so a
+// `daemon stop` stays stopped and a crashed daemon comes back (6.1, 12).
+fn reconnect_options(cfg: &LoopConfig, reconnect: bool) -> ConnectOptions {
+    let mut opts = cfg.connect.clone();
+    if reconnect && stopped_file(&cfg.home).exists() {
+        opts.start = false;
+    }
+    opts
+}
+
 // Keeps one session open: connects, opens, and re-opens after a lost connection or when the loop asks.
 async fn keep(
     cfg: Arc<LoopConfig>,
@@ -486,7 +504,7 @@ async fn keep(
     loop {
         let c = match client.take().filter(|c| !c.is_closed()) {
             Some(c) => c,
-            None => match Client::connect(&cfg.home, &cfg.connect).await {
+            None => match Client::connect(&cfg.home, &reconnect_options(&cfg, opened)).await {
                 Ok(c) => c,
                 Err(e) => {
                     // The first connection decides whether serve starts at all; another user's socket is
@@ -580,6 +598,31 @@ mod tests {
         let cs = a.open.client_session.clone().unwrap();
         assert!(cs.starts_with("serve-"), "{cs}");
         assert_ne!(a.open.client_session, b.open.client_session);
+    }
+
+    #[test]
+    fn a_reconnect_starts_no_daemon_while_run_stopped_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path()).unwrap();
+        home.ensure().unwrap();
+        let limits = GateSettings::from(&super::super::ServeSettings::default());
+        let cfg = LoopConfig::new(
+            home.clone(),
+            ServeClient::Claude,
+            "/w".into(),
+            None,
+            None,
+            limits,
+        );
+        assert!(reconnect_options(&cfg, false).start);
+        assert!(reconnect_options(&cfg, true).start);
+        std::fs::write(stopped_file(&home), "").unwrap();
+        assert!(
+            reconnect_options(&cfg, false).start,
+            "the first connect still starts one"
+        );
+        assert!(!reconnect_options(&cfg, true).start);
+        assert!(!reconnect_options(&cfg, true).upgrade);
     }
 
     #[test]

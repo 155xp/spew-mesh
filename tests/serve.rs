@@ -502,6 +502,33 @@ fn serve_carries_on_when_the_daemon_restarts_mid_run() {
     assert!(mesh.responders().is_empty());
 }
 
+#[test]
+fn a_reconnecting_serve_leaves_a_stopped_daemon_stopped() {
+    let mesh = Mesh::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = mesh.api();
+    let mut serve = mesh.serve(&["claude", "--cwd", api.to_str().unwrap()]);
+    serve.wait_for("Serving claude in");
+
+    // What `daemon stop` does (6.1): write run/stopped, then stop the daemon.
+    std::fs::write(mesh.home().join("run").join("stopped"), "").unwrap();
+    rt.block_on(async { mesh.client().await.shutdown().await.unwrap() });
+    serve.wait_for("Lost the daemon; reconnecting.");
+    // Reconnects at about 0.5 s and 1.5 s go by without starting a daemon.
+    std::thread::sleep(Duration::from_secs(2));
+    let status = mesh.run(&["daemon", "status"]);
+    assert_eq!(code(&status), 3, "{}", stdout(&status));
+
+    // A daemon started some other way is picked up again.
+    let started = mesh.run(&["daemon", "start"]);
+    assert_eq!(code(&started), 0, "{}", stderr(&started));
+    serve.wait_for("Back on the daemon as");
+    let asked = mesh.run(&["ask", "claude", "--wait", "30", "still there?"]);
+    assert_eq!(code(&asked), 0, "{}", stderr(&asked));
+    assert!(stdout(&asked).contains("answer 1"), "{}", stdout(&asked));
+    assert_eq!(serve.interrupt(), 0);
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // In-process daemons on the in-memory network.
 

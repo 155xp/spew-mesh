@@ -434,7 +434,10 @@ retries (the message stays queued); `invalid`, `no-such-session`, `session-ended
   sends `daemon.shutdown` and starts a new one (an older client never does, so two versions can't take turns);
   hooks never do. `doctor` reports a mismatch.
 - Long-lived clients (MCP servers, responders) reconnect after a lost connection, starting at 500 ms and doubling
-  to 20 s with jitter, and re-open their sessions.
+  to 20 s with jitter, and re-open their sessions. They start a missing daemon only while `<home>/run/stopped` is
+  absent. `daemon stop` and `uninstall` write that file before stopping the daemon, and a daemon removes it once
+  it holds the lock. So a stopped daemon stays stopped until a CLI command, a `start` or `prompt` hook or an MCP
+  tool call starts it, and a crashed daemon comes back on its own.
 
 ### 6.2 Protocol
 
@@ -1219,7 +1222,8 @@ remote presence cache, the roster cache, and dedupe keys. A daily sweep deletes 
 ## 12. Daemon lifetime
 
 v0.1 installs no background service. The daemon starts on demand (6.1) and runs until `daemon stop`, `uninstall`
-or the computer restarts; after a restart, the first agent session or CLI command starts it again. A LaunchAgent
+or the computer restarts; after a restart, the first agent session or CLI command starts it again. Reconnecting
+MCP servers and responders don't undo a `daemon stop` (6.1). A LaunchAgent
 and a systemd user unit are a later version.
 
 ---

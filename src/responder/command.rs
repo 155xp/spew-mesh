@@ -139,7 +139,9 @@ async fn serve(
         SystemClock,
     )
     .await?;
-    let daemon = Client::connect(&home, &ConnectOptions::responder())
+    // The first connect is a CLI command's: it starts a missing daemon and replaces an older one (6.1, 9).
+    // Reconnects use the loop's responder options.
+    let daemon = Client::connect(&home, &ConnectOptions::cli())
         .await
         .map_err(|e| Problem::new(e, DOCTOR))?;
     let folder = responder.config().cwd.clone();

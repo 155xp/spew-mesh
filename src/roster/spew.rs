@@ -178,14 +178,10 @@ impl SpewRosterCache {
     ) -> Result<(), RosterError> {
         match fetch {
             PeersFetch::Modified { etag, peers } => {
-                if let Some(tag) = &etag
-                    && !is_display_text(tag, MAX_VERSION)
-                {
-                    return Err(RosterError("invalid ETag from spew".into()));
-                }
                 build(&self.me, &peers, this_device, device_name, true, true)?;
                 self.peers = Some(peers);
-                self.etag = etag;
+                // An odd ETag only costs a full fetch next time; it says nothing about who is admitted.
+                self.etag = etag.filter(|t| is_display_text(t, MAX_VERSION));
             }
             PeersFetch::NotModified => {
                 if self.peers.is_none() {

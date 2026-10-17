@@ -1900,6 +1900,18 @@ mod tests {
     }
 
     #[test]
+    fn device_lists_bare_or_wrapped() {
+        let key = iroh::SecretKey::from_bytes(&[5; 32]).public();
+        let one = format!(r#"{{"name": "sam-mbp", "public_key": "{key}", "self": true}}"#);
+        for text in [format!("[{one}]"), format!(r#"{{"devices": [{one}]}}"#)] {
+            let (DeviceList::Bare(d) | DeviceList::Wrapped { devices: d }) =
+                serde_json::from_str(&text).unwrap();
+            assert_eq!(d.len(), 1);
+            assert!(d[0].is_self);
+        }
+    }
+
+    #[test]
     fn relay_reports_are_throttled() {
         let a: RelayUrl = "https://relay-a.example.com".parse().unwrap();
         let b: RelayUrl = "https://relay-b.example.com".parse().unwrap();

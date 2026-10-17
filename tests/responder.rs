@@ -386,12 +386,39 @@ async fn claude_forgets_a_session_it_no_longer_has() {
     assert_eq!(fake.argv(2)[3], "--resume");
     assert!(
         r.conversations()
-            .get(&ConversationKey::of(&q))
+            .get(&ConversationKey::of(ServeClient::Claude, &q))
             .unwrap()
             .is_none()
     );
     r.answer(&question(Q3, C1, "q3")).await.unwrap();
     assert_eq!(fake.argv(3)[3], "--session-id");
+}
+
+#[tokio::test]
+async fn a_failed_follow_up_still_marks_the_conversation_used() {
+    let fake = Fake::new("claude");
+    fake.set("stdout", 1, &claude_ok("one", 0.0));
+    fake.set("stderr", 2, "Error: something broke\n");
+    fake.set("exit", 2, "1");
+    let clock = std::sync::Arc::new(ManualClock::new(1_000));
+    let mut r = Responder::start(
+        fake.config(ServeClient::Claude),
+        &fake.host(),
+        SystemRunner,
+        MemoryConversations::new(),
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    let q = question(Q1, C1, "q");
+    r.answer(&q).await.unwrap();
+    let key = ConversationKey::of(ServeClient::Claude, &q);
+    assert_eq!(r.conversations().used_at(&key), Some(1_000));
+    // The store's sweep goes by this time (11.1).
+    clock.advance(Duration::from_secs(60));
+    assert!(r.answer(&question(Q2, C1, "q2")).await.is_err());
+    assert_eq!(r.conversations().used_at(&key), Some(61_000));
+    assert!(r.conversations().get(&key).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -591,10 +618,10 @@ async fn codex_new_thread_replaces_the_mapping() {
     r.answer(&question(Q2, C1, "two")).await.unwrap();
     let stored = r
         .conversations()
-        .get(&ConversationKey::of(&q))
+        .get(&ConversationKey::of(ServeClient::Codex, &q))
         .unwrap()
         .unwrap();
-    assert_eq!(stored.session_id, THREAD2);
+    assert_eq!(stored, THREAD2);
     r.answer(&question(Q3, C1, "three")).await.unwrap();
     let argv = fake.argv(6);
     assert_eq!(argv[argv.len() - 2], THREAD2);

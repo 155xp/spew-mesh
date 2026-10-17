@@ -8,12 +8,14 @@ use tokio::sync::watch;
 
 use super::*;
 use crate::control::protocol::{
-    FetchParams, ReplyParams, SendResult, SendStatus, SessionOpen, TakeParams, TellParams,
+    FetchParams, Reason, ReplyParams, SendResult, SendStatus, SessionOpen, TakeParams, TellParams,
 };
 use crate::daemon::links::InboundDyn;
 use crate::daemon::testnet::{MemLinks, MemNet};
 use crate::link::Peer;
+use crate::responder::limits::{GateSettings, MAX_RUN_LIMIT};
 use crate::roster::file;
+use crate::settings::ServeFrom;
 use crate::wire::{
     ActivityState, DeliverState, ErrorCode, Incoming, PresenceDevice, Reach, Response,
 };
@@ -123,6 +125,7 @@ impl Node {
                     kind: SessionKind::Live,
                     name: None,
                     spew_project: room.map(str::to_string),
+                    serve: None,
                 },
             )
             .unwrap();
@@ -146,6 +149,7 @@ impl Node {
                     kind: SessionKind::Responder,
                     name: None,
                     spew_project: Some(room.into()),
+                    serve: None,
                 },
             )
             .unwrap();
@@ -565,6 +569,65 @@ async fn presence_is_filtered_and_held_to_once_a_second() {
     assert!(again[0].2 >= Duration::from_millis(1_200));
 }
 
+#[tokio::test]
+async fn presence_hides_an_own_only_responder_from_teammates() {
+    let net = MemNet::new();
+    let mac = Node::new(&net, SAM_MAC, "sam", "sam-mac");
+    let linux = Node::new(&net, SAM_LINUX, "sam", "sam-linux");
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    mac.open("web", Some("team"));
+    let own = GateSettings {
+        from: ServeFrom::Own,
+        max_runs_per_person_per_hour: 10,
+        max_runs_per_hour: 30,
+    };
+    let opened = mac
+        .courier
+        .open_session(
+            &mac.conn(),
+            responder_open(&mac, SessionKind::Responder, Some(own)),
+        )
+        .unwrap();
+    for (node, peer) in [(&linux, SAM_LINUX), (&maya, MAYA_MBP)] {
+        assert!(net.is_up(&id(SAM_MAC), &id(peer)));
+        mac.courier.on_link_event(&LinkEvent::Up(id(peer)));
+        node.courier.on_link_event(&LinkEvent::Up(id(SAM_MAC)));
+    }
+    let kinds = |device: u8| -> Vec<(SessionKind, String)> {
+        let round = mac.courier.presence_round(None);
+        let (_, snapshot, _) = round
+            .into_iter()
+            .find(|(d, _, _)| *d == id(device))
+            .unwrap();
+        snapshot
+            .sessions
+            .into_iter()
+            .map(|s| (s.kind, s.session))
+            .collect()
+    };
+    let to_maya = kinds(MAYA_MBP);
+    assert_eq!(to_maya.len(), 1, "{to_maya:?}");
+    assert_eq!(to_maya[0].0, SessionKind::Live);
+    let to_linux = kinds(SAM_LINUX);
+    assert!(
+        to_linux.contains(&(SessionKind::Responder, opened.session.clone())),
+        "{to_linux:?}"
+    );
+
+    // Serving the room again shows it to maya.
+    let room = GateSettings {
+        from: ServeFrom::Room,
+        ..own
+    };
+    mac.courier
+        .open_session(
+            &mac.conn(),
+            responder_open(&mac, SessionKind::Responder, Some(room)),
+        )
+        .unwrap();
+    assert!(kinds(MAYA_MBP).contains(&(SessionKind::Responder, opened.session)));
+}
+
 fn presence_session(
     session: &str,
     name: &str,
@@ -717,7 +780,12 @@ async fn a_device_that_leaves_every_shared_room_loses_its_mail_and_presence() {
     // A reply to a device that left is refused at once instead of waiting a day in the outbox.
     let too_late = maya.reply(&token, &later_id, "thanks", None).await;
     assert_eq!(too_late.status, SendStatus::Refused);
-    assert_eq!(too_late.code.as_deref(), Some("no-such-session"));
+    assert_eq!(too_late.code.as_deref(), Some(NOT_SHARED));
+    assert!(
+        too_late.note.contains("no longer in a shared room"),
+        "{}",
+        too_late.note
+    );
 
     let stored = maya
         .courier
@@ -842,6 +910,79 @@ async fn a_responder_with_a_full_queue_is_busy() {
         .unwrap();
     assert!(taken.question.is_some());
     assert!(accepted(&deliver(&maya, ask).await));
+}
+
+#[tokio::test]
+async fn a_responder_answers_an_ask_only_once() {
+    let net = MemNet::new();
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    let (token, helper, helper_name) = maya.open_responder("web", "team");
+    let ask = envelope("ask", None, None, (&helper, &helper_name));
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    assert!(accepted(&deliver(&maya, ask).await));
+    let first = maya.reply(&token, &ask_id, "on main", None).await;
+    assert_eq!(first.status, SendStatus::Queued);
+    // The same reply sent again after a dropped connection is refused instead of going out as a tell.
+    let again = maya
+        .courier
+        .reply(
+            &maya.conn(),
+            ReplyParams {
+                token: token.clone(),
+                id: ask_id.clone(),
+                text: "on main".into(),
+                wait_seconds: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(again.reason, Reason::Conflict);
+    assert!(
+        again.message.contains("already answered"),
+        "{}",
+        again.message
+    );
+    let delivers = |node: &Node| {
+        node.outbox_kinds(SAM_MAC)
+            .into_iter()
+            .filter(|k| *k == OutboxKind::Deliver)
+            .count()
+    };
+    assert_eq!(delivers(&maya), 1);
+
+    // The same goes for a reply to a tell.
+    let tell = envelope("tell", None, None, (&helper, &helper_name));
+    let tell_id = tell["id"].as_str().unwrap().to_string();
+    assert!(accepted(&deliver(&maya, tell).await));
+    let first = maya.reply(&token, &tell_id, "noted", None).await;
+    assert_eq!(first.status, SendStatus::Queued);
+    let again = maya
+        .courier
+        .reply(
+            &maya.conn(),
+            ReplyParams {
+                token: token.clone(),
+                id: tell_id.clone(),
+                text: "noted".into(),
+                wait_seconds: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(again.reason, Reason::Conflict);
+    assert_eq!(delivers(&maya), 2);
+
+    // A live session's second reply still goes, as a tell.
+    let (live_token, live, live_name) = maya.open("api", Some("team"));
+    let ask = envelope("ask", None, None, (&live, &live_name));
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    assert!(accepted(&deliver(&maya, ask).await));
+    maya.reply(&live_token, &ask_id, "yes", None).await;
+    let tell = maya
+        .reply(&live_token, &ask_id, "and one more thing", None)
+        .await;
+    assert_eq!(tell.status, SendStatus::Queued);
+    assert_eq!(delivers(&maya), 4);
 }
 
 #[tokio::test]
@@ -989,4 +1130,138 @@ async fn one_fetch_returns_at_most_64_kib() {
     assert_eq!(rest.messages.len(), 1);
     assert!(rest.messages[0].body.starts_with('2'));
     assert_eq!(rest.unread, 0);
+}
+
+// mesh#10: the `[serve]` limits a responder sends in `session.open` (9).
+fn responder_open(node: &Node, kind: SessionKind, serve: Option<GateSettings>) -> SessionOpen {
+    let cwd = node.dir.path().join("api");
+    std::fs::create_dir_all(&cwd).unwrap();
+    SessionOpen {
+        client: "claude".into(),
+        client_session: Some("serve-test".into()),
+        client_pid: None,
+        cwd: cwd.to_string_lossy().into_owned(),
+        client_name: None,
+        kind,
+        name: None,
+        spew_project: Some("team".into()),
+        serve,
+    }
+}
+
+#[tokio::test]
+async fn a_responders_own_limits_apply_when_questions_arrive() {
+    let net = MemNet::new();
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    let one = GateSettings {
+        from: ServeFrom::Room,
+        max_runs_per_person_per_hour: 1,
+        max_runs_per_hour: 30,
+    };
+
+    // Only a responder sends limits, and only in range.
+    let live = maya.courier.open_session(
+        &maya.conn(),
+        responder_open(&maya, SessionKind::Live, Some(one)),
+    );
+    assert_eq!(live.unwrap_err().reason, Reason::Invalid);
+    let huge = GateSettings {
+        max_runs_per_hour: MAX_RUN_LIMIT + 1,
+        ..one
+    };
+    let refused_open = maya.courier.open_session(
+        &maya.conn(),
+        responder_open(&maya, SessionKind::Responder, Some(huge)),
+    );
+    assert_eq!(refused_open.unwrap_err().reason, Reason::Invalid);
+
+    let conn = maya.conn();
+    let opened = maya
+        .courier
+        .open_session(
+            &conn,
+            responder_open(&maya, SessionKind::Responder, Some(one)),
+        )
+        .unwrap();
+    let to = (opened.session.as_str(), opened.name.as_str());
+    assert!(accepted(
+        &deliver(&maya, envelope("ask", None, None, to)).await
+    ));
+    // Over sam's limit: busy, and the refused ask isn't counted.
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::Busy
+    ));
+
+    // A re-open keeps the count; `from = own` turns a teammate away as if the responder weren't there.
+    let own = GateSettings {
+        from: ServeFrom::Own,
+        max_runs_per_person_per_hour: 5,
+        ..one
+    };
+    maya.courier
+        .open_session(
+            &conn,
+            responder_open(&maya, SessionKind::Responder, Some(own)),
+        )
+        .unwrap();
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::NoSuchSession
+    ));
+    let two = GateSettings {
+        max_runs_per_person_per_hour: 2,
+        ..one
+    };
+    maya.courier
+        .open_session(
+            &conn,
+            responder_open(&maya, SessionKind::Responder, Some(two)),
+        )
+        .unwrap();
+    assert!(accepted(
+        &deliver(&maya, envelope("ask", None, None, to)).await
+    ));
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::Busy
+    ));
+}
+
+#[tokio::test]
+async fn asks_from_own_devices_count_only_toward_the_total() {
+    let net = MemNet::new();
+    let sam = Node::new(&net, SAM_MAC, "sam", "sam-mac");
+    let limits = GateSettings {
+        from: ServeFrom::Own,
+        max_runs_per_person_per_hour: 1,
+        max_runs_per_hour: 3,
+    };
+    let opened = sam
+        .courier
+        .open_session(
+            &sam.conn(),
+            responder_open(&sam, SessionKind::Responder, Some(limits)),
+        )
+        .unwrap();
+    let to = (opened.session.as_str(), opened.name.as_str());
+    let linux = Peer {
+        device: id(SAM_LINUX),
+        person: "sam".into(),
+        device_name: "sam-linux".into(),
+        own: true,
+    };
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(
+            sam.courier
+                .handle_inbound(
+                    linux.clone(),
+                    Incoming::Deliver(envelope("ask", None, None, to)),
+                )
+                .await,
+        );
+    }
+    assert!(answers[..3].iter().all(accepted), "{answers:?}");
+    assert!(refused(&answers[3], RefusalCode::Busy), "{answers:?}");
 }

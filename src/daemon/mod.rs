@@ -1,12 +1,18 @@
 //! The daemon process (3, 6.1, 12): lock, settings, identity, store, roster, control socket, links and the
 //! background work that keeps them moving.
 //!
-//! Start order (6.1): take the lock, read settings, load or create the identity, open the store, choose the
-//! roster, remove a stale socket, bind the new one 0600, record its path, then accept.
+//! Start order (6.1): take the lock (and clear `run/stopped`), read settings, load or create the identity, open
+//! the store, choose the roster, start the links, remove a stale socket, bind the new one 0600, record its path,
+//! then accept. The links start admitting nobody; the roster in force then decides whether an endpoint exists
+//! (5.1).
 
 pub mod links;
+pub mod relay;
 pub mod roster;
+pub mod status;
 pub mod testnet;
+#[cfg(test)]
+mod tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +30,8 @@ use crate::control::place::{
     remove_stale_socket, take_lock, write_socket_path,
 };
 use crate::control::protocol::{
-    self, DeviceList, DeviceStatus, Empty, LoginResult, LoginUrl, LogoutResult, Reason,
-    RevokeParams, Revoked, RpcError, Status, TokenOnly, method,
+    self, DeviceList, DeviceStatus, DirectoryQuery, Empty, LoginResult, LoginUrl, LogoutResult,
+    Reason, RevokeParams, Revoked, RpcError, Status, TokenOnly, method,
 };
 use crate::control::server::{Conn, Handler, serve};
 use crate::courier::outbox::CALL_TIMEOUT;
@@ -35,14 +41,17 @@ use crate::link::{LinkEvent, Links};
 use crate::paths::Home;
 use crate::presence::{DEBOUNCE_MS, REFRESH_MS};
 use crate::roster::local::{local_username, os_user_name};
+use crate::roster::spew::UnknownPeerRefresh;
 use crate::roster::{ActiveRoster, file::POLL_SECONDS};
-use crate::settings::{Env, Settings};
+use crate::settings::{Env, NetworkMode, Settings};
 use crate::spew_api::{ApiError, BaseUrl, Clock, SpewApi};
 use crate::store::{RosterProvider, Store};
 use crate::wire::Request;
 
-use links::{InboundDyn, InboundHandle, OffLinks};
+use links::{DaemonLinks, InboundDyn, InboundHandle, LinkSetup, iroh_links};
+use relay::{RelayReport, ReportOutcome};
 use roster::RosterManager;
+use status::NetworkDetails;
 
 /// How long `auth.login` waits for the browser (14.1).
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -50,6 +59,9 @@ pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const REFRESH_WAIT: Duration = Duration::from_secs(15);
 /// How long `daemon.shutdown` leaves for its answer to go out.
 const SHUTDOWN_DELAY: Duration = Duration::from_millis(100);
+/// How often the home relay is looked at besides when it changes, so a change that came too soon after the last
+/// report, or before sign-in, still goes out (14.3).
+const RELAY_CHECK: Duration = Duration::from_secs(15);
 
 /// What a daemon needs from the process that runs it.
 pub struct DaemonOptions {
@@ -63,21 +75,6 @@ pub struct DaemonOptions {
     pub runtime_dirs: Vec<Option<PathBuf>>,
     /// The clock.
     pub clock: Arc<dyn Clock>,
-}
-
-/// The `[serve]` settings as the responder's gates take them.
-pub fn serve_settings(s: &crate::settings::ServeSettings) -> crate::responder::ServeSettings {
-    crate::responder::ServeSettings {
-        timeout_seconds: s.timeout_seconds,
-        max_turns: s.max_turns,
-        from: match s.from {
-            crate::settings::ServeFrom::Room => crate::responder::ServeFrom::Room,
-            crate::settings::ServeFrom::Own => crate::responder::ServeFrom::Own,
-        },
-        max_runs_per_person_per_hour: s.max_runs_per_person_per_hour,
-        max_runs_per_hour: s.max_runs_per_hour,
-        max_budget_usd: s.max_budget_usd,
-    }
 }
 
 // Registering this device with spew again after the try at sign-in failed (14.3). Registering is idempotent, so
@@ -127,7 +124,7 @@ enum RosterCmd {
 }
 
 /// A running daemon.
-pub struct Daemon<L: Links> {
+pub struct Daemon<L: DaemonLinks> {
     /// Its courier, for tests that look inside.
     pub courier: Arc<Courier<L>>,
     /// The control socket.
@@ -140,7 +137,7 @@ pub struct Daemon<L: Links> {
     _lock: DaemonLock,
 }
 
-impl<L: Links> Daemon<L> {
+impl<L: DaemonLinks> Daemon<L> {
     /// Asks the daemon to stop.
     pub fn stop(&self) {
         let _ = self.shutdown.send(true);
@@ -152,7 +149,8 @@ impl<L: Links> Daemon<L> {
         let _ = rx.wait_for(|stop| *stop).await;
     }
 
-    /// Stops the background work and removes the socket; the lock goes when this returns.
+    /// Stops the background work, closes every link with code 4 (`shutdown`) and removes the socket; the lock
+    /// goes when this returns.
     pub async fn finish(self) {
         self.stop();
         for task in &self.tasks {
@@ -161,6 +159,7 @@ impl<L: Links> Daemon<L> {
         for task in self.tasks {
             let _ = task.await;
         }
+        self.courier.links().shutdown().await;
         let _ = remove_stale_socket(&self.socket);
         if read_socket_path(&self.home).as_deref() == Some(self.socket.as_path()) {
             let _ = std::fs::remove_file(self.home.socket_file());
@@ -169,10 +168,10 @@ impl<L: Links> Daemon<L> {
     }
 }
 
-/// Runs the production daemon until `daemon.shutdown`, SIGTERM or SIGINT.
+/// Runs the production daemon, on iroh links, until `daemon.shutdown`, SIGTERM or SIGINT.
 pub async fn run(opts: DaemonOptions) -> anyhow::Result<()> {
     let root = opts.home.root().display().to_string();
-    let Some(daemon) = start(opts, |_| (OffLinks::default(), InboundHandle::new())).await? else {
+    let Some(daemon) = start_with(opts, iroh_links).await? else {
         bail!("another spew mesh daemon is already running for {root}");
     };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -190,8 +189,26 @@ pub async fn run(opts: DaemonOptions) -> anyhow::Result<()> {
 /// this home's lock; nothing is touched then.
 pub async fn start<L, F>(opts: DaemonOptions, make_links: F) -> anyhow::Result<Option<Daemon<L>>>
 where
-    L: Links,
+    L: DaemonLinks,
     F: FnOnce(EndpointId) -> (L, InboundHandle),
+{
+    start_with(opts, |setup: LinkSetup| {
+        let made = make_links(setup.device);
+        async move { Ok(made) }
+    })
+    .await
+}
+
+/// Like [`start`], with links built from this device's key, name and `[network]` settings, such as
+/// [`iroh_links`].
+pub async fn start_with<L, F, Fut>(
+    opts: DaemonOptions,
+    make_links: F,
+) -> anyhow::Result<Option<Daemon<L>>>
+where
+    L: DaemonLinks,
+    F: FnOnce(LinkSetup) -> Fut,
+    Fut: Future<Output = anyhow::Result<(L, InboundHandle)>>,
 {
     let home = opts.home.clone();
     home.ensure()
@@ -202,6 +219,10 @@ where
     else {
         return Ok(None);
     };
+    // Running again undoes `daemon stop` for reconnecting clients (6.1).
+    if let Err(e) = home.clear_stopped() {
+        tracing::warn!(error = %e, "could not remove run/stopped");
+    }
     let mut settings = Settings::load(&home, opts.user_home.as_deref())?;
     settings.apply_env(&opts.env);
     let api = BaseUrl::parse(settings.spew.url.as_str())
@@ -224,8 +245,17 @@ where
     );
     let active = ActiveRoster::new(chosen.me, device, chosen.roster);
 
+    let setup = LinkSetup::new(
+        identity.secret_key().clone(),
+        identity.name(),
+        settings.network.clone(),
+    );
+    let (links, inbound) = make_links(setup).await?;
+    // Subscribed before admission is set, so the first link ups aren't missed.
+    let link_events = links.events();
+
     // A socket an earlier daemon left outside the home would otherwise stay there for good.
-    if let Err(e) = remove_previous_socket(&home) {
+    if let Err(e) = remove_previous_socket(&home).await {
         tracing::warn!(error = %e, "could not remove the previous daemon's socket");
     }
     let socket =
@@ -235,15 +265,12 @@ where
         bind_private(&socket).with_context(|| format!("can't bind {}", socket.display()))?;
     write_socket_path(&home, &socket).context("can't record the socket path")?;
 
-    let (links, inbound) = make_links(device);
-    // Subscribed before admission is set, so the first link ups aren't missed.
-    let link_events = links.events();
     let cfg = CourierConfig {
         device: LocalDevice::new(device, identity.name(), platform()),
         default_room: settings.roster.default_room.clone(),
         send_branch: settings.presence.branch,
         send_place: settings.presence.place,
-        serve: serve_settings(&settings.serve),
+        serve: settings.serve.clone(),
         clock: opts.clock.clone(),
         start_time: crate::sessions::process::start_time,
     };
@@ -263,6 +290,11 @@ where
         pending: Arc::new(AtomicBool::new(true)),
     };
     let registration_pending = registration.pending.clone();
+    // Only n0 and own modes have a home relay worth telling spew about (5.1).
+    let relay_api = match (&api, settings.network.mode) {
+        (Ok(api), NetworkMode::N0 | NetworkMode::Own) => Some(api.clone()),
+        _ => None,
+    };
     let control = Arc::new(Control {
         courier: courier.clone(),
         api,
@@ -277,13 +309,16 @@ where
             socket: socket.display().to_string(),
         },
     });
-    let tasks = vec![
+    let mut tasks = vec![
         tokio::spawn(link_task(courier.clone(), link_events)),
         tokio::spawn(outbox_task(courier.clone())),
         tokio::spawn(presence_task(courier.clone())),
         tokio::spawn(roster_task(courier.clone(), mgr, registration, roster_rx)),
         tokio::spawn(serve(listener, control, shutdown_rx)),
     ];
+    if let Some(api) = relay_api {
+        tasks.push(tokio::spawn(relay_task(courier.clone(), api)));
+    }
     tracing::info!(socket = %socket.display(), "listening");
     Ok(Some(Daemon {
         courier,
@@ -382,7 +417,21 @@ async fn presence_task<L: Links>(courier: Arc<Courier<L>>) {
     }
 }
 
-async fn roster_task<L: Links>(
+// The next endpoint id the link layer refused; never resolves once the links are gone.
+async fn next_refused(refused: &mut Option<broadcast::Receiver<EndpointId>>) -> EndpointId {
+    loop {
+        let Some(rx) = refused.as_mut() else {
+            return std::future::pending().await;
+        };
+        match rx.recv().await {
+            Ok(id) => return id,
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => *refused = None,
+        }
+    }
+}
+
+async fn roster_task<L: DaemonLinks>(
     courier: Arc<Courier<L>>,
     mut mgr: RosterManager,
     registration: Registration,
@@ -390,8 +439,11 @@ async fn roster_task<L: Links>(
 ) {
     let mut every = tokio::time::interval(Duration::from_secs(POLL_SECONDS));
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut refused = Some(courier.links().refused());
+    let mut unknown = UnknownPeerRefresh::default();
     loop {
         let mut reply = None;
+        let mut early = false;
         tokio::select! {
             _ = every.tick() => {}
             cmd = commands.recv() => match cmd {
@@ -402,15 +454,29 @@ async fn roster_task<L: Links>(
                 }
                 None => return,
             },
+            // A device the roster doesn't know may be one spew added since the last refresh (4.2). Anyone who
+            // knows the endpoint id can cause this, so it refreshes at most once every 10 s.
+            stranger = next_refused(&mut refused) => {
+                if !unknown.allow(courier.now()) {
+                    continue;
+                }
+                tracing::info!(
+                    device = %stranger.fmt_short(),
+                    "a device the roster doesn't admit tried to connect; refreshing the roster"
+                );
+                early = true;
+            }
         }
         let now = courier.now();
-        let forced = reply.is_some();
+        let forced = reply.is_some() || early;
         if (forced || mgr.refresh_due(now))
             && let Some(cached) = mgr.refresh_spew(now).await
         {
             courier.save_roster_cache(&cached);
-            // A device registered just now is in the next roster; fetch it at once.
-            if registration.retry(&mgr).await
+            // A device registered just now is in the next roster; fetch it at once. A refresh a stranger caused
+            // doesn't retry registration, so nobody outside the roster can make this device call spew more often.
+            if !early
+                && registration.retry(&mgr).await
                 && let Some(cached) = mgr.refresh_spew(courier.now()).await
             {
                 courier.save_roster_cache(&cached);
@@ -424,6 +490,38 @@ async fn roster_task<L: Links>(
         }
         if let Some(tx) = reply {
             let _ = tx.send(());
+        }
+    }
+}
+
+async fn relay_task<L: DaemonLinks>(courier: Arc<Courier<L>>, api: SpewApi) {
+    let mut relay = courier.links().home_relay();
+    let mut report = RelayReport::default();
+    let mut every = tokio::time::interval(RELAY_CHECK);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = every.tick() => {}
+            changed = relay.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+        let current = relay.borrow_and_update().clone();
+        match report.step(&api, current.as_ref(), courier.now()).await {
+            ReportOutcome::Sent => tracing::info!(
+                relay = current
+                    .as_ref()
+                    .map(|r| r.to_string())
+                    .as_deref()
+                    .unwrap_or("none"),
+                "told spew this device's home relay"
+            ),
+            ReportOutcome::Failed(e) => {
+                tracing::info!(error = %e, "could not tell spew the home relay; trying again later")
+            }
+            ReportOutcome::NotDue | ReportOutcome::NotSignedIn => {}
         }
     }
 }
@@ -484,10 +582,22 @@ impl<L: Links> Control<L> {
         }
     }
 
-    fn status(&self) -> Status {
+    // `daemon.status`: the protocol's fields, with the network object widened to [`NetworkDetails`].
+    fn status(&self) -> Result<Value, RpcError> {
         let (counts, network) = self.courier.counts();
+        let links = self.courier.links().status();
+        let devices = self
+            .courier
+            .directory(&DirectoryQuery {
+                token: None,
+                filter: None,
+                include_offline: true,
+            })?
+            .devices;
+        let bound_sockets = links.bound_sockets.clone();
+        let details = protocol::result(&NetworkDetails::new(links, &devices))?;
         let device = self.courier.device();
-        Status {
+        let status = Status {
             version: crate::control::client::own_version().to_string(),
             pid: self.base.pid,
             started_at: self.base.started_at,
@@ -501,10 +611,14 @@ impl<L: Links> Control<L> {
             },
             roster: self.courier.roster_status(),
             network,
-            // The bound sockets come from the iroh endpoint, which the link layer owns (5.1).
-            bound_sockets: Vec::new(),
+            bound_sockets,
             counts,
+        };
+        let mut value = protocol::result(&status)?;
+        if let Some(fields) = value.as_object_mut() {
+            fields.insert("network".into(), details);
         }
+        Ok(value)
     }
 
     async fn login(&self, conn: &Conn) -> Result<LoginResult, RpcError> {
@@ -589,7 +703,7 @@ impl<L: Links> Control<L> {
             method::RESPONDER_TAKE => r(&c.take(&conn, p(params)?).await?),
             method::DAEMON_STATUS => {
                 let _: Empty = p(params)?;
-                r(&self.status())
+                self.status()
             }
             method::DIRECTORY_REFRESH => {
                 let _: Empty = p(params)?;

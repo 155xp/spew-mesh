@@ -7,10 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use iroh::EndpointId;
-use tokio::sync::broadcast;
+use iroh::{EndpointId, RelayUrl};
+use tokio::sync::{broadcast, watch};
 
-use super::links::InboundHandle;
+use super::links::{DaemonLinks, InboundHandle};
 use crate::link::{CallError, Inbound, LinkEvent, LinkInfo, LinkStatus, Links, Peer};
 use crate::roster::Admission;
 use crate::wire::{Request, Response, parse_incoming};
@@ -19,6 +19,8 @@ struct Node {
     inbound: InboundHandle,
     admission: Option<Admission>,
     events: broadcast::Sender<LinkEvent>,
+    refused: broadcast::Sender<EndpointId>,
+    home_relay: watch::Sender<Option<RelayUrl>>,
     up: HashSet<EndpointId>,
 }
 
@@ -118,6 +120,8 @@ impl MemNet {
                 inbound: inbound.clone(),
                 admission: None,
                 events: broadcast::channel(64).0,
+                refused: broadcast::channel(64).0,
+                home_relay: watch::channel(None).0,
                 up: HashSet::new(),
             },
         );
@@ -156,6 +160,13 @@ impl MemNet {
     pub fn is_up(&self, a: &EndpointId, b: &EndpointId) -> bool {
         self.lock().nodes.get(a).is_some_and(|n| n.up.contains(b))
     }
+
+    /// Sets a device's home relay, as when its endpoint connects to one.
+    pub fn set_home_relay(&self, device: &EndpointId, relay: Option<RelayUrl>) {
+        if let Some(node) = self.lock().nodes.get(device) {
+            node.home_relay.send_replace(relay);
+        }
+    }
 }
 
 /// One device's links on a [`MemNet`].
@@ -178,6 +189,12 @@ impl Links for MemLinks {
             let s = self.net.lock();
             if !s.admits(&self.me, &device) {
                 return Err(CallError::NotAdmitted);
+            }
+            // A dial the other device's admission closes: it hears of an unknown device, as iroh's hook reports.
+            if let Some(callee) = s.nodes.get(&device)
+                && !s.admits(&device, &self.me)
+            {
+                let _ = callee.refused.send(self.me);
             }
             let up = s
                 .nodes
@@ -255,9 +272,29 @@ impl Links for MemLinks {
         LinkStatus {
             network: if admits_others { "local" } else { "off" }.into(),
             endpoint_id: admits_others.then(|| self.me.to_string()),
-            relay: None,
+            relay: node.home_relay.borrow().as_ref().map(ToString::to_string),
             links,
             ..LinkStatus::default()
         }
     }
+}
+
+impl DaemonLinks for MemLinks {
+    fn refused(&self) -> broadcast::Receiver<EndpointId> {
+        let s = self.net.lock();
+        match s.nodes.get(&self.me) {
+            Some(n) => n.refused.subscribe(),
+            None => broadcast::channel(1).1,
+        }
+    }
+
+    fn home_relay(&self) -> watch::Receiver<Option<RelayUrl>> {
+        let s = self.net.lock();
+        match s.nodes.get(&self.me) {
+            Some(n) => n.home_relay.subscribe(),
+            None => watch::channel(None).1,
+        }
+    }
+
+    async fn shutdown(&self) {}
 }

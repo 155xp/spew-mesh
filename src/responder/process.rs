@@ -8,6 +8,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -104,7 +105,73 @@ pub struct SystemRunner;
 
 impl ProcessRunner for SystemRunner {
     fn run(&self, spec: RunSpec) -> impl Future<Output = io::Result<RunOutput>> + Send {
-        run_system(spec)
+        run_tracked(spec, None)
+    }
+}
+
+/// Spawns real processes like [`SystemRunner`], and keeps each run's process group in a [`RunGroups`] while
+/// the run's leader is unreaped.
+#[derive(Clone, Debug, Default)]
+pub struct TrackedRunner {
+    groups: RunGroups,
+}
+
+impl TrackedRunner {
+    /// A runner that records its runs in `groups`.
+    pub fn new(groups: RunGroups) -> Self {
+        TrackedRunner { groups }
+    }
+}
+
+impl ProcessRunner for TrackedRunner {
+    fn run(&self, spec: RunSpec) -> impl Future<Output = io::Result<RunOutput>> + Send {
+        run_tracked(spec, Some(self.groups.clone()))
+    }
+}
+
+/// The process groups of runs whose leader isn't reaped yet. A process that has to exit at once kills them
+/// first: `exit` runs no destructors, so the guard of a run still in flight would never fire.
+#[derive(Clone, Debug, Default)]
+pub struct RunGroups(Arc<Mutex<Vec<libc::pid_t>>>);
+
+impl RunGroups {
+    fn list(&self) -> std::sync::MutexGuard<'_, Vec<libc::pid_t>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, pgid: libc::pid_t) {
+        self.list().push(pgid);
+    }
+
+    fn remove(&self, pgid: libc::pid_t) {
+        self.list().retain(|g| *g != pgid);
+    }
+
+    /// How many runs are in flight.
+    pub fn len(&self) -> usize {
+        self.list().len()
+    }
+
+    /// True when no run is in flight.
+    pub fn is_empty(&self) -> bool {
+        self.list().is_empty()
+    }
+
+    /// Sends SIGKILL to the process group of every run in flight.
+    pub fn kill_all(&self) {
+        for pgid in self.list().iter() {
+            kill_group(*pgid);
+        }
+    }
+}
+
+// The crate denies unsafe code; killing a process group needs libc::killpg (see SAFETY below).
+#[allow(unsafe_code)]
+fn kill_group(pgid: libc::pid_t) {
+    // SAFETY: killpg only sends a signal. Callers pass the pid of a child that isn't reaped yet, which can't be
+    // reused meanwhile.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
     }
 }
 
@@ -113,16 +180,29 @@ impl ProcessRunner for SystemRunner {
 struct GroupGuard {
     pgid: libc::pid_t,
     armed: bool,
+    groups: Option<RunGroups>,
 }
 
 impl GroupGuard {
-    // The crate denies unsafe code; killing a process group needs libc::killpg (see SAFETY below).
-    #[allow(unsafe_code)]
+    fn new(pgid: libc::pid_t, groups: Option<RunGroups>) -> Self {
+        if let Some(groups) = &groups {
+            groups.add(pgid);
+        }
+        GroupGuard {
+            pgid,
+            armed: true,
+            groups,
+        }
+    }
+
     fn kill(&self) {
-        // SAFETY: killpg only sends a signal. The group id is our child's pid, which can't be reused while
-        // the child is unreaped.
-        unsafe {
-            libc::killpg(self.pgid, libc::SIGKILL);
+        kill_group(self.pgid);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        if let Some(groups) = &self.groups {
+            groups.remove(self.pgid);
         }
     }
 }
@@ -131,6 +211,7 @@ impl Drop for GroupGuard {
     fn drop(&mut self) {
         if self.armed {
             self.kill();
+            self.disarm();
         }
     }
 }
@@ -138,7 +219,7 @@ impl Drop for GroupGuard {
 // The crate denies unsafe code; starting the run in its own session needs pre_exec and libc::setsid (see SAFETY
 // below).
 #[allow(unsafe_code)]
-async fn run_system(spec: RunSpec) -> io::Result<RunOutput> {
+async fn run_tracked(spec: RunSpec, groups: Option<RunGroups>) -> io::Result<RunOutput> {
     let start = Instant::now();
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -165,10 +246,7 @@ async fn run_system(spec: RunSpec) -> io::Result<RunOutput> {
         .id()
         .and_then(|id| libc::pid_t::try_from(id).ok())
         .ok_or_else(|| io::Error::other("the child has no pid"))?;
-    let mut guard = GroupGuard {
-        pgid: pid,
-        armed: true,
-    };
+    let mut guard = GroupGuard::new(pid, groups);
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -228,7 +306,7 @@ async fn run_system(spec: RunSpec) -> io::Result<RunOutput> {
 
     let exit = match finished {
         Ok(status) => {
-            guard.armed = false;
+            guard.disarm();
             let status = status?;
             if overflow.load(Ordering::SeqCst) {
                 Exit::OutputTooLarge
@@ -242,7 +320,7 @@ async fn run_system(spec: RunSpec) -> io::Result<RunOutput> {
             guard.kill();
             // Reap the leader; after SIGKILL this returns promptly.
             let _ = child.wait().await;
-            guard.armed = false;
+            guard.disarm();
             Exit::TimedOut
         }
     };
@@ -431,6 +509,46 @@ mod tests {
         assert_eq!(out.exit, Exit::Code(0));
         assert_eq!(out.stderr.len(), STDERR_CAP);
         assert_eq!(out.stdout, b"done\n");
+    }
+
+    #[tokio::test]
+    async fn kill_all_stops_the_runs_in_flight_and_forgets_finished_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let groups = RunGroups::default();
+        let runner = TrackedRunner::new(groups.clone());
+        let quick = script(dir.path(), "quick", "echo done");
+        let out = runner.run(spec(quick, dir.path())).await.unwrap();
+        assert_eq!(out.exit, Exit::Code(0));
+        assert!(groups.is_empty(), "a reaped run stays listed");
+
+        let slow = script(
+            dir.path(),
+            "slow",
+            r#"sleep 30 & echo $! > "$REC/bg"; sleep 30"#,
+        );
+        let slow_spec = spec(slow, dir.path());
+        let run = tokio::spawn(async move { runner.run(slow_spec).await });
+        let bg_file = dir.path().join("bg");
+        let started = Instant::now();
+        let bg: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&bg_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the run never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(groups.len(), 1);
+        groups.kill_all();
+        let out = run.await.unwrap().unwrap();
+        assert_eq!(out.exit, Exit::Signal(libc::SIGKILL));
+        assert!(groups.is_empty());
+        assert!(wait_gone(bg).await, "background child {bg} survived");
     }
 
     #[tokio::test]

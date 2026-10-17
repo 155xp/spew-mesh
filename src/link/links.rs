@@ -254,6 +254,8 @@ struct PeerState {
     dialer_running: bool,
     /// Wakes this device's dialer: link down, new hints, removal, shutdown.
     notify: Arc<Notify>,
+    /// Goes up when the device's roster hints change, so a dial still trying its old addresses starts over.
+    hints: watch::Sender<u64>,
     deliver: RateWindow,
     presence: Gap,
     problem: Option<LinkProblem>,
@@ -269,6 +271,7 @@ impl PeerState {
             last_dial_failure: None,
             dialer_running: false,
             notify: Arc::new(Notify::new()),
+            hints: watch::channel(0).0,
             deliver: RateWindow::deliver(),
             presence: Gap::presence(),
             problem: None,
@@ -453,6 +456,8 @@ impl Shared {
             let serial = self.next_id();
             let ps = st.peers.entry(id).or_insert_with(|| PeerState::new(serial));
             if hints_changed {
+                ps.hints
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
                 ps.notify.notify_one();
             }
         }
@@ -717,7 +722,7 @@ impl Shared {
             (ps.dial_lock.clone(), ep)
         };
         let _dialing = dial_lock.lock().await;
-        {
+        let mut hints = {
             let st = self.lock();
             let ps = st.peers.get(&peer).ok_or(CallError::NotAdmitted)?;
             if let Some(link) = &ps.link {
@@ -729,14 +734,26 @@ impl Shared {
             {
                 return Err(CallError::Unreachable(why.clone()));
             }
-        }
+            ps.hints.subscribe()
+        };
         let timeout = self.timing().dial_timeout;
-        let result = match tokio::time::timeout(timeout, self.dial(&ep, peer)).await {
-            Ok(result) => result,
-            Err(_) => Err(DialError::new(
-                Problem::Unreachable,
-                format!("no link within {} s", timeout.as_secs_f32()),
-            )),
+        let result = loop {
+            // New hints (a device that came back on another port) cancel a dial still trying the old addresses,
+            // which would otherwise hold the next try back for the whole timeout. A dial dropped mid-way leaves
+            // nothing behind: registering the link happens after its last await.
+            tokio::select! {
+                attempt = tokio::time::timeout(timeout, self.dial(&ep, peer)) => {
+                    break attempt.unwrap_or_else(|_| {
+                        Err(DialError::new(
+                            Problem::Unreachable,
+                            format!("no link within {} s", timeout.as_secs_f32()),
+                        ))
+                    });
+                }
+                Ok(()) = hints.changed() => {
+                    debug!(device = %peer.fmt_short(), "new addresses for the device; dialing again");
+                }
+            }
         };
         result.or_else(|error| {
             let mut st = self.lock();

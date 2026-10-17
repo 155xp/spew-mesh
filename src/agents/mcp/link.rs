@@ -27,10 +27,6 @@ pub const CALL_CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// means it is stuck.
 const STEP_LIMIT: Duration = Duration::from_secs(10);
 
-/// `<home>/run/stopped`, which `daemon stop` and `uninstall` write and a daemon removes once it holds the lock
-/// (6.1). The CLI and the daemon own the file; the MCP server only looks for it.
-const STOPPED_FILE: &str = "stopped";
-
 /// The longest client session id the daemon takes.
 const MAX_CLIENT_SESSION: usize = 200;
 
@@ -281,6 +277,7 @@ impl DaemonLink {
             kind: SessionKind::Live,
             name: None,
             spew_project: f.spew_project.clone(),
+            serve: None,
         }
     }
 
@@ -354,10 +351,7 @@ impl DaemonLink {
     // Whether `run/stopped` is there. Anything but a clear "not found" counts as there, so a reconnect never
     // undoes a stop it can't see.
     fn stopped(&self) -> bool {
-        match std::fs::symlink_metadata(self.home.run_dir().join(STOPPED_FILE)) {
-            Ok(_) => true,
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        }
+        self.home.is_stopped()
     }
 
     // Opens (or re-attaches) every session on a new connection and returns its generation.
@@ -789,7 +783,7 @@ mod tests {
         let starts = |o: &ConnectOptions| (o.start, o.upgrade);
         assert_eq!(starts(&link.attempt_options(true)), (true, true));
         assert_eq!(starts(&link.attempt_options(false)), (true, true));
-        std::fs::write(home.run_dir().join(STOPPED_FILE), "").unwrap();
+        std::fs::write(home.stopped_file(), "").unwrap();
         // The first connect is the agent starting: it may start the daemon.
         assert_eq!(starts(&link.attempt_options(true)), (true, true));
         assert_eq!(starts(&link.attempt_options(false)), (false, false));
@@ -797,7 +791,7 @@ mod tests {
         link.start_wanted.store(true, Ordering::Release);
         assert_eq!(starts(&link.attempt_options(false)), (true, true));
         assert_eq!(starts(&link.attempt_options(false)), (false, false));
-        std::fs::remove_file(home.run_dir().join(STOPPED_FILE)).unwrap();
+        std::fs::remove_file(home.stopped_file()).unwrap();
         assert_eq!(starts(&link.attempt_options(false)), (true, true));
     }
 }

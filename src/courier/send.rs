@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::outbox::retry_delay_ms;
 use super::outbox::{Attempt, read_deliver_response};
-use super::{Core, Courier, RECEIPT_WAIT, refusal_reason, render, store_err, warn_store};
+use super::{
+    Core, Courier, NOT_SHARED, RECEIPT_WAIT, refusal_reason, render, store_err, warn_store,
+};
 use crate::address::{Address, is_card};
 use crate::control::protocol::{
     AnswerView, AskParams, ReplyParams, RpcError, SendResult, SendStatus, TellParams,
@@ -14,7 +16,7 @@ use crate::control::server::Conn;
 use crate::identity::parse_endpoint_id;
 use crate::link::Links;
 use crate::resolve::{Asker, resolve};
-use crate::responder::limits::{Gate, MAX_WAITING, Refusal};
+use crate::responder::limits::{Gate, GateSettings, MAX_WAITING, Refusal};
 use crate::sessions::directory::Entry;
 use crate::store::{
     Message, MessageState, NewOutbox, OutboxKind, Party, SessionRecord, StoredMessage,
@@ -76,7 +78,18 @@ enum Sent {
     Delivered,
     Queued(String),
     Refused(RefusalCode),
+    /// The target's device left every room we share (4.3); nothing went out.
+    NotShared,
 }
+
+impl Sent {
+    fn is_refused(&self) -> bool {
+        matches!(self, Sent::Refused(_) | Sent::NotShared)
+    }
+}
+
+/// Why mail to a device that left every shared room fails, in the words of 4.3.
+const NOT_SHARED_REASON: &str = "that device is no longer in a shared room";
 
 struct Outgoing {
     kind: MessageKind,
@@ -144,6 +157,8 @@ impl<L: Links> Courier<L> {
         }
     }
 
+    // The responder's gate: the limits it sent in `session.open`, else this daemon's `[serve]` settings (a
+    // question can arrive after a daemon restart before the responder re-opens).
     pub(super) fn responder_gate<'c>(
         &self,
         c: &'c mut Core,
@@ -151,16 +166,18 @@ impl<L: Links> Courier<L> {
     ) -> &'c mut Gate {
         c.gates
             .entry(target.id.clone())
-            .or_insert_with(|| Gate::new(&self.cfg.serve))
+            .or_insert_with(|| Gate::new(&GateSettings::from(&self.cfg.serve)))
     }
 
-    // The checks a local delivery shares with 5.5 steps 6 and 7.
+    // The checks a local delivery shares with 5.5 steps 6 and 7. Returns the asker whose run to count once the
+    // message is stored, for a question to a responder.
     fn accept_local(
         &self,
         c: &mut Core,
         msg: &Message,
         target: &SessionRecord,
-    ) -> Result<(), RefusalCode> {
+    ) -> Result<Option<crate::responder::Asker>, RefusalCode> {
+        let mut counted = None;
         let now = self.now();
         if target.kind == SessionKind::Responder
             && matches!(msg.kind, MessageKind::Ask | MessageKind::Tell)
@@ -178,16 +195,17 @@ impl<L: Links> Courier<L> {
                 room,
             };
             self.responder_gate(c, target)
-                .admit(now, &asker, true, has_room)
+                .check(now, &asker, true, has_room)
                 .map_err(|r| match r {
                     Refusal::Busy => RefusalCode::Busy,
                     Refusal::NoSuchSession => RefusalCode::NoSuchSession,
                 })?;
+            counted = Some(asker);
         }
         if !c.guard.allows(&msg.conversation, now) {
             return Err(RefusalCode::ConversationLimit);
         }
-        Ok(())
+        Ok(counted)
     }
 
     // Stores and routes one message. Returns the stored row (when stored), how it went, and for another device
@@ -228,13 +246,17 @@ impl<L: Links> Courier<L> {
             let Some(record) = record else {
                 return Ok((msg, Sent::Refused(RefusalCode::SessionEnded), None));
             };
-            if let Err(code) = self.accept_local(c, &msg, &record) {
-                return Ok((msg, Sent::Refused(code), None));
-            }
+            let counted = match self.accept_local(c, &msg, &record) {
+                Ok(counted) => counted,
+                Err(code) => return Ok((msg, Sent::Refused(code), None)),
+            };
             let mut msg = msg;
             msg.to.session.clone_from(&record.id);
             c.store.insert_message(&msg, now).map_err(store_err)?;
             c.guard.record(&msg.conversation, now);
+            if let Some(asker) = counted {
+                self.responder_gate(c, &record).record(now, &asker);
+            }
             self.wake(c, &record.id);
             if record.kind == SessionKind::Responder {
                 self.presence_changed();
@@ -255,7 +277,7 @@ impl<L: Links> Courier<L> {
         // A reply goes to whoever wrote, without resolving an address; a device that has left every shared room
         // can't take it, and queueing it would only let it expire a day later (4.3).
         if !c.roster.admission().is_admitted(&device) {
-            return Ok((msg, Sent::Refused(RefusalCode::NoSuchSession), None));
+            return Ok((msg, Sent::NotShared, None));
         }
         if !c.guard.allows(&msg.conversation, now) {
             return Ok((msg, Sent::Refused(RefusalCode::ConversationLimit), None));
@@ -357,7 +379,7 @@ impl<L: Links> Courier<L> {
         let (msg, sent, attempt) = {
             let mut c = self.core();
             let routed = self.route(&mut c, &sender, &target, out)?;
-            if waiting_ask && !matches!(routed.1, Sent::Refused(_)) {
+            if waiting_ask && !routed.1.is_refused() {
                 *c.waiting_asks.entry(routed.0.id.clone()).or_default() += 1;
             }
             routed
@@ -395,6 +417,11 @@ impl<L: Links> Courier<L> {
                 Some(code.as_str().to_string()),
                 Some(refusal_reason(*code).to_string()),
             ),
+            Sent::NotShared => (
+                SendStatus::Refused,
+                Some(NOT_SHARED.to_string()),
+                Some(NOT_SHARED_REASON.to_string()),
+            ),
         };
         SendResult {
             status,
@@ -429,6 +456,7 @@ impl<L: Links> Courier<L> {
             Sent::Refused(code) => {
                 format!("{} refused it: {}.", target.address, refusal_reason(*code))
             }
+            Sent::NotShared => format!("Not sent to {}: {NOT_SHARED_REASON}.", target.address),
         }
     }
 
@@ -493,7 +521,7 @@ impl<L: Links> Courier<L> {
         let started = Instant::now();
         let sender_id = sender.id.clone();
         let (msg, sent) = self.send_one(sender, target.clone(), out, true).await?;
-        if let Sent::Refused(_) = sent {
+        if sent.is_refused() {
             let unread = self.unread_count(&self.core(), &sender_id);
             return Ok(self.result(
                 &msg,
@@ -586,21 +614,13 @@ impl<L: Links> Courier<L> {
                 ),
             ),
             Some((MessageState::Refused, code)) => {
-                let code = code.and_then(|c| RefusalCode::from_name(&c));
-                let mut r = self.result(
-                    &msg,
-                    &target,
-                    &Sent::Refused(code.unwrap_or(RefusalCode::NoSuchSession)),
-                    String::new(),
-                    unread_after(&c),
-                );
-                r.note = match code {
-                    Some(code) => {
-                        format!("{} refused it: {}.", target.address, refusal_reason(code))
-                    }
-                    None => format!("{} is no longer in a room you share.", target.address),
+                // The only code kept that isn't a peer's refusal is the one for a device that left (4.3).
+                let sent = match code.and_then(|c| RefusalCode::from_name(&c)) {
+                    Some(code) => Sent::Refused(code),
+                    None => Sent::NotShared,
                 };
-                return Ok(r);
+                let note = Self::sent_note(&target, &sent);
+                return Ok(self.result(&msg, &target, &sent, note, unread_after(&c)));
             }
             Some((MessageState::Expired, _)) => (
                 SendStatus::Expired,
@@ -666,6 +686,30 @@ impl<L: Links> Courier<L> {
                     ))
                 })?;
             let o = &original.message;
+            // A responder resending after a dropped connection would otherwise answer twice, the second time as
+            // a tell; its first reply already went out.
+            if sender.kind == SessionKind::Responder && p.wait_seconds.is_none() {
+                let answered = match o.kind {
+                    MessageKind::Ask => o.state == MessageState::Answered,
+                    // A tell has no answered state: look for this session's reply to it.
+                    MessageKind::Tell => {
+                        let ids = c.reg.ids_of(&sender.id);
+                        c.store
+                            .conversation(&o.conversation)
+                            .map_err(store_err)?
+                            .iter()
+                            .any(|m| {
+                                m.message.in_reply_to.as_deref() == Some(o.id.as_str())
+                                    && m.message.from.device == self.cfg.device.hex
+                                    && ids.contains(&m.message.from.session)
+                            })
+                    }
+                    _ => false,
+                };
+                if answered {
+                    return Err(RpcError::conflict(format!("{} is already answered", p.id)));
+                }
+            }
             let answers_ask = o.kind == MessageKind::Ask && o.state != MessageState::Answered;
             let follow_up = p.wait_seconds.is_some() && o.kind != MessageKind::Ask;
             let kind = if follow_up {

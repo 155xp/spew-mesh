@@ -200,6 +200,7 @@ pub async fn open_session(client: &Client, name_client: &str, cwd: &str) -> (Str
             kind: SessionKind::Live,
             name: None,
             spew_project: None,
+            serve: None,
         })
         .await
         .unwrap();
@@ -217,7 +218,8 @@ pub struct Mcp {
 }
 
 impl Mcp {
-    fn spawn(mut cmd: Command) -> Mcp {
+    /// Starts a server from a prepared `spew mesh mcp-server` command.
+    pub fn spawn(mut cmd: Command) -> Mcp {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

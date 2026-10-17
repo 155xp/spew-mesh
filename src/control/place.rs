@@ -8,6 +8,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::paths::{
     Home, LOG_ROTATE_BYTES, ensure_private_dir, open_private_append, private_open_options,
@@ -115,21 +116,38 @@ pub fn remove_stale_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+/// How long the probe of a recorded socket waits to connect.
+const PROBE_WAIT: Duration = Duration::from_secs(1);
+
 /// Removes the socket an earlier daemon of this home recorded in `run/socket`, when it is still there, is a
-/// socket and belongs to this user. Call it holding the lock, so no live daemon uses it; a daemon that crashed
-/// with a socket outside the home leaves nothing behind for long.
-pub fn remove_previous_socket(home: &Home) -> io::Result<()> {
+/// socket of this user and refuses a connection. Call it holding the lock; a daemon that crashed with a socket
+/// outside the home then leaves nothing behind for long. A home copied from another carries that home's
+/// `run/socket`, so a socket something still answers on belongs to a live daemon and stays.
+pub async fn remove_previous_socket(home: &Home) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let Some(path) = read_socket_path(home) else {
         return Ok(());
     };
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.file_type().is_socket() && meta.uid() == current_uid() => {
-            std::fs::remove_file(&path)
+            if refuses_connections(&path).await {
+                std::fs::remove_file(&path)
+            } else {
+                tracing::info!(socket = %path.display(), "left a socket another daemon still answers on");
+                Ok(())
+            }
         }
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+// Only a refused connect proves nobody listens; a connect that succeeds, hangs or fails otherwise keeps the socket.
+async fn refuses_connections(path: &Path) -> bool {
+    match tokio::time::timeout(PROBE_WAIT, tokio::net::UnixStream::connect(path)).await {
+        Ok(Err(e)) => e.kind() == io::ErrorKind::ConnectionRefused,
+        Ok(Ok(_)) | Err(_) => false,
     }
 }
 
@@ -334,16 +352,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::at(tmp.path().join("h")).unwrap();
         home.ensure().unwrap();
-        remove_previous_socket(&home).unwrap();
+        remove_previous_socket(&home).await.unwrap();
         let old = tmp.path().join("spew-mesh-old.sock");
         drop(bind_private(&old).unwrap());
         write_socket_path(&home, &old).unwrap();
-        remove_previous_socket(&home).unwrap();
+        remove_previous_socket(&home).await.unwrap();
         assert!(!old.exists());
         // A file that took the recorded path is left alone.
         std::fs::write(&old, "keep").unwrap();
-        remove_previous_socket(&home).unwrap();
+        remove_previous_socket(&home).await.unwrap();
         assert!(old.exists());
+    }
+
+    #[tokio::test]
+    async fn a_socket_another_daemon_answers_on_stays() {
+        // A copied home names the other home's socket in run/socket; that daemon is still listening.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("copy")).unwrap();
+        home.ensure().unwrap();
+        let live = tmp.path().join("spew-mesh-live.sock");
+        let listener = bind_private(&live).unwrap();
+        write_socket_path(&home, &live).unwrap();
+        remove_previous_socket(&home).await.unwrap();
+        assert!(live.exists());
+        assert!(tokio::net::UnixStream::connect(&live).await.is_ok());
+        drop(listener);
+        remove_previous_socket(&home).await.unwrap();
+        assert!(!live.exists());
     }
 
     #[tokio::test]

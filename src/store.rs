@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::paths::{FILE_MODE, PathsError, mode_of, private_open_options, set_mode};
 use crate::wire::{ActivityState, MessageKind, Reach, SessionKind};
 
-/// How long messages and receipts are kept, and ended sessions after they end (11.1).
+/// How long messages and receipts are kept, ended sessions after they end, and serve conversations after their
+/// last use (11.1).
 pub const MESSAGE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How long dedupe keys are kept (11.1).
 pub const DEDUPE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -535,6 +536,8 @@ pub struct Swept {
     pub dedupe: usize,
     /// Sessions that ended, with the cards they held.
     pub sessions: usize,
+    /// Serve conversations.
+    pub serve_conversations: usize,
 }
 
 /// SHA-256 of a session token as lowercase hex, the only form of a token the store keeps.
@@ -1443,7 +1446,9 @@ impl Store {
             .ctx("read a roster")
     }
 
-    /// The daily sweep (11.1): messages and receipts older than 30 days, dedupe keys older than 7 days.
+    /// The daily sweep (11.1): messages and receipts older than 30 days, sessions that ended more than 30 days ago,
+    /// serve conversations unused for 30 days, dedupe keys older than 7 days. A serve conversation's `updated_at`
+    /// is its last use: serve writes it after every run that continues or starts it.
     pub fn sweep(&self, now: u64) -> Result<Swept, StoreError> {
         let tx = self
             .conn
@@ -1472,12 +1477,19 @@ impl Store {
                 params![message_cutoff],
             )
             .ctx("sweep ended sessions")?;
+        let serve_conversations = tx
+            .execute(
+                "DELETE FROM serve_conversations WHERE updated_at < ?1",
+                params![message_cutoff],
+            )
+            .ctx("sweep serve conversations")?;
         tx.commit().ctx("commit the sweep")?;
         Ok(Swept {
             messages,
             receipts,
             dedupe,
             sessions,
+            serve_conversations,
         })
     }
 }
@@ -1588,6 +1600,45 @@ mod tests {
             let s = Store::open(&path).unwrap();
             assert!(s.message(MAYA_DEVICE, &ulid(1)).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn a_v1_store_with_a_session_upgrades_and_reads_had_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store.sqlite3");
+        let id = ulid(1);
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(V1).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.commit().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, name, client, kind, client_session, client_pid, client_pid_start, \
+                 token_hash, cwd, repo, branch, place, room, room_source, reach, state, state_since, activity, \
+                 activity_project, opened_at, last_seen_at, ended_at) VALUES (?1, 'codex-api', 'codex', 'live', \
+                 'thread-1', NULL, NULL, 'hash', '/work/api', 'acme/api', 'main', 'api', 'spew', 'spew-json', \
+                 'hooked', 'idle', 10, NULL, NULL, 10, 20, NULL)",
+                params![id],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.version().unwrap(), schema_version());
+        let kept = s
+            .session(&id)
+            .unwrap()
+            .expect("the session survives the upgrade");
+        assert_eq!(kept.name, "codex-api");
+        assert_eq!(kept.reach, Reach::Hooked);
+        // A session from before the column existed counts as never connected, so rule 3 doesn't end it early.
+        assert!(s.had_connection().unwrap().is_empty());
+        s.mark_had_connection(&id).unwrap();
+        let connected = s.had_connection().unwrap();
+        assert!(connected.len() == 1 && connected.contains(&id));
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(s.had_connection().unwrap().contains(&id));
     }
 
     #[test]
@@ -2116,6 +2167,25 @@ mod tests {
         s.put_session(&session(11, "claude-recent")).unwrap();
         s.end_session(&ulid(11), now - 29 * DAY).unwrap();
         s.put_session(&session(12, "claude-live")).unwrap();
+        // Last used 31 and 29 days ago.
+        s.set_serve_thread(
+            "claude",
+            MAYA_DEVICE,
+            &ulid(20),
+            &ulid(21),
+            "old",
+            now - 31 * DAY,
+        )
+        .unwrap();
+        s.set_serve_thread(
+            "claude",
+            MAYA_DEVICE,
+            &ulid(20),
+            &ulid(22),
+            "new",
+            now - 29 * DAY,
+        )
+        .unwrap();
 
         let swept = s.sweep(now).unwrap();
         assert_eq!(
@@ -2124,8 +2194,20 @@ mod tests {
                 messages: 1,
                 receipts: 1,
                 dedupe: 1,
-                sessions: 1
+                sessions: 1,
+                serve_conversations: 1,
             }
+        );
+        assert_eq!(
+            s.serve_thread("claude", MAYA_DEVICE, &ulid(20), &ulid(21))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            s.serve_thread("claude", MAYA_DEVICE, &ulid(20), &ulid(22))
+                .unwrap()
+                .as_deref(),
+            Some("new")
         );
         assert!(s.session(&ulid(10)).unwrap().is_none());
         assert!(s.cards(&ulid(10)).unwrap().is_empty());

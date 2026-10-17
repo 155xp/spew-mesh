@@ -158,6 +158,41 @@ impl Home {
         self.run_dir().join("ipc.sock")
     }
 
+    /// `run/stopped`: written by `daemon stop` and `uninstall` so reconnecting MCP servers and responders don't
+    /// start the daemon again; a daemon removes it once it holds the lock (6.1, 12).
+    pub fn stopped_file(&self) -> PathBuf {
+        self.run_dir().join("stopped")
+    }
+
+    /// Whether `run/stopped` is there. Long-lived clients start a missing daemon only while it is absent (6.1).
+    /// A file that can't be checked counts as there, as the MCP server and serve see it: when in doubt, a
+    /// reconnect leaves the daemon stopped.
+    pub fn is_stopped(&self) -> bool {
+        match fs::symlink_metadata(self.stopped_file()) {
+            Ok(_) => true,
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Writes `run/stopped` (0600). A home that doesn't exist yet stays absent: no daemon can run there.
+    pub fn mark_stopped(&self) -> Result<(), PathsError> {
+        if !self.root.is_dir() {
+            return Ok(());
+        }
+        ensure_private_dir(&self.run_dir())?;
+        write_atomic(&self.stopped_file(), b"")
+    }
+
+    /// Removes `run/stopped`; a missing file is fine.
+    pub fn clear_stopped(&self) -> Result<(), PathsError> {
+        let path = self.stopped_file();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PathsError::io("remove", &path)(e)),
+        }
+    }
+
     /// `run/serve/`: Codex run files (8.3).
     pub fn serve_run_dir(&self) -> PathBuf {
         self.run_dir().join("serve")
@@ -382,11 +417,33 @@ mod tests {
         assert_eq!(rel(home.lock_file()), "run/lock");
         assert_eq!(rel(home.socket_file()), "run/socket");
         assert_eq!(rel(home.ipc_socket()), "run/ipc.sock");
+        assert_eq!(rel(home.stopped_file()), "run/stopped");
         assert_eq!(rel(home.serve_run_dir()), "run/serve");
         assert_eq!(rel(home.log_file()), "logs/mesh.log");
         assert_eq!(rel(home.spew_auth_file()), "auth/spew.json");
         assert_eq!(rel(home.manifest_file()), "agents/manifest.json");
         assert_eq!(rel(home.roster_file()), "roster.toml");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stopped_mark_comes_and_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = Home::at(tmp.path().join("never")).unwrap();
+        missing.mark_stopped().unwrap();
+        assert!(!missing.root().exists(), "no home is created to mark it");
+
+        let home = Home::at(tmp.path().join("mesh")).unwrap();
+        fs::create_dir(home.root()).unwrap();
+        assert!(!home.is_stopped());
+        home.mark_stopped().unwrap();
+        assert!(home.is_stopped());
+        assert_eq!(mode_of(&home.stopped_file()).unwrap(), Some(FILE_MODE));
+        assert_eq!(mode_of(&home.run_dir()).unwrap(), Some(DIR_MODE));
+        home.mark_stopped().unwrap();
+        home.clear_stopped().unwrap();
+        assert!(!home.is_stopped());
+        home.clear_stopped().unwrap();
     }
 
     #[test]

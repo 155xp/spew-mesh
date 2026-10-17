@@ -3,11 +3,13 @@
 //! [`Responder`] takes one question and returns the answer text, or a failure whose reply line ends the
 //! asker's wait. Underneath: the command line, environment and permission set for each client (8.2 to 8.4),
 //! a runner that spawns each run in its own process group with a timeout and an output cap, the run limits
-//! and queue, the conversation map, and the prompt. Taking questions from the daemon (`responder.take`) and
-//! sending answers back (`message.reply`) are wired on top of [`Responder::answer`].
+//! and queue, the conversation map, and the prompt. [`runloop`] connects a responder to the daemon
+//! (`session.open`, `responder.take`, `message.reply`, reconnecting when the daemon restarts), and [`command`]
+//! is `spew mesh serve`.
 
 pub mod claude;
 pub mod codex;
+pub mod command;
 mod config;
 pub mod env;
 pub mod limits;
@@ -15,13 +17,15 @@ pub mod memory;
 pub mod opencode;
 pub mod process;
 pub mod prompt;
+pub mod runloop;
 mod serve;
 
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub use config::{ServeConfig, ServeFrom, ServeSettings};
+pub use crate::settings::{ServeFrom, ServeSettings};
+pub use config::ServeConfig;
 pub use serve::{Answer, MAX_ANSWER_BYTES, Responder};
 
 /// The agent CLI a responder drives.
@@ -108,6 +112,32 @@ pub enum ServeError {
 }
 
 impl ServeError {
+    /// What the person can do about it, for the `fix:` line serve and `doctor` print.
+    pub fn fix(&self) -> String {
+        match self {
+            ServeError::Invalid(_) => {
+                "check the serve flags and the [serve] table in settings.toml".into()
+            }
+            ServeError::ProgramNotFound(program) => format!(
+                "install {program} or add its folder to PATH (serve skips relative PATH entries)"
+            ),
+            ServeError::Config { .. } => "fix or move that file, then start serve again".into(),
+            ServeError::ProviderSecret { .. } => {
+                "use a Codex provider that reads its key from an environment variable (env_key)"
+                    .into()
+            }
+            ServeError::ProjectConfig { .. } => {
+                "remove that key from the repo's Codex config, or serve another folder".into()
+            }
+            ServeError::Canary(_) => {
+                "update Codex, then start serve again; `spew mesh doctor` shows its version".into()
+            }
+            ServeError::Io { .. } => {
+                "check the folder and that the spew mesh home is writable".into()
+            }
+        }
+    }
+
     pub(crate) fn io(context: impl Into<String>, source: std::io::Error) -> Self {
         ServeError::Io {
             context: context.into(),

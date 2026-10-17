@@ -3,7 +3,11 @@
 //! The map lives in the store's serve conversation table (11.1) through [`StoreConversations`];
 //! [`ConversationStore`] is the seam, and [`MemoryConversations`] keeps the map in memory for tests.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+use anyhow::Context as _;
 
 use super::{Question, ServeClient};
 use crate::store::Store;
@@ -48,19 +52,44 @@ pub trait ConversationStore: Send {
 /// in WAL mode lets both write.
 #[derive(Debug)]
 pub struct StoreConversations {
-    store: Store,
+    path: Option<PathBuf>,
+    store: OnceCell<Store>,
 }
 
 impl StoreConversations {
     /// The map in an open store.
     pub fn new(store: Store) -> Self {
-        StoreConversations { store }
+        StoreConversations {
+            path: None,
+            store: OnceCell::from(store),
+        }
+    }
+
+    /// The map in the store file at `path`, opened at first use. serve checks its client before it reaches
+    /// the daemon, and the daemon is the one that creates and migrates the store.
+    pub fn open_later(path: impl Into<PathBuf>) -> Self {
+        StoreConversations {
+            path: Some(path.into()),
+            store: OnceCell::new(),
+        }
+    }
+
+    fn store(&self) -> anyhow::Result<&Store> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+        let path = self
+            .path
+            .as_deref()
+            .context("the serve conversation map has no store")?;
+        let store = Store::open(path).with_context(|| format!("can't open {}", path.display()))?;
+        Ok(self.store.get_or_init(|| store))
     }
 }
 
 impl ConversationStore for StoreConversations {
     fn get(&self, key: &ConversationKey) -> anyhow::Result<Option<String>> {
-        let thread = self.store.serve_thread(
+        let thread = self.store()?.serve_thread(
             key.client.as_str(),
             &key.device,
             &key.session,
@@ -73,7 +102,7 @@ impl ConversationStore for StoreConversations {
         if session_id.is_empty() {
             anyhow::bail!("a serve conversation needs a session id");
         }
-        self.store.set_serve_thread(
+        self.store()?.set_serve_thread(
             key.client.as_str(),
             &key.device,
             &key.session,
@@ -86,7 +115,7 @@ impl ConversationStore for StoreConversations {
 
     fn forget(&mut self, key: &ConversationKey, now_ms: u64) -> anyhow::Result<()> {
         // The store has no delete for this table; an empty thread reads as "start a new session".
-        self.store.set_serve_thread(
+        self.store()?.set_serve_thread(
             key.client.as_str(),
             &key.device,
             &key.session,
@@ -214,9 +243,22 @@ mod tests {
             m.put(&key("c1"), "s1", 1).unwrap();
             assert!(m.put(&key("c2"), "", 1).is_err());
         }
-        let m = StoreConversations::new(Store::open(&path).unwrap());
+        let m = StoreConversations::open_later(&path);
         assert_eq!(m.get(&key("c1")).unwrap().as_deref(), Some("s1"));
         assert_eq!(m.get(&key("c2")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_store_opened_later_is_opened_at_first_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store.sqlite3");
+        let mut m = StoreConversations::open_later(&path);
+        assert!(!path.exists());
+        m.put(&key("c1"), "s1", 1).unwrap();
+        assert!(path.exists());
+        assert_eq!(m.get(&key("c1")).unwrap().as_deref(), Some("s1"));
+        let missing = StoreConversations::open_later(tmp.path().join("no/such/dir/store.sqlite3"));
+        assert!(missing.get(&key("c1")).is_err());
     }
 
     #[test]

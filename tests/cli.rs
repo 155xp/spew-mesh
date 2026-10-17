@@ -241,11 +241,7 @@ fn the_home_flag_and_doctor_work_without_a_daemon() {
 #[test]
 fn the_commands_other_cards_build_say_so() {
     let mesh = Mesh::new();
-    for args in [
-        &["mcp-server"][..],
-        &["hook", "claude", "SessionStart"][..],
-        &["serve", "codex", "--name", "web-help"][..],
-    ] {
+    for args in [&["mcp-server"][..], &["hook", "claude", "SessionStart"][..]] {
         let out = mesh.run(args);
         assert_eq!(code(&out), 1, "{args:?}");
         assert!(stderr(&out).contains("not built yet"), "{args:?}");

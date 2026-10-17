@@ -231,7 +231,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match &mesh.command {
         Some(Command::McpServer) => return Ok(mcp_server_not_built()),
         Some(Command::Hook { client, event }) => return Ok(hook_not_built(client, event)),
-        Some(Command::Serve(args)) => return Ok(serve_not_built(args)),
+        Some(Command::Serve(args)) => return Ok(serve(mesh.home.as_deref(), args)),
         _ => {}
     }
     let home = Home::from_env(mesh.home.as_deref()).context("can't find the spew mesh home")?;
@@ -289,10 +289,17 @@ pub fn hook_not_built(client: &str, event: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `spew mesh serve`: built by mesh#10 part 2.
-pub fn serve_not_built(args: &ServeArgs) -> ExitCode {
-    eprintln!("spew mesh serve {}: not built yet", args.client);
-    ExitCode::FAILURE
+/// `spew mesh serve` (9).
+pub fn serve(home: Option<&std::path::Path>, args: &ServeArgs) -> ExitCode {
+    let opts = crate::responder::command::ServeOptions {
+        client: args.client.clone(),
+        name: args.name.clone(),
+        cwd: args.cwd.clone(),
+        allow_edits: args.allow_edits,
+        timeout: args.timeout,
+        model: args.model.clone(),
+    };
+    crate::responder::command::run(home, &opts)
 }
 
 fn block_on<T, F: Future<Output = anyhow::Result<T>>>(f: F) -> anyhow::Result<T> {

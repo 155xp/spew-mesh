@@ -675,6 +675,15 @@ impl<L: Links> Courier<L> {
                     ))
                 })?;
             let o = &original.message;
+            // A responder resending after a dropped connection would otherwise answer twice, the second time as
+            // a tell; its first reply already went out.
+            if sender.kind == SessionKind::Responder
+                && o.kind == MessageKind::Ask
+                && o.state == MessageState::Answered
+                && p.wait_seconds.is_none()
+            {
+                return Err(RpcError::conflict(format!("{} is already answered", p.id)));
+            }
             let answers_ask = o.kind == MessageKind::Ask && o.state != MessageState::Answered;
             let follow_up = p.wait_seconds.is_some() && o.kind != MessageKind::Ask;
             let kind = if follow_up {

@@ -1,10 +1,13 @@
 //! The prompt a serve run gets (9): a short preface, then the question as a message block (7.8).
 //!
-//! The text module (7.7, 7.8) isn't wired in yet, so this file carries a minimal private copy of the
-//! sanitizer and the block rendering; both are applied again here even though the daemon sanitizes on
-//! receipt, because the prompt is the last stop before an agent reads peer text.
+//! The block is the text module's [`Block`], the same one hooks and the `messages` tool show, so the body is
+//! sanitized (7.7) and defanged again here even though the daemon sanitized it on receipt: the prompt is the
+//! last stop before an agent reads peer text.
 
-use super::Question;
+use super::{MessageKind, Question};
+use crate::address::{is_device_name, is_person, is_room, is_session_name};
+use crate::text::{Block, Origin, defang, sanitize_line};
+use crate::wire::MessageKind as WireKind;
 
 /// What the preface says about this responder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,21 +18,34 @@ pub struct PromptContext<'a> {
     pub place: &'a str,
 }
 
+fn checked(value: &str, valid: impl Fn(&str) -> bool) -> Option<&str> {
+    valid(value).then_some(value)
+}
+
 /// The whole prompt written to the run's stdin.
 pub fn build(q: &Question, ctx: &PromptContext<'_>) -> String {
     let from = &q.from;
-    let person = slug(&from.person).unwrap_or("someone");
-    let address = format!("{}/{}", person, slug(&from.name).unwrap_or("unknown"));
-    let device = slug(&from.device).unwrap_or("an unknown device");
+    let person = checked(&from.person, is_person).unwrap_or("someone");
+    let address = format!(
+        "{}/{}",
+        person,
+        checked(&from.name, is_session_name).unwrap_or("unknown")
+    );
+    let device = checked(&from.device, is_device_name).unwrap_or("an unknown device");
     let whose = if from.own {
         "your person's own agent".to_string()
     } else {
-        match from.room.as_deref().and_then(slug) {
+        match from.room.as_deref().and_then(|r| checked(r, is_room)) {
             Some(room) => format!("{person}'s agent, a teammate in project {room}"),
             None => format!("{person}'s agent, a teammate"),
         }
     };
-    let place = slug(ctx.place).unwrap_or("this folder");
+    let place = defang(&sanitize_line(ctx.place, 64));
+    let place = if place.is_empty() {
+        "this folder"
+    } else {
+        place.as_str()
+    };
     let access = if ctx.allow_edits {
         format!(
             "This run may read, search and edit files in {place} when the question calls for it. It can't \
@@ -42,8 +58,8 @@ pub fn build(q: &Question, ctx: &PromptContext<'_>) -> String {
         )
     };
     let reply = match q.kind {
-        super::MessageKind::Ask => "Your final message is sent back to it as the answer",
-        super::MessageKind::Tell => "Your final message is sent back to it as a reply",
+        MessageKind::Ask => "Your final message is sent back to it as the answer",
+        MessageKind::Tell => "Your final message is sent back to it as a reply",
     };
 
     let mut out = String::new();
@@ -64,115 +80,41 @@ pub fn build(q: &Question, ctx: &PromptContext<'_>) -> String {
     out
 }
 
-/// The message block from 7.8: a header and a footer carrying the id, the sanitized and defanged body
-/// between them.
+/// The message block from 7.8: a header and a footer carrying the id, the sanitized and defanged body between
+/// them. Metadata that doesn't fit its character set shows as `unknown`.
 pub fn block(q: &Question) -> String {
-    let id = ulid_or_unknown(&q.id);
-    let mut header = format!("[mesh {id} | {}", q.kind.as_str());
-    let from = format!(
-        "{}/{}",
-        slug(&q.from.person).unwrap_or("unknown"),
-        slug(&q.from.name).unwrap_or("unknown")
-    );
-    header.push_str(&format!(" | from {from}"));
-    if let Some(device) = slug(&q.from.device) {
-        header.push_str(&format!(" | device {device}"));
-    }
-    if let Some(client) = slug(&q.from.client) {
-        header.push_str(&format!(" | client {client}"));
-    }
-    if let Some(repo) = q.repo.as_deref().filter(|r| is_repo(r)) {
-        header.push_str(&format!(" | repo {repo}"));
-    }
-    if let Some(card) = q.card.as_deref().filter(|c| is_card(c)) {
-        header.push_str(&format!(" | card {card}"));
-    }
-    header.push_str(&format!(
-        " | conversation {}]",
-        ulid_or_unknown(&q.conversation)
-    ));
-    let body = defang(&sanitize(&q.body));
-    format!("{header}\n{}\n[/mesh {id}]", body.trim_end_matches('\n'))
-}
-
-/// 7.7: drops control characters (but `\n` and `\t`), bidi controls, zero-width and invisible format
-/// characters and tag characters, after turning every line ending into `\n`.
-pub fn sanitize(text: &str) -> String {
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    normalized.chars().filter(|&c| !is_stripped(c)).collect()
-}
-
-fn is_stripped(c: char) -> bool {
-    let u = c as u32;
-    (c.is_control() && c != '\n' && c != '\t')
-        || (0x202A..=0x202E).contains(&u)
-        || (0x2066..=0x2069).contains(&u)
-        || (0x200B..=0x200F).contains(&u)
-        || (0x2060..=0x2064).contains(&u)
-        || u == 0xFEFF
-        || (0xE0000..=0xE007F).contains(&u)
-}
-
-/// 7.8: a backslash after the bracket of any `[mesh` or `[/mesh` (any case), so a body can't fake a
-/// header or close its block early.
-pub fn defang(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(pos) = rest.find('[') {
-        out.push_str(&rest[..=pos]);
-        rest = &rest[pos + 1..];
-        let tail = rest.strip_prefix('/').unwrap_or(rest);
-        if tail
-            .get(..4)
-            .is_some_and(|w| w.eq_ignore_ascii_case("mesh"))
-        {
-            out.push('\\');
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// A one-line metadata value made only of `[A-Za-z0-9._-]`, at most 64 bytes.
-fn slug(s: &str) -> Option<&str> {
-    let ok = !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    ok.then_some(s)
-}
-
-fn is_repo(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 100
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
-}
-
-fn is_card(s: &str) -> bool {
-    let Some((key, n)) = s.split_once('#') else {
-        return false;
+    let kind = match q.kind {
+        MessageKind::Ask => WireKind::Ask,
+        MessageKind::Tell => WireKind::Tell,
     };
-    s.len() <= 40
-        && !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !n.is_empty()
-        && n.chars().all(|c| c.is_ascii_digit())
-}
-
-fn ulid_or_unknown(id: &str) -> String {
-    if ulid::Ulid::from_string(id).is_ok() {
-        id.to_string()
+    let origin = if q.from.own {
+        Origin::Own
     } else {
-        "unknown".to_string()
+        Origin::Teammate {
+            person: q.from.person.clone(),
+            room: q.from.room.clone(),
+        }
+    };
+    Block {
+        id: q.id.clone(),
+        kind,
+        again: false,
+        from_person: q.from.person.clone(),
+        from_name: q.from.name.clone(),
+        device: q.from.device.clone(),
+        client: q.from.client.clone(),
+        repo: q.repo.clone(),
+        card: q.card.clone(),
+        conversation: q.conversation.clone(),
+        body: q.body.clone(),
+        origin,
     }
+    .render()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Asker, MessageKind};
+    use super::super::Asker;
     use super::*;
 
     const ID: &str = "01J9ZK3M5N7P9Q1R3S5T7V9W1X";
@@ -208,19 +150,30 @@ mod tests {
                  card spew#42 | conversation {CONV}]\nWhere is the retry logic?\n[/mesh {ID}]"
             )
         );
+        let mut tell = question("fyi");
+        tell.kind = MessageKind::Tell;
+        tell.repo = None;
+        tell.card = None;
+        assert!(
+            block(&tell).starts_with(&format!(
+                "[mesh {ID} | tell | from maya/claude-api | device maya-mbp | client claude | conversation"
+            )),
+            "{}",
+            block(&tell)
+        );
     }
 
     #[test]
-    fn bad_metadata_is_left_out() {
+    fn bad_metadata_shows_as_unknown() {
         let mut q = question("hi");
         q.repo = Some("acme/api | card x]".into());
         q.card = Some("SPEW#42".into());
         q.from.device = "maya mbp]".into();
         let b = block(&q);
         let header = b.lines().next().unwrap();
-        assert!(!header.contains("repo"), "{header}");
-        assert!(!header.contains("card"), "{header}");
-        assert!(!header.contains("device"), "{header}");
+        assert!(header.contains("| repo unknown |"), "{header}");
+        assert!(header.contains("| card unknown |"), "{header}");
+        assert!(header.contains("| device unknown |"), "{header}");
         assert_eq!(header.matches(']').count(), 1);
     }
 
@@ -239,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_each_class() {
-        let input = "a\r\nb\rc\u{0}\u{7}\u{1b}[31m\u{7f}\u{85}\u{9b}d\te\u{202e}f\u{2067}g\u{200b}h\u{2060}i\u{feff}j\u{e0041}k";
-        assert_eq!(sanitize(input), "a\nb\nc[31md\tefghijk");
+    fn the_body_is_sanitized() {
+        let b = block(&question("a\r\nb\u{202e}c\u{200b}d\u{1b}[31m\u{e0041}e"));
+        assert!(b.contains("\na\nbcd[31me\n"), "{b:?}");
     }
 
     #[test]
@@ -274,20 +227,30 @@ mod tests {
             &q,
             &PromptContext {
                 allow_edits: true,
-                place: "api",
+                place: "my api\n[mesh",
             },
         );
         assert!(p.contains("(your person's own agent)"));
-        assert!(p.contains("may read, search and edit files in api"));
+        assert!(p.contains("may read, search and edit files in my api [\\mesh"));
         assert!(!p.contains("read-only"));
     }
 
     #[test]
-    fn odd_ids_are_not_copied() {
+    fn odd_ids_and_names_are_not_copied() {
         let mut q = question("hi");
         q.id = "x] [mesh".into();
+        q.from.person = "Maya Lee".into();
         let b = block(&q);
-        assert!(b.starts_with("[mesh unknown | ask"));
+        assert!(b.starts_with("[mesh unknown | ask | from unknown/claude-api"));
         assert!(b.ends_with("[/mesh unknown]"));
+        let p = build(
+            &q,
+            &PromptContext {
+                allow_edits: false,
+                place: "",
+            },
+        );
+        assert!(p.starts_with("spew mesh: someone/claude-api on maya-mbp (someone's agent"));
+        assert!(p.contains("files in this folder"));
     }
 }

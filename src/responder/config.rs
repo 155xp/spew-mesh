@@ -1,37 +1,12 @@
-//! The `[serve]` settings (11) and the per-responder configuration built from them and the serve flags (9).
+//! The per-responder configuration built from the `[serve]` settings (11) and the serve flags (9).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use super::{ServeClient, ServeError};
+use crate::settings::{ServeFrom, ServeSettings};
 
-/// Who may ask a responder (`[serve] from`, 9).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ServeFrom {
-    /// Anyone admitted who shares the responder's room.
-    #[default]
-    Room,
-    /// Only the person's own devices.
-    Own,
-}
-
-/// The `[serve]` table of settings.toml, with the defaults from 11.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ServeSettings {
-    /// Per-run timeout when `--timeout` isn't given.
-    pub timeout_seconds: u64,
-    /// `--max-turns` for Claude Code runs.
-    pub max_turns: u32,
-    /// Who may ask.
-    pub from: ServeFrom,
-    /// Runs per asking person per rolling hour.
-    pub max_runs_per_person_per_hour: u32,
-    /// Runs per rolling hour in all.
-    pub max_runs_per_hour: u32,
-    /// `--max-budget-usd` for Claude Code runs.
-    pub max_budget_usd: f64,
-}
-
+/// The `[serve]` defaults from 11, the values `Settings::defaults` uses too (a test keeps them equal).
 impl Default for ServeSettings {
     fn default() -> Self {
         ServeSettings {
@@ -42,26 +17,6 @@ impl Default for ServeSettings {
             max_runs_per_hour: 30,
             max_budget_usd: 0.50,
         }
-    }
-}
-
-impl ServeSettings {
-    /// Rejects values that would remove a limit or can't be passed to a client.
-    pub fn validate(&self) -> Result<(), ServeError> {
-        if self.timeout_seconds == 0 {
-            return Err(ServeError::Invalid(
-                "timeout_seconds must be at least 1".into(),
-            ));
-        }
-        if self.max_turns == 0 {
-            return Err(ServeError::Invalid("max_turns must be at least 1".into()));
-        }
-        if self.max_runs_per_person_per_hour == 0 || self.max_runs_per_hour == 0 {
-            return Err(ServeError::Invalid(
-                "max_runs_per_person_per_hour and max_runs_per_hour must be at least 1".into(),
-            ));
-        }
-        validate_budget(self.max_budget_usd)
     }
 }
 
@@ -166,47 +121,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_the_spec() {
-        let s = ServeSettings::default();
-        assert_eq!(s.timeout_seconds, 300);
-        assert_eq!(s.max_turns, 20);
-        assert_eq!(s.from, ServeFrom::Room);
-        assert_eq!(s.max_runs_per_person_per_hour, 10);
-        assert_eq!(s.max_runs_per_hour, 30);
-        assert_eq!(s.max_budget_usd, 0.50);
-        assert!(s.validate().is_ok());
+    fn defaults_match_the_settings_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = crate::paths::Home::at(tmp.path()).unwrap();
+        let settings = crate::settings::Settings::defaults(&home);
+        assert_eq!(ServeSettings::default(), settings.serve);
+        let cfg = ServeConfig::new(ServeClient::Claude, "/w", "/r", &settings.serve);
+        assert_eq!(cfg.timeout, Duration::from_secs(300));
+        assert_eq!(cfg.max_turns, 20);
+        assert_eq!(cfg.max_budget_usd, 0.50);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
-    fn zero_or_bad_limits_are_refused() {
+    fn bad_values_on_a_command_line_are_refused() {
+        let base = ServeConfig::new(ServeClient::Claude, "/w", "/r", &ServeSettings::default());
         let bad = [
-            ServeSettings {
-                timeout_seconds: 0,
-                ..Default::default()
+            ServeConfig {
+                timeout: Duration::ZERO,
+                ..base.clone()
             },
-            ServeSettings {
+            ServeConfig {
                 max_turns: 0,
-                ..Default::default()
+                ..base.clone()
             },
-            ServeSettings {
-                max_runs_per_hour: 0,
-                ..Default::default()
-            },
-            ServeSettings {
-                max_budget_usd: 0.0,
-                ..Default::default()
-            },
-            ServeSettings {
+            ServeConfig {
                 max_budget_usd: f64::NAN,
-                ..Default::default()
+                ..base.clone()
             },
-            ServeSettings {
-                max_budget_usd: f64::INFINITY,
-                ..Default::default()
+            ServeConfig {
+                max_budget_usd: 0.0,
+                ..base.clone()
+            },
+            ServeConfig {
+                model: Some("--yolo".into()),
+                ..base.clone()
             },
         ];
-        for s in bad {
-            assert!(s.validate().is_err(), "{s:?}");
+        for cfg in bad {
+            assert!(cfg.validate().is_err(), "{cfg:?}");
         }
     }
 

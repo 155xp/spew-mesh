@@ -21,7 +21,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub use config::{ServeConfig, ServeFrom, ServeSettings};
+pub use crate::settings::{ServeFrom, ServeSettings};
+pub use config::ServeConfig;
 pub use serve::{Answer, MAX_ANSWER_BYTES, Responder};
 
 /// The agent CLI a responder drives.

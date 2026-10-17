@@ -80,7 +80,7 @@ pub struct LinkStatus {
 }
 
 /// One open link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LinkInfo {
     /// The peer's endpoint id.
     pub device: String,

@@ -569,6 +569,65 @@ async fn presence_is_filtered_and_held_to_once_a_second() {
     assert!(again[0].2 >= Duration::from_millis(1_200));
 }
 
+#[tokio::test]
+async fn presence_hides_an_own_only_responder_from_teammates() {
+    let net = MemNet::new();
+    let mac = Node::new(&net, SAM_MAC, "sam", "sam-mac");
+    let linux = Node::new(&net, SAM_LINUX, "sam", "sam-linux");
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    mac.open("web", Some("team"));
+    let own = GateSettings {
+        from: ServeFrom::Own,
+        max_runs_per_person_per_hour: 10,
+        max_runs_per_hour: 30,
+    };
+    let opened = mac
+        .courier
+        .open_session(
+            &mac.conn(),
+            responder_open(&mac, SessionKind::Responder, Some(own)),
+        )
+        .unwrap();
+    for (node, peer) in [(&linux, SAM_LINUX), (&maya, MAYA_MBP)] {
+        assert!(net.is_up(&id(SAM_MAC), &id(peer)));
+        mac.courier.on_link_event(&LinkEvent::Up(id(peer)));
+        node.courier.on_link_event(&LinkEvent::Up(id(SAM_MAC)));
+    }
+    let kinds = |device: u8| -> Vec<(SessionKind, String)> {
+        let round = mac.courier.presence_round(None);
+        let (_, snapshot, _) = round
+            .into_iter()
+            .find(|(d, _, _)| *d == id(device))
+            .unwrap();
+        snapshot
+            .sessions
+            .into_iter()
+            .map(|s| (s.kind, s.session))
+            .collect()
+    };
+    let to_maya = kinds(MAYA_MBP);
+    assert_eq!(to_maya.len(), 1, "{to_maya:?}");
+    assert_eq!(to_maya[0].0, SessionKind::Live);
+    let to_linux = kinds(SAM_LINUX);
+    assert!(
+        to_linux.contains(&(SessionKind::Responder, opened.session.clone())),
+        "{to_linux:?}"
+    );
+
+    // Serving the room again shows it to maya.
+    let room = GateSettings {
+        from: ServeFrom::Room,
+        ..own
+    };
+    mac.courier
+        .open_session(
+            &mac.conn(),
+            responder_open(&mac, SessionKind::Responder, Some(room)),
+        )
+        .unwrap();
+    assert!(kinds(MAYA_MBP).contains(&(SessionKind::Responder, opened.session)));
+}
+
 fn presence_session(
     session: &str,
     name: &str,
@@ -846,6 +905,57 @@ async fn a_responder_with_a_full_queue_is_busy() {
         .unwrap();
     assert!(taken.question.is_some());
     assert!(accepted(&deliver(&maya, ask).await));
+}
+
+#[tokio::test]
+async fn a_responder_answers_an_ask_only_once() {
+    let net = MemNet::new();
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    let (token, helper, helper_name) = maya.open_responder("web", "team");
+    let ask = envelope("ask", None, None, (&helper, &helper_name));
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    assert!(accepted(&deliver(&maya, ask).await));
+    let first = maya.reply(&token, &ask_id, "on main", None).await;
+    assert_eq!(first.status, SendStatus::Queued);
+    // The same reply sent again after a dropped connection is refused instead of going out as a tell.
+    let again = maya
+        .courier
+        .reply(
+            &maya.conn(),
+            ReplyParams {
+                token: token.clone(),
+                id: ask_id.clone(),
+                text: "on main".into(),
+                wait_seconds: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(again.reason, Reason::Conflict);
+    assert!(
+        again.message.contains("already answered"),
+        "{}",
+        again.message
+    );
+    let delivers = |node: &Node| {
+        node.outbox_kinds(SAM_MAC)
+            .into_iter()
+            .filter(|k| *k == OutboxKind::Deliver)
+            .count()
+    };
+    assert_eq!(delivers(&maya), 1);
+
+    // A live session's second reply still goes, as a tell.
+    let (live_token, live, live_name) = maya.open("api", Some("team"));
+    let ask = envelope("ask", None, None, (&live, &live_name));
+    let ask_id = ask["id"].as_str().unwrap().to_string();
+    assert!(accepted(&deliver(&maya, ask).await));
+    maya.reply(&live_token, &ask_id, "yes", None).await;
+    let tell = maya
+        .reply(&live_token, &ask_id, "and one more thing", None)
+        .await;
+    assert_eq!(tell.status, SendStatus::Queued);
+    assert_eq!(delivers(&maya), 3);
 }
 
 #[tokio::test]

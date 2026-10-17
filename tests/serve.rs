@@ -15,10 +15,10 @@ use iroh::EndpointId;
 use serde_json::Value;
 use tokio::sync::{mpsc as tmpsc, watch};
 
-use spew_mesh::control::client::{Client, ConnectOptions};
+use spew_mesh::control::client::{Client, ClientError, ConnectOptions};
 use spew_mesh::control::protocol::{
-    AskParams, DirectoryQuery, FetchParams, ReplyParams, SendResult, SendStatus, SessionOpen,
-    SessionRow,
+    AskParams, DirectoryQuery, FetchParams, Reason, ReplyParams, SendResult, SendStatus,
+    SessionOpen, SessionRow,
 };
 use spew_mesh::daemon::testnet::{MemLinks, MemNet};
 use spew_mesh::daemon::{self, Daemon, DaemonOptions};
@@ -266,11 +266,11 @@ impl Serve {
 
     // Ctrl-C, then the exit code.
     fn interrupt(&mut self) -> i32 {
-        let status = Command::new("kill")
-            .args(["-INT", &self.child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        kill("-INT", self.child.id());
+        self.exit_code()
+    }
+
+    fn exit_code(&mut self) -> i32 {
         let deadline = Instant::now() + WAIT;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -286,6 +286,23 @@ impl Drop for Serve {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn kill(signal: &str, pid: u32) {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// A stopped daemon, continued when dropped so the [`Mesh`] can stop it.
+struct Paused(u32);
+
+impl Drop for Paused {
+    fn drop(&mut self) {
+        kill("-CONT", self.0);
     }
 }
 
@@ -529,6 +546,31 @@ fn a_reconnecting_serve_leaves_a_stopped_daemon_stopped() {
     assert_eq!(serve.interrupt(), 0);
 }
 
+#[test]
+fn a_second_ctrl_c_stops_serve_at_once() {
+    let mesh = Mesh::new();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = mesh.api();
+    let mut serve = mesh.serve(&["claude", "--cwd", api.to_str().unwrap()]);
+    serve.wait_for("Serving claude in");
+
+    // With the daemon not answering, the first Ctrl-C waits up to 5 s for `session.close`; the second ends serve.
+    let pid = rt.block_on(async { mesh.client().await.status().await.unwrap().pid });
+    kill("-STOP", pid);
+    let paused = Paused(pid);
+    let started = Instant::now();
+    kill("-INT", serve.child.id());
+    std::thread::sleep(Duration::from_millis(300));
+    kill("-INT", serve.child.id());
+    assert_eq!(serve.exit_code(), 130);
+    assert!(
+        started.elapsed() < runloop::CLOSE_WAIT,
+        "{:?}",
+        started.elapsed()
+    );
+    drop(paused);
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // In-process daemons on the in-memory network.
 
@@ -755,6 +797,10 @@ impl Session {
     }
 
     async fn ask(&self, to: &str, text: &str, wait: u64) -> SendResult {
+        self.try_ask(to, text, wait).await.unwrap()
+    }
+
+    async fn try_ask(&self, to: &str, text: &str, wait: u64) -> Result<SendResult, ClientError> {
         self.client
             .ask(&AskParams {
                 token: self.token.clone(),
@@ -764,10 +810,16 @@ impl Session {
                 wait_seconds: Some(wait),
             })
             .await
-            .unwrap()
     }
 
     async fn responder_row(&self, include_offline: bool) -> Option<SessionRow> {
+        self.rows(include_offline)
+            .await
+            .into_iter()
+            .find(|s| s.kind == SessionKind::Responder && s.online)
+    }
+
+    async fn rows(&self, include_offline: bool) -> Vec<SessionRow> {
         let dir = self
             .client
             .directory(&DirectoryQuery {
@@ -781,7 +833,7 @@ impl Session {
             .into_iter()
             .flat_map(|r| r.people)
             .flat_map(|p| p.sessions)
-            .find(|s| s.kind == SessionKind::Responder && s.online)
+            .collect()
     }
 
     async fn sees_responder(&self) {
@@ -874,7 +926,7 @@ async fn the_per_person_limit_refuses_with_busy_and_own_devices_count_only_towar
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn from_own_turns_a_teammate_away_as_no_such_session() {
+async fn from_own_hides_the_responder_from_a_teammate() {
     let team = Team::start("\n[serve]\nfrom = \"own\"\n").await;
     let fake = Fake::new(&team.mac.root());
     let (mut responder, lc) = responder(&team.mac, &fake).await;
@@ -888,12 +940,37 @@ async fn from_own_turns_a_teammate_away_as_no_such_session() {
         .await;
         let maya = Session::open(&team.maya, &team.maya.folder("web", Some("team"))).await;
         let linux = Session::open(&team.linux, &team.linux.folder("ops", None)).await;
-        maya.sees_responder().await;
         linux.sees_responder().await;
+        // Maya sees sam-mac's live session in `team`, opened after the responder, but not the responder (9).
+        let _notes = Session::open(&team.mac, &team.mac.folder("notes", Some("team"))).await;
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let rows = maya.rows(false).await;
+            if rows
+                .iter()
+                .any(|s| s.address.starts_with("sam@sam-mac/") && s.online)
+            {
+                assert!(
+                    rows.iter().all(|s| s.kind != SessionKind::Responder),
+                    "{rows:?}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sam-mac never showed up: {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-        let refused = maya.ask(SERVED, "where is the retry logic?", 5).await;
-        assert_eq!(refused.status, SendStatus::Refused, "{}", refused.note);
-        assert_eq!(refused.code.as_deref(), Some("no-such-session"));
+        // Unseen, it can't be asked; a deliver that got there anyway is refused with no-such-session (the
+        // courier tests).
+        let unseen = maya
+            .try_ask(SERVED, "where is the retry logic?", 5)
+            .await
+            .unwrap_err();
+        let unseen = unseen.rpc().expect("an RPC error");
+        assert_eq!(unseen.reason, Reason::NotFound, "{}", unseen.message);
         let answered = linux.ask(SERVED, "where is the retry logic?", 20).await;
         assert_eq!(answered.status, SendStatus::Answered, "{}", answered.note);
         assert_eq!(answered.answer.unwrap().body, "answer 1");

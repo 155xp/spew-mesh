@@ -139,7 +139,9 @@ async fn serve(
         SystemClock,
     )
     .await?;
-    let daemon = Client::connect(&home, &ConnectOptions::responder())
+    // The first connect is a CLI command's: it starts a missing daemon and replaces an older one (6.1, 9).
+    // Reconnects use the loop's responder options.
+    let daemon = Client::connect(&home, &ConnectOptions::cli())
         .await
         .map_err(|e| Problem::new(e, DOCTOR))?;
     let folder = responder.config().cwd.clone();
@@ -167,24 +169,35 @@ async fn serve(
     }
 }
 
-// Turns `stop` true on Ctrl-C, SIGTERM or SIGHUP.
+// Turns `stop` true on Ctrl-C, SIGTERM or SIGHUP, and exits with 130 on a second one, so a daemon that doesn't
+// answer can't hold a stopping serve. By then the loop has dropped the run, which killed its process group.
 async fn stop_on_signal(stop: watch::Sender<bool>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    async fn on(kind: SignalKind) {
-        match signal(kind) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            // Without the handler the default action applies, which ends the process anyway.
-            Err(_) => std::future::pending::<()>().await,
+    use tokio::signal::unix::{Signal, SignalKind, signal};
+    async fn next(s: &mut Option<Signal>) {
+        let got = match s {
+            Some(s) => s.recv().await,
+            None => None,
+        };
+        // Without the handler the default action applies, which ends the process anyway.
+        if got.is_none() {
+            std::future::pending::<()>().await;
         }
     }
-    tokio::select! {
-        _ = on(SignalKind::interrupt()) => {}
-        _ = on(SignalKind::terminate()) => {}
-        _ = on(SignalKind::hangup()) => {}
+    let mut int = signal(SignalKind::interrupt()).ok();
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut hup = signal(SignalKind::hangup()).ok();
+    for first in [true, false] {
+        tokio::select! {
+            _ = next(&mut int) => {}
+            _ = next(&mut term) => {}
+            _ = next(&mut hup) => {}
+        }
+        if first {
+            let _ = stop.send(true);
+        } else {
+            std::process::exit(130);
+        }
     }
-    let _ = stop.send(true);
 }
 
 // Writes the loop's events to the terminal and the log. Peer text is cut to one clean line (10).
@@ -249,14 +262,51 @@ fn reporter(serving: String) -> Report {
 
 // The serve process logs to the daemon's log file, where `doctor` and bug reports look (9, 11).
 fn init_logging(home: &Home, env: &Env) -> Result<(), Problem> {
-    let file = open_private_append(&home.log_file())
+    let path = home.log_file();
+    open_private_append(&path)
         .map_err(|e| Problem::new(e, "check that the spew mesh home is yours and writable"))?;
     let filter = tracing_subscriber::EnvFilter::try_new(env.log.as_deref().unwrap_or("info"))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::sync::Mutex::new(file))
+        .with_writer(log_writer(path))
         .with_ansi(false)
         .try_init();
     Ok(())
+}
+
+// Opens the log for each line: a daemon that serve starts may rotate it (11), and a held file would follow the
+// old one. A line that can't be written is dropped.
+fn log_writer(path: PathBuf) -> impl Fn() -> Box<dyn Write + Send> + Send + Sync + 'static {
+    move || match open_private_append(&path) {
+        Ok(file) => Box::new(file),
+        Err(_) => Box::new(std::io::sink()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_log_line_goes_to_the_current_log_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mesh.log");
+        let make = log_writer(log.clone());
+        make().write_all(b"one\n").unwrap();
+        // What a starting daemon's rotation does.
+        std::fs::rename(&log, tmp.path().join("mesh.log.1")).unwrap();
+        make().write_all(b"two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "two\n");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("mesh.log.1")).unwrap(),
+            "one\n"
+        );
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A log that can't be opened drops the line.
+        let gone = log_writer(tmp.path().join("missing").join("mesh.log"));
+        gone().write_all(b"lost\n").unwrap();
+    }
 }

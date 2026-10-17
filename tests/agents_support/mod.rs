@@ -218,7 +218,8 @@ pub struct Mcp {
 }
 
 impl Mcp {
-    fn spawn(mut cmd: Command) -> Mcp {
+    /// Starts a server from a prepared `spew mesh mcp-server` command.
+    pub fn spawn(mut cmd: Command) -> Mcp {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

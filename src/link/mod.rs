@@ -138,6 +138,8 @@ mod config;
 mod endpoint;
 mod limits;
 mod links;
+#[cfg(test)]
+mod tests;
 
 pub use config::{LinkConfig, MAX_INBOUND_STREAMS, MDNS_SERVICE, Timing};
 pub use limits::{DELIVER_PER_MINUTE, DELIVER_WINDOW, PRESENCE_GAP};

@@ -38,8 +38,10 @@ const WAIT: Duration = Duration::from_secs(30);
 
 /// A fake `claude -p`: records its pid, argv and stdin of call N as `<rec>/pid.N`, `argv.N` and `stdin.N`, sleeps `sleep.N`
 /// seconds when that file exists and waits while `hold.N` exists, then prints `stdout.N` (with `@SESSION@` replaced by the session id from
-/// argv) or a success result answering "answer N", prints `stderr.N` and exits with `exit.N`.
+/// argv) or a success result answering "answer N", prints `stderr.N` and exits with `exit.N`. With FAKE_PROBE set it
+/// only exits.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
+[ -n "$FAKE_PROBE" ] && exit 0
 PATH=/usr/bin:/bin
 rec="$FAKE_REC"
 n=$(cat "$rec/count" 2>/dev/null || echo 0)
@@ -72,6 +74,30 @@ fn claude_ok(answer: &str, cost: f64) -> String {
     )
 }
 
+// Writes an executable script, then runs it once with FAKE_PROBE set until it starts: a child another test thread
+// forked while the file was open for writing keeps it busy (ETXTBSY) until that child execs, and nothing writes
+// the file after this, so later runs can't hit that.
+fn write_exe(path: &Path, script: &str) {
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..250 {
+        match std::process::Command::new(path)
+            .env("FAKE_PROBE", "1")
+            .status()
+        {
+            Ok(status) => {
+                assert!(status.success(), "{}: {status}", path.display());
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+    panic!("{} stayed busy", path.display());
+}
+
 /// The fake's folders: `bin/claude` and the recordings.
 struct Fake {
     bin: PathBuf,
@@ -84,9 +110,7 @@ impl Fake {
         let rec = root.join("rec");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&rec).unwrap();
-        let exe = bin.join("claude");
-        std::fs::write(&exe, FAKE_CLAUDE).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exe(&bin.join("claude"), FAKE_CLAUDE);
         Fake { bin, rec }
     }
 
@@ -957,10 +981,14 @@ impl Session {
 }
 
 // A send that reached the other device, or will: under load its receipt can come after the send stopped waiting
-// for it, so the caller checks the arrival some other way.
+// for it, so the caller checks the arrival some other way. A responder that takes the question at once can also
+// report it shown before the send's result is built.
 fn on_its_way(sent: &SendResult) {
     assert!(
-        matches!(sent.status, SendStatus::Delivered | SendStatus::Queued),
+        matches!(
+            sent.status,
+            SendStatus::Delivered | SendStatus::Queued | SendStatus::Shown
+        ),
         "{:?}: {}",
         sent.status,
         sent.note

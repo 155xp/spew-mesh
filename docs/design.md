@@ -1110,8 +1110,8 @@ setup never pre-approves `ask`, `tell` or `reply` in any client; `who` and `mess
   `busy`. A run is killed after `--timeout` (default `[serve] timeout_seconds`, 300) and answered with a timeout
   note.
 - A failed run (8.2 to 8.4) is answered with one line naming the failure ("The serve run failed: <reason>."), so
-  the asker's wait ends. The run's raw output stays in the log, with its cost when the client reports one (Claude
-  Code's `total_cost_usd`).
+  the asker's wait ends. Up to 16 KiB each of the run's stdout and stderr go to the 0600 log (`logs/mesh.log`),
+  with its cost when the client reports one (Claude Code's `total_cost_usd`).
 - Presence shows the responder with `kind = "responder"`, `reach = "serve"`, and busy or idle.
 - serve connects like a CLI command the first time (it starts a missing daemon and replaces an older one, 6.1) and
   like a long-lived client after that. Settings edits apply when serve restarts.

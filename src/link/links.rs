@@ -1116,20 +1116,26 @@ impl Shared {
             close(conn, CloseCode::NotAdmitted);
             return None;
         };
-        // Read once, so a call racing the acceptor's hello can't skip the rate check below and still be served.
+        // Read once, so a call racing the acceptor's hello is either refused here or served after its rate check.
         let ready = hello_done.load(Ordering::Acquire);
         // Calls are counted before their bodies are parsed (5.5 step 2): only `t` and `id` are read first, so a
-        // call over the limit never has its JSON built.
+        // call over the limit never has its JSON built. Calls before hello count too.
         let head = CallHead::read(payload);
-        if ready {
-            match self.check_rate(&device, &head) {
-                Ok(None) => {}
-                Ok(Some(early)) => return Some(early),
-                Err(NotAdmitted) => {
-                    close(conn, CloseCode::NotAdmitted);
-                    return None;
-                }
+        let early = match self.check_rate(&device, &head) {
+            Ok(early) => early,
+            Err(NotAdmitted) => {
+                close(conn, CloseCode::NotAdmitted);
+                return None;
             }
+        };
+        // Before hello only a hello is parsed (5.4); anything else, even a broken frame, is refused on its head.
+        if !ready && head.kind != Some(CallKind::Hello) {
+            return Some(Response::Error {
+                code: ErrorCode::HelloRequired,
+            });
+        }
+        if early.is_some() {
+            return early;
         }
         let call = match parse_incoming(payload) {
             Ok(call) => call,
@@ -1147,11 +1153,6 @@ impl Shared {
         }
         if let Incoming::Hello(theirs) = call {
             return self.server_hello(conn, id, hello_done, theirs);
-        }
-        if !ready {
-            return Some(Response::Error {
-                code: ErrorCode::HelloRequired,
-            });
         }
         Some(self.inbound.handle(peer, call).await)
     }

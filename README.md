@@ -52,6 +52,9 @@ Restart any open Claude Code, Codex or OpenCode session to pick this up.
 In Codex, run /hooks and trust the spew mesh hooks.
 ```
 
+Setup wires Claude Code 2.1.259 or newer, Codex 0.163.0 or newer and OpenCode 1.19.3 or newer. It skips an older
+client with a message naming the version it needs.
+
 - `--dry-run` shows what would change and changes nothing.
 - `--agents claude,codex` wires only those agents.
 - `--no-login` skips spew sign-in. Your own sessions on this computer work without it.

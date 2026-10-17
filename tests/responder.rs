@@ -22,8 +22,9 @@ use spew_mesh::responder::{
 /// `stdout.N`, `stderr.N` and `exit.N`. `@SESSION@` in stdout becomes the Claude session id from argv.
 /// `codex sandbox` cats its file only inside `-C` and never a `.env` file (FAKE_SANDBOX_LEAK lifts both
 /// rules, FAKE_SANDBOX_ENV_LEAK only the second). The `-o` file's mode goes to `runmode.N`, then it gets
-/// `runfile.N`. With `sleep.N` the call starts a background sleeper and sleeps.
+/// `runfile.N`. With `sleep.N` the call starts a background sleeper and sleeps. With FAKE_PROBE set it only exits.
 const FAKE: &str = r#"#!/bin/sh
+[ -n "$FAKE_PROBE" ] && exit 0
 rec="$FAKE_REC"
 n=$(cat "$rec/count" 2>/dev/null || echo 0)
 n=$((n+1))
@@ -63,6 +64,30 @@ code=0
 exit $code
 "#;
 
+// Writes an executable script, then runs it once with FAKE_PROBE set until it starts: a child another test thread
+// forked while the file was open for writing keeps it busy (ETXTBSY) until that child execs, and nothing writes
+// the file after this, so later runs can't hit that.
+fn write_exe(path: &Path, script: &str) {
+    std::fs::write(path, script).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..250 {
+        match std::process::Command::new(path)
+            .env("FAKE_PROBE", "1")
+            .status()
+        {
+            Ok(status) => {
+                assert!(status.success(), "{}: {status}", path.display());
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+    panic!("{} stayed busy", path.display());
+}
+
 struct Fake {
     _tmp: tempfile::TempDir,
     bin: PathBuf,
@@ -88,9 +113,7 @@ impl Fake {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::create_dir(cwd.join(".git")).unwrap();
-        let exe = bin.join(program);
-        std::fs::write(&exe, FAKE).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exe(&bin.join(program), FAKE);
         Fake {
             _tmp: tmp,
             bin,

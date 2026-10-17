@@ -348,6 +348,7 @@ async fn terminal(client: &Client) -> anyhow::Result<String> {
             kind: SessionKind::Terminal,
             name: None,
             spew_project: std::env::var(PROJECT_ENV).ok().filter(|v| !v.is_empty()),
+            serve: None,
         })
         .await?;
     Ok(opened.token)

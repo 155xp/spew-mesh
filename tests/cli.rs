@@ -110,6 +110,7 @@ async fn agent_session(home: &Path, cwd: &Path) -> (Client, String) {
             kind: SessionKind::Live,
             name: None,
             spew_project: None,
+            serve: None,
         })
         .await
         .unwrap();

@@ -7,11 +7,13 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::*;
-use crate::control::protocol::{FetchParams, SendStatus, SessionOpen, TellParams};
+use crate::control::protocol::{FetchParams, Reason, SendStatus, SessionOpen, TellParams};
 use crate::daemon::links::InboundDyn;
 use crate::daemon::testnet::{MemLinks, MemNet};
 use crate::link::Peer;
+use crate::responder::limits::{GateSettings, MAX_RUN_LIMIT};
 use crate::roster::file;
+use crate::settings::ServeFrom;
 use crate::wire::{DeliverState, ErrorCode, Incoming, Response};
 
 struct TestClock(AtomicU64);
@@ -109,6 +111,7 @@ impl Node {
                     kind: SessionKind::Live,
                     name: None,
                     spew_project: room.map(str::to_string),
+                    serve: None,
                 },
             )
             .unwrap();
@@ -468,4 +471,138 @@ async fn presence_is_filtered_and_held_to_once_a_second() {
     // A second round right away is held back about a second.
     let again = sam.courier.presence_round(None);
     assert!(again[0].2 >= Duration::from_millis(900));
+}
+
+// mesh#10: the `[serve]` limits a responder sends in `session.open` (9).
+fn responder_open(node: &Node, kind: SessionKind, serve: Option<GateSettings>) -> SessionOpen {
+    let cwd = node.dir.path().join("api");
+    std::fs::create_dir_all(&cwd).unwrap();
+    SessionOpen {
+        client: "claude".into(),
+        client_session: Some("serve-test".into()),
+        client_pid: None,
+        cwd: cwd.to_string_lossy().into_owned(),
+        client_name: None,
+        kind,
+        name: None,
+        spew_project: Some("team".into()),
+        serve,
+    }
+}
+
+#[tokio::test]
+async fn a_responders_own_limits_apply_when_questions_arrive() {
+    let net = MemNet::new();
+    let maya = Node::new(&net, MAYA_MBP, "maya", "maya-mbp");
+    let one = GateSettings {
+        from: ServeFrom::Room,
+        max_runs_per_person_per_hour: 1,
+        max_runs_per_hour: 30,
+    };
+
+    // Only a responder sends limits, and only in range.
+    let live = maya.courier.open_session(
+        &maya.conn(),
+        responder_open(&maya, SessionKind::Live, Some(one)),
+    );
+    assert_eq!(live.unwrap_err().reason, Reason::Invalid);
+    let huge = GateSettings {
+        max_runs_per_hour: MAX_RUN_LIMIT + 1,
+        ..one
+    };
+    let refused_open = maya.courier.open_session(
+        &maya.conn(),
+        responder_open(&maya, SessionKind::Responder, Some(huge)),
+    );
+    assert_eq!(refused_open.unwrap_err().reason, Reason::Invalid);
+
+    let conn = maya.conn();
+    let opened = maya
+        .courier
+        .open_session(
+            &conn,
+            responder_open(&maya, SessionKind::Responder, Some(one)),
+        )
+        .unwrap();
+    let to = (opened.session.as_str(), opened.name.as_str());
+    assert!(accepted(
+        &deliver(&maya, envelope("ask", None, None, to)).await
+    ));
+    // Over sam's limit: busy, and the refused ask isn't counted.
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::Busy
+    ));
+
+    // A re-open keeps the count; `from = own` turns a teammate away as if the responder weren't there.
+    let own = GateSettings {
+        from: ServeFrom::Own,
+        max_runs_per_person_per_hour: 5,
+        ..one
+    };
+    maya.courier
+        .open_session(
+            &conn,
+            responder_open(&maya, SessionKind::Responder, Some(own)),
+        )
+        .unwrap();
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::NoSuchSession
+    ));
+    let two = GateSettings {
+        max_runs_per_person_per_hour: 2,
+        ..one
+    };
+    maya.courier
+        .open_session(
+            &conn,
+            responder_open(&maya, SessionKind::Responder, Some(two)),
+        )
+        .unwrap();
+    assert!(accepted(
+        &deliver(&maya, envelope("ask", None, None, to)).await
+    ));
+    assert!(refused(
+        &deliver(&maya, envelope("ask", None, None, to)).await,
+        RefusalCode::Busy
+    ));
+}
+
+#[tokio::test]
+async fn asks_from_own_devices_count_only_toward_the_total() {
+    let net = MemNet::new();
+    let sam = Node::new(&net, SAM_MAC, "sam", "sam-mac");
+    let limits = GateSettings {
+        from: ServeFrom::Own,
+        max_runs_per_person_per_hour: 1,
+        max_runs_per_hour: 3,
+    };
+    let opened = sam
+        .courier
+        .open_session(
+            &sam.conn(),
+            responder_open(&sam, SessionKind::Responder, Some(limits)),
+        )
+        .unwrap();
+    let to = (opened.session.as_str(), opened.name.as_str());
+    let linux = Peer {
+        device: id(SAM_LINUX),
+        person: "sam".into(),
+        device_name: "sam-linux".into(),
+        own: true,
+    };
+    let mut answers = Vec::new();
+    for _ in 0..4 {
+        answers.push(
+            sam.courier
+                .handle_inbound(
+                    linux.clone(),
+                    Incoming::Deliver(envelope("ask", None, None, to)),
+                )
+                .await,
+        );
+    }
+    assert!(answers[..3].iter().all(accepted), "{answers:?}");
+    assert!(refused(&answers[3], RefusalCode::Busy), "{answers:?}");
 }

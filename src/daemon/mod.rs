@@ -14,6 +14,7 @@ pub mod testnet;
 #[cfg(test)]
 mod tests;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -37,7 +38,7 @@ use crate::control::server::{Conn, Handler, serve};
 use crate::courier::outbox::CALL_TIMEOUT;
 use crate::courier::{Courier, CourierConfig, LocalDevice};
 use crate::identity::{DeviceIdentity, default_device_name, platform};
-use crate::link::{LinkEvent, Links};
+use crate::link::{LinkEvent, LinkStatus, Links};
 use crate::paths::Home;
 use crate::presence::{DEBOUNCE_MS, REFRESH_MS};
 use crate::roster::local::{local_username, os_user_name};
@@ -374,19 +375,125 @@ fn spawn_pump<L: Links>(courier: &Arc<Courier<L>>, device: EndpointId, all: bool
     tokio::spawn(async move { courier.pump(device, all).await });
 }
 
+// What follows a link coming up: presence, then the device's whole outbox.
+fn link_round<L: Links>(courier: &Arc<Courier<L>>, devices: &[EndpointId]) {
+    send_presence(courier, Some(devices));
+    for device in devices {
+        spawn_pump(courier, *device, true);
+    }
+}
+
+/// The least time between two link rounds for one device.
+const UP_GAP: Duration = Duration::from_secs(1);
+
+/// What to do about a link coming up.
+#[derive(Debug, PartialEq, Eq)]
+enum UpAction {
+    /// Run the device's link round now.
+    Now,
+    /// Run it once after this long.
+    After(Duration),
+    /// A round is already scheduled.
+    Scheduled,
+}
+
+/// Holds link rounds to one per device per [`UP_GAP`], with one more after the gap when ups kept coming: a
+/// designated dialer that keeps reconnecting brings a Down and an Up per connection (5.3).
+#[derive(Default)]
+struct UpDebounce {
+    last: HashMap<EndpointId, tokio::time::Instant>,
+    scheduled: HashSet<EndpointId>,
+}
+
+impl UpDebounce {
+    fn up(&mut self, device: EndpointId, now: tokio::time::Instant) -> UpAction {
+        if self.scheduled.contains(&device) {
+            return UpAction::Scheduled;
+        }
+        let since = self.last.get(&device).map(|last| now.duration_since(*last));
+        match since {
+            Some(since) if since < UP_GAP => {
+                self.scheduled.insert(device);
+                UpAction::After(UP_GAP - since)
+            }
+            _ => {
+                self.last.insert(device, now);
+                UpAction::Now
+            }
+        }
+    }
+
+    /// A scheduled round came due; false when a round ran meanwhile and this one isn't needed.
+    fn due(&mut self, device: EndpointId, now: tokio::time::Instant) -> bool {
+        let scheduled = self.scheduled.remove(&device);
+        if scheduled {
+            self.last.insert(device, now);
+        }
+        scheduled
+    }
+
+    /// A round ran outside [`UpDebounce::up`], which also stands in for one that was scheduled.
+    fn ran(&mut self, device: EndpointId, now: tokio::time::Instant) {
+        self.scheduled.remove(&device);
+        self.last.insert(device, now);
+    }
+}
+
+// The devices the link layer has a link to now.
+fn linked_devices(status: &LinkStatus) -> Vec<EndpointId> {
+    status
+        .links
+        .iter()
+        .filter_map(|link| match link.device.parse::<EndpointId>() {
+            Ok(device) => Some(device),
+            Err(e) => {
+                tracing::warn!(device = %link.device, error = %e, "the link status names a bad endpoint id");
+                None
+            }
+        })
+        .collect()
+}
+
 async fn link_task<L: Links>(courier: Arc<Courier<L>>, mut events: broadcast::Receiver<LinkEvent>) {
+    let mut ups = UpDebounce::default();
+    let (due_tx, mut due_rx) = mpsc::unbounded_channel::<EndpointId>();
     loop {
-        match events.recv().await {
-            Ok(event) => {
-                if let Some(device) = courier.on_link_event(&event) {
-                    send_presence(&courier, Some(&[device]));
-                    spawn_pump(&courier, device, true);
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) => {
+                    let Some(device) = courier.on_link_event(&event) else {
+                        continue;
+                    };
+                    match ups.up(device, tokio::time::Instant::now()) {
+                        UpAction::Now => link_round(&courier, &[device]),
+                        UpAction::After(wait) => {
+                            let due = due_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(wait).await;
+                                let _ = due.send(device);
+                            });
+                        }
+                        UpAction::Scheduled => {}
+                    }
+                }
+                // Missed ups and downs: the link layer's status says which links are up now.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!(missed = n, "link events lagged; resyncing from the link status");
+                    let linked = linked_devices(&courier.links().status());
+                    courier.resync_links(&linked);
+                    let now = tokio::time::Instant::now();
+                    for device in &linked {
+                        ups.ran(*device, now);
+                    }
+                    link_round(&courier, &linked);
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
+            Some(device) = due_rx.recv() => {
+                if ups.due(device, tokio::time::Instant::now()) && courier.is_online(&device) {
+                    link_round(&courier, &[device]);
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::debug!(missed = n, "link events lagged");
-            }
-            Err(broadcast::error::RecvError::Closed) => return,
         }
     }
 }

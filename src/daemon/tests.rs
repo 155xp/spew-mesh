@@ -1,6 +1,7 @@
 //! The daemon's background work against a small hand-written spew server: device registration retried after
 //! a failure, an early roster refresh when an unknown device knocks (at most once every 10 s), home relay
-//! reports, and `run/stopped` cleared once a daemon holds the lock.
+//! reports, `run/stopped` cleared once a daemon holds the lock, and the link task's rounds: at most one per device
+//! a second, and a resync from the link status after missed link events.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -539,4 +540,160 @@ async fn a_daemon_that_holds_the_lock_clears_run_stopped() {
     assert!(start(opts(), move |id| n.join(id)).await.unwrap().is_none());
     assert!(home.is_stopped());
     daemon.finish().await;
+}
+
+/// Records the calls a device gets and answers each as the daemon would, minus the work.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<crate::wire::CallKind>>);
+
+impl Recorder {
+    fn count(&self, kind: crate::wire::CallKind) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| **k == kind)
+            .count()
+    }
+}
+
+impl InboundDyn for Recorder {
+    fn handle_dyn(
+        &self,
+        _peer: crate::link::Peer,
+        call: crate::wire::Incoming,
+    ) -> std::pin::Pin<Box<dyn Future<Output = crate::wire::Response> + Send + '_>> {
+        self.0.lock().unwrap().push(call.kind());
+        Box::pin(async { crate::wire::Response::Ok })
+    }
+}
+
+/// sam-mac's courier and maya-mbp as a recorder, linked on an in-memory network, with sam-mac's link task fed
+/// from `events` instead of its links.
+struct LinkTaskSetup {
+    net: MemNet,
+    sam: Arc<Courier<MemLinks>>,
+    maya: EndpointId,
+    recorder: Arc<Recorder>,
+    _maya_links: MemLinks,
+}
+
+fn link_task_setup() -> LinkTaskSetup {
+    let (sam, maya) = (key(1).public(), key(2).public());
+    let text = format!(
+        "[[person]]\nname = \"sam\"\ndevices = [ {{ id = \"{sam}\", name = \"sam-mac\" }} ]\n\n\
+         [[person]]\nname = \"maya\"\ndevices = [ {{ id = \"{maya}\", name = \"maya-mbp\" }} ]\n\n\
+         [[room]]\nname = \"team\"\npeople = [\"sam\", \"maya\"]\n"
+    );
+    let file = roster_file::parse(&text).unwrap();
+    let net = MemNet::new();
+    let (maya_me, maya_roster) = file.roster_for(Some("maya"), &maya, T0).unwrap();
+    let (maya_links, maya_inbound) = net.join(maya);
+    let recorder = Arc::new(Recorder::default());
+    maya_inbound.bind(Arc::downgrade(&recorder) as Weak<dyn InboundDyn>);
+    maya_links.set_admission(Admission::compute(&maya_me, &maya, &maya_roster));
+    let (me, roster) = file.roster_for(Some("sam"), &sam, T0).unwrap();
+    let (links, inbound) = net.join(sam);
+    let cfg = CourierConfig {
+        device: LocalDevice::new(sam, "sam-mac", "linux"),
+        default_room: None,
+        send_branch: true,
+        send_place: true,
+        serve: Default::default(),
+        clock: Arc::new(TestClock(AtomicU64::new(T0))),
+        start_time: |_| None,
+    };
+    let courier = Arc::new(
+        Courier::new(
+            links,
+            Store::open_in_memory().unwrap(),
+            ActiveRoster::new(me, sam, roster),
+            crate::courier::RosterInfo::default(),
+            cfg,
+        )
+        .unwrap(),
+    );
+    inbound.bind(Arc::downgrade(&courier) as Weak<dyn InboundDyn>);
+    courier.start_links();
+    assert!(net.is_up(&sam, &maya));
+    LinkTaskSetup {
+        net,
+        sam: courier,
+        maya,
+        recorder,
+        _maya_links: maya_links,
+    }
+}
+
+#[test]
+fn ups_closer_than_a_second_bring_one_more_round_after_the_gap() {
+    let d = key(2).public();
+    let t0 = tokio::time::Instant::now();
+    let mut ups = UpDebounce::default();
+    assert_eq!(ups.up(d, t0), UpAction::Now);
+    let t1 = t0 + Duration::from_millis(300);
+    assert_eq!(ups.up(d, t1), UpAction::After(Duration::from_millis(700)));
+    assert_eq!(
+        ups.up(d, t1 + Duration::from_millis(100)),
+        UpAction::Scheduled
+    );
+    assert!(ups.due(d, t0 + UP_GAP));
+    assert!(!ups.due(d, t0 + UP_GAP), "only once");
+    // A second after the scheduled round, an up runs at once again.
+    assert_eq!(ups.up(d, t0 + UP_GAP * 2), UpAction::Now);
+    // A round run for a resync stands in for a scheduled one.
+    let t2 = t0 + UP_GAP * 2 + Duration::from_millis(10);
+    assert_eq!(ups.up(d, t2), UpAction::After(Duration::from_millis(990)));
+    ups.ran(d, t2);
+    assert!(!ups.due(d, t0 + UP_GAP * 3));
+    // Other devices aren't held by this one.
+    assert_eq!(ups.up(key(3).public(), t2), UpAction::Now);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dialer_that_keeps_reconnecting_gets_presence_once_a_second() {
+    use crate::wire::CallKind;
+    let s = link_task_setup();
+    let (tx, rx) = broadcast::channel(64);
+    let task = tokio::spawn(link_task(s.sam.clone(), rx));
+    // Each new connection from the designated dialer replaces the last: a Down and an Up each time.
+    for _ in 0..5 {
+        tx.send(LinkEvent::Down {
+            device: s.maya,
+            last_seen_ms: T0,
+        })
+        .unwrap();
+        tx.send(LinkEvent::Up(s.maya)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The first up at once, then one more after the gap: not one per connection.
+    assert_eq!(s.recorder.count(CallKind::Presence), 2);
+    assert!(s.sam.is_online(&s.maya));
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn missed_link_events_resync_from_the_link_status() {
+    use crate::wire::CallKind;
+    let s = link_task_setup();
+    // sam-linux was online by an earlier event but has no link now; maya-mbp has one this courier never heard of.
+    let gone = key(3).public();
+    s.sam.on_link_event(&LinkEvent::Up(gone));
+    assert!(!s.sam.is_online(&s.maya));
+    let (tx, rx) = broadcast::channel(2);
+    for _ in 0..4 {
+        tx.send(LinkEvent::Down {
+            device: gone,
+            last_seen_ms: T0,
+        })
+        .unwrap();
+    }
+    let task = tokio::spawn(link_task(s.sam.clone(), rx));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(s.sam.is_online(&s.maya));
+    assert!(!s.sam.is_online(&gone));
+    assert_eq!(s.recorder.count(CallKind::Presence), 1);
+    assert!(s.net.is_up(&key(1).public(), &s.maya));
+    task.abort();
 }

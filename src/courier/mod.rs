@@ -753,6 +753,26 @@ impl<L: Links> Courier<L> {
         }
     }
 
+    /// Sets which devices are online from `linked`, the links the link layer has now, after link events were
+    /// missed.
+    pub fn resync_links(&self, linked: &[EndpointId]) {
+        let now = self.now();
+        let mut c = self.core();
+        for device in c.remote.online() {
+            if !linked.contains(&device) {
+                c.remote.link_down(device, now);
+            }
+        }
+        for device in linked {
+            c.remote.link_up(*device);
+        }
+    }
+
+    /// Whether `device` is online.
+    pub fn is_online(&self, device: &EndpointId) -> bool {
+        self.core().remote.is_online(device)
+    }
+
     fn snapshot_for(&self, c: &Core, device: &EndpointId, seq: u64) -> Option<PresenceSnapshot> {
         let admitted = c.roster.admission().get(device)?;
         // A responder that serves only its owner is hidden from teammates as well as refusing them (9).

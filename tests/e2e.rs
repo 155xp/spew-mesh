@@ -339,11 +339,13 @@ async fn a_card_ask_reaches_the_session_holding_the_card_on_another_device() {
         json!({"text": "Fixing the login redirect", "project": "team"}),
         "ok",
     );
-    // sam's device sees the card and the activity, which belong to the room they share (5.6).
-    let row = wait_for_row(&mut gemini, MAYA, |r| {
-        r["cards"] == json!(["team#7"]) && r["state"] == "busy"
+    // sam's device sees the card and the activity, which belong to the room they share (5.6). Each change is
+    // its own presence update, so the wait covers all of them.
+    wait_for_row(&mut gemini, MAYA, |r| {
+        r["cards"] == json!(["team#7"])
+            && r["activity"] == "Fixing the login redirect"
+            && r["state"] == "busy"
     });
-    assert_eq!(row["activity"], "Fixing the login redirect", "{row}");
 
     // A card nobody holds fails with the words the spec gives (2.2).
     let nobody = gemini.call("ask", json!({"to": "team#8", "text": "who has this?"}));

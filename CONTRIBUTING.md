@@ -44,7 +44,8 @@ Tests never touch the network, your home folder, or your real agent configs:
   `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_CONFIG_HOME` at temporary folders when it needs them.
 - Tests never run the real `claude`, `codex` or `opencode`. They use small fake scripts written to a temporary
   folder that record their arguments and print canned output.
-- Daemons in integration tests use a roster file and `[network] mode = "local"` on `127.0.0.1`. The spew API is a
+- Daemons in integration tests run in one process on an in-memory network (`src/daemon/testnet.rs`) with a
+  shared roster file, or as child processes with `[network] mode = "local"` on `127.0.0.1`. The spew API is a
   mock server inside the test.
 
 ## Code

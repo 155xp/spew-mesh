@@ -26,7 +26,7 @@ every archive:
 ```sh
 grep spew-0.1.0-aarch64-apple-darwin.tar.gz SHA256SUMS | shasum -a 256 --check   # Linux: sha256sum --check
 tar -xzf spew-0.1.0-aarch64-apple-darwin.tar.gz
-mv spew-0.1.0-aarch64-apple-darwin/spew ~/.local/bin/
+mkdir -p ~/.local/bin && mv spew-0.1.0-aarch64-apple-darwin/spew ~/.local/bin/   # ~/.local/bin must be on your PATH
 ```
 
 The Linux binaries are static and run on any distribution. The macOS binaries are not signed. If macOS blocks
@@ -47,6 +47,7 @@ Codex 0.163.0
   changed /Users/sam/.codex/hooks.json: added the SessionStart hook, added the UserPromptSubmit hook, ...
 OpenCode: not found; skipped.
 The spew mesh daemon is running on sam-mac (1995f53bd1).
+Signed in to spew as sam. Projects: spew. This device is registered as sam-mac.
 Restart any open Claude Code, Codex or OpenCode session to pick this up.
 In Codex, run /hooks and trust the spew mesh hooks.
 ```

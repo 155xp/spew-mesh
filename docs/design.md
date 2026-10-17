@@ -414,8 +414,8 @@ retries (the message stays queued); `invalid`, `no-such-session`, `session-ended
 - The daemon listens on a Unix domain socket. It uses `<home>/run/ipc.sock` when that full path is shorter than
   100 bytes. Otherwise it uses `spew-mesh-<10 random base32 characters>.sock` in the first of
   `$XDG_RUNTIME_DIR`, `$TMPDIR` or `/tmp` that exists.
-- Start order: take the lock (below); remove a stale socket file; bind with umask 077, so the socket is 0600 from
-  the start; write the chosen path to `<home>/run/socket` (mode 0600); then accept. A daemon that can't take
+- Start order: take the lock (below); remove a stale socket file; bind with umask 177, so the socket is 0600 from
+  the start (a socket takes 0777 minus the umask); write the chosen path to `<home>/run/socket` (mode 0600); then accept. A daemon that can't take
   the lock exits without touching `run/socket` or any socket file.
 - Clients read `<home>/run/socket` and connect. Both ends check the other's uid with the socket's peer
   credentials: the daemon drops connections from other users, and a client refuses a socket owned by another
@@ -555,7 +555,7 @@ A stored message stays unread until the agent has been shown it and that was ack
   other mesh tool result ends with one line: "spew mesh: N messages waiting; the messages tool shows them."
 - In every session, the `messages` tool returns unread messages first, then the asks it was shown before and
   hasn't answered, each block marked `again` in its header (7.8), so an agent whose context was compacted can
-  still answer them.
+  still answer them. An ask stops coming back once its ttl has run out.
 - **serve** responders: handed over by `responder.take`, acknowledged when taken.
 
 When a message is acknowledged, the receiving device sends a `receipt` with state `shown`; when the session

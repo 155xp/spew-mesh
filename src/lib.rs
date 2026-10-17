@@ -10,6 +10,8 @@ pub mod daemon;
 pub mod identity;
 pub mod link;
 pub mod paths;
+pub mod presence;
+pub mod resolve;
 pub mod responder;
 pub mod roster;
 pub mod sessions;

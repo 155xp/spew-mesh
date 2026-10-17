@@ -32,6 +32,11 @@ fn peers_json(version: &str, ttl: u64) -> Value {
     json!({
         "version": version,
         "ttl_secs": ttl,
+        "me": { "username": "sam", "display": "Sam", "devices": [
+            { "endpoint_id": key(1).to_string(), "name": "sam-mbp", "relay": null },
+            { "endpoint_id": key(2).to_string(), "name": "sam-linux",
+              "relay": "https://relay.example.com" }
+        ] },
         "rooms": [{
             "id": "spew", "name": "spew", "kind": "project",
             "members": [
@@ -180,16 +185,16 @@ fn a_bad_roster_is_refused_and_the_last_good_one_stays() {
     let before = cache.clone();
 
     let mut bad = Vec::new();
-    let mut team_room = peers_json("v2", 60);
-    team_room["rooms"][0]["kind"] = json!("team");
-    bad.push(team_room);
+    // Maya's device claims this device's key.
     let mut stolen = peers_json("v2", 60);
     stolen["rooms"][0]["members"][1]["devices"][0]["endpoint_id"] = json!(key(1).to_string());
     bad.push(stolen);
-    let mut slash = peers_json("v2", 60);
-    slash["rooms"][0]["members"][1]["username"] = json!("maya/x");
-    bad.push(slash);
+    // A roster for another person.
+    let mut not_me = peers_json("v2", 60);
+    not_me["me"]["username"] = json!("maya");
+    bad.push(not_me);
     bad.push(peers_json("v2", 86_401));
+    bad.push(peers_json("v2", 0));
     for body in bad {
         let p: Peers = serde_json::from_value(body).unwrap();
         assert!(
@@ -199,14 +204,6 @@ fn a_bad_roster_is_refused_and_the_last_good_one_stays() {
         );
         assert_eq!(cache, before);
     }
-    assert!(
-        serde_json::from_value::<Peers>({
-            let mut v = peers_json("v2", 60);
-            v["rooms"][0]["members"][1]["devices"][0]["endpoint_id"] = json!("not-a-key");
-            v
-        })
-        .is_err()
-    );
     // A 304 with nothing cached is refused too.
     let mut empty = SpewRosterCache::new(sam());
     assert!(
@@ -214,6 +211,94 @@ fn a_bad_roster_is_refused_and_the_last_good_one_stays() {
             .apply(PeersFetch::NotModified, &key(1), "sam-mbp", T0)
             .is_err()
     );
+}
+
+#[test]
+fn entries_outside_the_name_rules_are_dropped_and_the_rest_applies() {
+    let mut body = peers_json("v2", 60);
+    let members = body["rooms"][0]["members"].as_array_mut().unwrap();
+    members.push(json!({ "username": "Lee", "devices": [
+        { "endpoint_id": key(4).to_string(), "name": "lee-mac" } ] }));
+    members.push(json!({ "username": "kim", "display": "Kim", "devices": [
+        { "endpoint_id": key(5).to_string(), "name": "Kim-PC" },
+        { "endpoint_id": "not-a-key", "name": "kim-old" },
+        { "endpoint_id": key(6).to_string(), "name": "kim-linux", "relay": "ftp://relay.example.com" } ] }));
+    members.push(json!({ "username": "me", "devices": [] }));
+    body["rooms"].as_array_mut().unwrap().extend([
+        json!({ "id": "team", "name": "team", "kind": "team", "members": [] }),
+        json!({ "id": "Big Room", "kind": "project", "members": [] }),
+    ]);
+    let mut cache = SpewRosterCache::new(sam());
+    cache
+        .apply(
+            modified(serde_json::from_value(body).unwrap()),
+            &key(1),
+            "sam-mbp",
+            T0,
+        )
+        .unwrap();
+    let view = cache.view(&key(1), "sam-mbp", T0, DAY);
+    assert_eq!(view.state, SpewRosterState::Fresh);
+    assert_eq!(view.dropped.len(), 7, "{:#?}", view.dropped);
+    assert!(
+        view.describe()
+            .contains("7 roster entries from spew dropped")
+    );
+    let a = Admission::compute(cache.me(), &key(1), &view.roster);
+    assert!(
+        a.is_admitted(&key(2)) && a.is_admitted(&key(3)),
+        "the rest applies"
+    );
+    assert!(!a.is_admitted(&key(4)), "person with a bad name dropped");
+    assert!(!a.is_admitted(&key(5)), "device with a bad name dropped");
+    let kim = a.get(&key(6)).unwrap();
+    assert_eq!(kim.person, "kim");
+    assert_eq!(kim.relay, None, "bad relay hint ignored, device kept");
+    let ids: Vec<&str> = view.roster.rooms.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec![PRIVATE_ROOM_ID, "spew"]);
+}
+
+#[test]
+fn own_devices_come_from_me_with_no_shared_project() {
+    let body = json!({
+        "version": "v1",
+        "ttl_secs": 60,
+        "me": { "username": "sam", "display": "Sam", "devices": [
+            { "endpoint_id": key(1).to_string(), "name": "sam-mbp" },
+            { "endpoint_id": key(2).to_string(), "name": "sam-linux" } ] },
+        "rooms": []
+    });
+    let mut cache = SpewRosterCache::new(sam());
+    cache
+        .apply(
+            modified(serde_json::from_value(body).unwrap()),
+            &key(1),
+            "sam-mbp",
+            T0,
+        )
+        .unwrap();
+    let (state, a) = admission_at(&cache, T0, DAY);
+    assert_eq!(state, SpewRosterState::Fresh);
+    assert!(a.get(&key(2)).is_some_and(|d| d.own));
+    // Teammates drop with staleness; own devices from `me` stay.
+    let (state, a) = admission_at(&cache, T0 + 900_000, DAY);
+    assert_eq!(state, SpewRosterState::Stale);
+    assert!(a.is_admitted(&key(2)));
+
+    // A spew that sends no `me` still gives my devices from the project rooms.
+    let mut old = peers_json("v1", 60);
+    old.as_object_mut().unwrap().remove("me");
+    let mut cache = SpewRosterCache::new(sam());
+    cache
+        .apply(
+            modified(serde_json::from_value(old).unwrap()),
+            &key(1),
+            "sam-mbp",
+            T0,
+        )
+        .unwrap();
+    let (_, a) = admission_at(&cache, T0 + 900_000, DAY);
+    assert!(a.is_admitted(&key(2)) && !a.is_admitted(&key(3)));
 }
 
 #[test]
@@ -364,13 +449,9 @@ async fn refresh_against_spew_handles_304_and_401() {
     let a = Admission::compute(cache.me(), &key(1), &view.roster);
     assert!(!a.is_admitted(&key(3)) && a.is_admitted(&key(2)));
 
-    // spew unreachable: the last good roster stays.
+    // An unusable roster (ttl_secs 0): the last good one stays.
     mock.with(|s| s.reject_all_bearer = false);
-    mock.set_peers(
-        json!({ "version": "v2", "ttl_secs": 60, "rooms": [{ "id": "spew", "kind": "team",
-        "name": "spew", "members": [] }] }),
-        "\"v2\"",
-    );
+    mock.set_peers(peers_json("v2", 0), "\"v2\"");
     assert!(matches!(
         refresh(&mut cache, &api, &key(1), "sam-mbp").await,
         RefreshOutcome::Failed(_)

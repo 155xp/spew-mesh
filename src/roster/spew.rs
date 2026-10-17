@@ -4,14 +4,17 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DeviceEntry, EndpointId, MAX_VERSION, Me, Room, RoomKind, Roster, RosterError, is_display_text,
-    private_room, this_device_entry,
+    DeviceEntry, EndpointId, MAX_DISPLAY, MAX_ROOM_NAME, MAX_VERSION, Me, Member, RelayUrl, Room,
+    RoomKind, Roster, RosterError, is_display_text, is_valid_device_name, is_valid_person_name,
+    is_valid_room_id, parse_endpoint_id, private_room, this_device_entry,
 };
 use crate::spew_api::{ApiError, SpewApi};
 
-/// The largest `ttl_secs` accepted from spew. Teammates stay admitted for 15 × `ttl_secs` while spew can't be
-/// reached, so an absurd value would keep a removed member in for days.
+/// The largest `ttl_secs` accepted from spew (4.2). Teammates stay admitted for 15 × `ttl_secs` while spew
+/// can't be reached, so an absurd value would keep a removed member in for days.
 pub const MAX_TTL_SECS: u64 = 86_400;
+// Enough dropped entries to diagnose a broken roster without growing without bound.
+const MAX_DROPPED_REPORTS: usize = 20;
 /// The floor of the teammate window, in seconds.
 pub const MIN_TEAMMATE_WINDOW_SECS: u64 = 900;
 /// Refreshes caused by an unknown endpoint id trying to connect happen at most this often (4.2).
@@ -21,7 +24,8 @@ fn default_ttl() -> u64 {
     60
 }
 
-/// The body of `GET /api/mesh/v1/peers` (14.4).
+/// The body of `GET /api/mesh/v1/peers` (14.4) as spew sent it. Names and keys are checked when the roster is
+/// built, so an entry outside the rules (2) is dropped and reported instead of refusing the whole roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peers {
     /// Opaque version; changes when membership or devices change.
@@ -29,8 +33,52 @@ pub struct Peers {
     /// How long, in seconds, the response may be used before asking again.
     #[serde(default = "default_ttl")]
     pub ttl_secs: u64,
+    /// The caller and all of their registered devices, whatever projects were chosen; the private room.
+    #[serde(default)]
+    pub me: Option<PeerMember>,
     /// One room per project chosen at consent.
-    pub rooms: Vec<Room>,
+    #[serde(default)]
+    pub rooms: Vec<PeerRoom>,
+}
+
+/// A room in the peers response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRoom {
+    /// Project key.
+    pub id: String,
+    /// Project name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Always `project` from spew; anything else is dropped.
+    pub kind: String,
+    /// Members of the project.
+    #[serde(default)]
+    pub members: Vec<PeerMember>,
+}
+
+/// A person in the peers response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerMember {
+    /// spew username.
+    pub username: String,
+    /// Display name.
+    #[serde(default)]
+    pub display: Option<String>,
+    /// Registered, unrevoked devices.
+    #[serde(default)]
+    pub devices: Vec<PeerDevice>,
+}
+
+/// A device in the peers response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDevice {
+    /// Endpoint id, 64 hex characters.
+    pub endpoint_id: String,
+    /// Device name.
+    pub name: String,
+    /// Home relay.
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 /// The outcome of one peers request that spew answered.
@@ -77,11 +125,21 @@ pub struct SpewView {
     pub age_secs: Option<u64>,
     /// The roster, already reduced to what the state allows.
     pub roster: Roster,
+    /// Entries of the cached roster that were dropped for breaking the name rules, for `doctor`.
+    pub dropped: Vec<String>,
 }
 
 impl SpewView {
     /// One line for `doctor` and `daemon.status`.
     pub fn describe(&self) -> String {
+        let line = self.describe_state();
+        match self.dropped.len() {
+            0 => line,
+            n => format!("{line}; {n} roster entries from spew dropped"),
+        }
+    }
+
+    fn describe_state(&self) -> String {
         let age = self.age_secs.unwrap_or(0);
         match self.state {
             SpewRosterState::NoRoster => {
@@ -178,7 +236,16 @@ impl SpewRosterCache {
     ) -> Result<(), RosterError> {
         match fetch {
             PeersFetch::Modified { etag, peers } => {
-                build(&self.me, &peers, this_device, device_name, true, true)?;
+                let cleaned = clean(&self.me, &peers)?;
+                build(
+                    &self.me,
+                    &peers,
+                    &cleaned,
+                    this_device,
+                    device_name,
+                    true,
+                    true,
+                )?;
                 self.peers = Some(peers);
                 // An odd ETag only costs a full fetch next time; it says nothing about who is admitted.
                 self.etag = etag.filter(|t| is_display_text(t, MAX_VERSION));
@@ -241,12 +308,19 @@ impl SpewRosterCache {
         } else {
             (SpewRosterState::Expired, false, false)
         };
-        if !own_devices {
+        let Ok(cleaned) = clean(&self.me, peers) else {
+            // apply() checked it; only a cache from an older build can get here.
             return self.only_this_device(state, age_secs, this_device, device_name);
+        };
+        if !own_devices {
+            let mut view = self.only_this_device(state, age_secs, this_device, device_name);
+            view.dropped = cleaned.dropped;
+            return view;
         }
         match build(
             &self.me,
             peers,
+            &cleaned,
             this_device,
             device_name,
             teammates,
@@ -260,6 +334,7 @@ impl SpewRosterCache {
                     own_devices,
                     age_secs,
                     roster,
+                    dropped: cleaned.dropped,
                 }
             }
             // Only reachable when this device's key changed since the roster was fetched.
@@ -290,64 +365,225 @@ impl SpewRosterCache {
                     vec![this_device_entry(this_device, device_name)],
                 )],
             },
+            dropped: Vec::new(),
         }
     }
 }
 
-/// Builds a validated roster from a peers response: my private room (my devices from every project room, plus
-/// this device), then the project rooms when teammates are admitted.
+/// A peers response with every entry checked: what's left, and what was dropped.
+struct Cleaned {
+    /// My devices from `me`, or `None` when spew sent no `me`.
+    me_devices: Option<Vec<DeviceEntry>>,
+    rooms: Vec<Room>,
+    dropped: Vec<String>,
+}
+
+/// A name from spew as it may appear in a report: quoted, escaped, cut short.
+fn shown(s: &str) -> String {
+    let cut: String = s.chars().take(40).collect();
+    format!("{cut:?}")
+}
+
+fn report(dropped: &mut Vec<String>, line: String) {
+    if dropped.len() < MAX_DROPPED_REPORTS {
+        dropped.push(line);
+    } else if dropped.len() == MAX_DROPPED_REPORTS {
+        dropped.push("more entries dropped".into());
+    }
+}
+
+/// Checks a peers response (2, 4.2, 14.4). A `ttl_secs` outside 1 to 86400, or a `me` for another person,
+/// refuses the whole roster; a room, member or device outside the name rules is dropped and reported, and the
+/// rest still applies.
+fn clean(me: &Me, peers: &Peers) -> Result<Cleaned, RosterError> {
+    if !(1..=MAX_TTL_SECS).contains(&peers.ttl_secs) {
+        return Err(RosterError(format!(
+            "ttl_secs {} from spew is outside 1 to {MAX_TTL_SECS}",
+            peers.ttl_secs
+        )));
+    }
+    let mut dropped = Vec::new();
+    let me_devices = match &peers.me {
+        Some(m) if m.username != me.username => {
+            return Err(RosterError(format!(
+                "spew's roster is for {}, not {:?}",
+                shown(&m.username),
+                me.username
+            )));
+        }
+        Some(m) => Some(clean_devices(&m.devices, &me.username, &mut dropped)),
+        None => None,
+    };
+    let mut rooms = Vec::new();
+    for room in &peers.rooms {
+        if room.kind != "project" {
+            report(
+                &mut dropped,
+                format!(
+                    "room {}: kind {} isn't \"project\"",
+                    shown(&room.id),
+                    shown(&room.kind)
+                ),
+            );
+            continue;
+        }
+        if !is_valid_room_id(&room.id) {
+            report(
+                &mut dropped,
+                format!("room {}: id breaks the name rules", shown(&room.id)),
+            );
+            continue;
+        }
+        let mut members = Vec::new();
+        for member in &room.members {
+            if !is_valid_person_name(&member.username) {
+                report(
+                    &mut dropped,
+                    format!(
+                        "person {} in room {}: name breaks the name rules",
+                        shown(&member.username),
+                        room.id
+                    ),
+                );
+                continue;
+            }
+            members.push(Member {
+                username: member.username.clone(),
+                display: member
+                    .display
+                    .clone()
+                    .filter(|d| is_display_text(d, MAX_DISPLAY))
+                    .unwrap_or_else(|| member.username.clone()),
+                devices: clean_devices(&member.devices, &member.username, &mut dropped),
+            });
+        }
+        rooms.push(Room {
+            id: room.id.clone(),
+            name: room
+                .name
+                .clone()
+                .filter(|n| is_display_text(n, MAX_ROOM_NAME))
+                .unwrap_or_else(|| room.id.clone()),
+            kind: RoomKind::Project,
+            members,
+        });
+    }
+    Ok(Cleaned {
+        me_devices,
+        rooms,
+        dropped,
+    })
+}
+
+fn clean_devices(
+    devices: &[PeerDevice],
+    owner: &str,
+    dropped: &mut Vec<String>,
+) -> Vec<DeviceEntry> {
+    let mut out = Vec::new();
+    for device in devices {
+        let Ok(endpoint_id) = parse_endpoint_id(&device.endpoint_id) else {
+            report(
+                dropped,
+                format!(
+                    "device {} of {owner}: endpoint id isn't 64 hex characters",
+                    shown(&device.name)
+                ),
+            );
+            continue;
+        };
+        if !is_valid_device_name(&device.name) {
+            report(
+                dropped,
+                format!(
+                    "device {} of {owner}: name breaks the name rules",
+                    shown(&device.name)
+                ),
+            );
+            continue;
+        }
+        // The relay is only a dialing hint: a bad one is ignored, the device stays.
+        let relay = device.relay.as_deref().and_then(|r| {
+            let url = r
+                .parse::<RelayUrl>()
+                .ok()
+                .filter(|u| matches!(u.scheme(), "https" | "http"));
+            if url.is_none() {
+                report(
+                    dropped,
+                    format!(
+                        "relay of device {} of {owner}: not an http(s) URL, ignored",
+                        device.name
+                    ),
+                );
+            }
+            url
+        });
+        out.push(DeviceEntry {
+            endpoint_id,
+            name: device.name.clone(),
+            relay,
+            addrs: Vec::new(),
+        });
+    }
+    out
+}
+
+/// Builds a validated roster from a checked peers response: my private room (this device and my devices from
+/// `me`), then the project rooms when teammates are admitted.
 fn build(
     me: &Me,
     peers: &Peers,
+    cleaned: &Cleaned,
     this_device: &EndpointId,
     device_name: &str,
     teammates: bool,
     own_devices: bool,
 ) -> Result<Roster, RosterError> {
-    if peers.ttl_secs > MAX_TTL_SECS {
-        return Err(RosterError(format!(
-            "ttl_secs {} from spew is over {MAX_TTL_SECS}",
-            peers.ttl_secs
-        )));
-    }
-    for room in &peers.rooms {
-        if room.kind != RoomKind::Project {
-            return Err(RosterError(format!(
-                "room {:?} from spew isn't a project room",
-                room.id
-            )));
-        }
-    }
+    let room_devices = || {
+        cleaned
+            .rooms
+            .iter()
+            .flat_map(|r| r.members.iter())
+            .flat_map(|m| m.devices.iter())
+    };
     // When spew lists this device, use the name it was registered with so the key has one name throughout.
-    let listed_name = peers
-        .rooms
+    let listed_name = cleaned
+        .me_devices
         .iter()
-        .flat_map(|r| r.members.iter())
-        .flat_map(|m| m.devices.iter())
+        .flatten()
+        .chain(room_devices())
         .find(|d| d.endpoint_id == *this_device)
         .map_or(device_name, |d| d.name.as_str());
     let mut mine: Vec<DeviceEntry> = vec![this_device_entry(this_device, listed_name)];
     if own_devices {
-        for room in &peers.rooms {
-            for member in room.members.iter().filter(|m| m.username == me.username) {
-                for device in &member.devices {
-                    if !mine.iter().any(|d| d.endpoint_id == device.endpoint_id) {
-                        mine.push(device.clone());
-                    }
-                }
+        let own: Vec<&DeviceEntry> = match &cleaned.me_devices {
+            Some(devices) => devices.iter().collect(),
+            // A spew that sends no `me` (it came later in 14.4): gather my devices from the project rooms.
+            None => cleaned
+                .rooms
+                .iter()
+                .flat_map(|r| r.members.iter())
+                .filter(|m| m.username == me.username)
+                .flat_map(|m| m.devices.iter())
+                .collect(),
+        };
+        for device in own {
+            if !mine.iter().any(|d| d.endpoint_id == device.endpoint_id) {
+                mine.push(device.clone());
             }
         }
     }
     let mut rooms = vec![private_room(me, mine)];
     if teammates {
-        rooms.extend(peers.rooms.iter().cloned());
+        rooms.extend(cleaned.rooms.iter().cloned());
     }
     let mut roster = Roster {
         version: peers.version.clone(),
         fetched_at: 0,
         rooms,
     };
-    // Also refuses a roster that lists this device under another person.
+    // Also refuses a roster that lists this device under another person, or one key under two people.
     roster.validate(me)?;
     Ok(roster)
 }

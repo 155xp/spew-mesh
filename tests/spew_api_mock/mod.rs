@@ -616,6 +616,7 @@ fn device_json(d: &Device, grant: u32) -> Value {
         "name": d.name,
         "public_key": d.public_key,
         "platform": d.platform,
+        "relay": d.relay,
         "created_at": 1_700_000_000_000u64,
         "last_seen_at": null,
         "self": d.grant == Some(grant),
@@ -692,7 +693,7 @@ fn mesh_api(s: &mut State, r: &Request, grant: u32) -> Resp {
             }
             let held = s.grants.get(&grant).and_then(|g| g.device.clone());
             if held.as_ref().is_some_and(|k| *k != public_key) {
-                return resp(409, json!({ "error": "grant-has-device" }));
+                return api_error(409, "grant-has-device", "this grant already holds a device");
             }
             if let Some(d) = s.devices.iter_mut().find(|d| d.public_key == public_key) {
                 d.grant = Some(grant);
@@ -715,7 +716,7 @@ fn mesh_api(s: &mut State, r: &Request, grant: u32) -> Resp {
         }
         ("GET", "/api/mesh/v1/devices") => {
             let list: Vec<Value> = s.devices.iter().map(|d| device_json(d, grant)).collect();
-            resp(200, Value::Array(list))
+            resp(200, json!({ "devices": list }))
         }
         ("PATCH", "/api/mesh/v1/devices/self") => {
             let Some(d) = s.devices.iter_mut().find(|d| d.grant == Some(grant)) else {

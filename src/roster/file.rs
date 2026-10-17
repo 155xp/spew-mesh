@@ -11,9 +11,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    DeviceEntry, EndpointId, MAX_DEVICE_NAME, MAX_DISPLAY, MAX_ROOM_ID, MAX_USERNAME, Me, Member,
-    RelayUrl, Room, RoomKind, Roster, RosterError, is_display_text, is_valid_name,
-    parse_endpoint_id, private_room,
+    DEVICE_NAME_RULE, DeviceEntry, EndpointId, MAX_DISPLAY, Me, Member, NAME_RULE, RelayUrl, Room,
+    RoomKind, Roster, RosterError, is_display_text, is_valid_device_name, is_valid_person_name,
+    is_valid_room_id, parse_endpoint_id, private_room,
 };
 
 /// How often the daemon checks the file's modification time (4.2).
@@ -119,15 +119,11 @@ pub fn parse(text: &str) -> Result<RosterFile, RosterError> {
     let mut people = BTreeMap::new();
     let mut seen_ids: BTreeMap<EndpointId, String> = BTreeMap::new();
     for person in raw.person {
-        if !is_valid_name(&person.name, MAX_USERNAME) {
+        if !is_valid_person_name(&person.name) {
             return Err(RosterError(format!(
-                "person name {:?} must be 1 to {MAX_USERNAME} ASCII letters, digits, '.', '_' or '-'",
+                "person name {:?} must be {NAME_RULE}",
                 person.name
             )));
-        }
-        // `me` is an address keyword (2.2); a person with that name couldn't be addressed.
-        if person.name == "me" {
-            return Err(RosterError("\"me\" can't be a person name".into()));
         }
         if people.contains_key(&person.name) {
             return Err(RosterError(format!(
@@ -175,9 +171,9 @@ pub fn parse(text: &str) -> Result<RosterFile, RosterError> {
     }
     let mut rooms: Vec<(String, Vec<String>)> = Vec::new();
     for room in raw.room {
-        if !is_valid_name(&room.name, MAX_ROOM_ID) {
+        if !is_valid_room_id(&room.name) {
             return Err(RosterError(format!(
-                "room name {:?} must be 1 to {MAX_ROOM_ID} ASCII letters, digits, '.', '_' or '-'",
+                "room name {:?} must be {NAME_RULE}",
                 room.name
             )));
         }
@@ -219,9 +215,9 @@ pub fn parse(text: &str) -> Result<RosterFile, RosterError> {
 fn parse_device(person: &str, device: RawDevice) -> Result<DeviceEntry, RosterError> {
     let endpoint_id = parse_endpoint_id(&device.id)
         .map_err(|e| RosterError(format!("a device of {person:?}: {e}")))?;
-    if !is_valid_name(&device.name, MAX_DEVICE_NAME) {
+    if !is_valid_device_name(&device.name) {
         return Err(RosterError(format!(
-            "device name {:?} of {person:?} must be 1 to {MAX_DEVICE_NAME} ASCII letters, digits, '.', '_' or '-'",
+            "device name {:?} of {person:?} must be {DEVICE_NAME_RULE}",
             device.name
         )));
     }
@@ -498,6 +494,21 @@ people = ["maya", "lee"]
                     .to_string(),
             ),
             ("person named me", "[[person]]\nname = \"me\"\n".to_string()),
+            (
+                "uppercase person",
+                "[[person]]\nname = \"Sam\"\n".to_string(),
+            ),
+            (
+                "room named me",
+                "[[person]]\nname = \"sam\"\n[[room]]\nname = \"me\"\npeople = [\"sam\"]\n"
+                    .to_string(),
+            ),
+            (
+                "uppercase device",
+                format!(
+                    "[[person]]\nname = \"sam\"\ndevices = [{{ id = \"{k1}\", name = \"Sam-MBP\" }}]\n"
+                ),
+            ),
             (
                 "person name",
                 "[[person]]\nname = \"sam@mbp\"\n".to_string(),

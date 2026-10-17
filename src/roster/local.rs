@@ -1,8 +1,8 @@
 //! The local roster, used before sign-in (C1): one private room holding only this device.
 
 use super::{
-    EndpointId, MAX_USERNAME, Me, Roster, RosterError, is_valid_name, private_room,
-    this_device_entry,
+    EndpointId, MAX_USERNAME, Me, NAME_RULE, Roster, RosterError, is_valid_person_name,
+    private_room, this_device_entry,
 };
 
 /// Version string of every local roster.
@@ -14,15 +14,15 @@ pub fn local_username(
     os_user: Option<&str>,
 ) -> Result<String, RosterError> {
     if let Some(name) = settings_username.filter(|n| !n.is_empty()) {
-        if !is_valid_name(name, MAX_USERNAME) {
+        if !is_valid_person_name(name) {
             return Err(RosterError(format!(
-                "settings username {name:?} must be 1 to {MAX_USERNAME} ASCII letters, digits, '.', '_' or '-'"
+                "settings username {name:?} must be {NAME_RULE}"
             )));
         }
         return Ok(name.to_string());
     }
     let slugged = os_user.map(slug).unwrap_or_default();
-    Ok(if slugged.is_empty() {
+    Ok(if !is_valid_person_name(&slugged) {
         "local".to_string()
     } else {
         slugged
@@ -82,7 +82,10 @@ mod tests {
         assert_eq!(local_username(Some(""), Some("maya")).unwrap(), "maya");
         assert_eq!(local_username(None, Some("!!!")).unwrap(), "local");
         assert_eq!(local_username(None, None).unwrap(), "local");
+        assert_eq!(local_username(None, Some("Me")).unwrap(), "local");
         assert!(local_username(Some("sam/x"), None).is_err());
+        assert!(local_username(Some("Sam"), None).is_err());
+        assert!(local_username(Some("me"), None).is_err());
     }
 
     #[test]

@@ -27,8 +27,8 @@ use url::{Host, Url};
 
 use crate::roster::spew::{Peers, PeersFetch};
 use crate::roster::{
-    EndpointId, MAX_DEVICE_NAME, MAX_DISPLAY, MAX_USERNAME, Me, RelayUrl, is_display_text,
-    is_valid_name,
+    DEVICE_NAME_RULE, EndpointId, MAX_DISPLAY, Me, RelayUrl, is_display_text, is_valid_device_name,
+    is_valid_person_name,
 };
 
 /// The only scope spew mesh asks for and accepts.
@@ -572,7 +572,7 @@ impl MeResponse {
     /// The person as a roster [`Me`], after checking the username.
     pub fn to_me(&self) -> Result<Me, ApiError> {
         let username = &self.user.username;
-        if !is_valid_name(username, MAX_USERNAME) {
+        if !is_valid_person_name(username) {
             return Err(ApiError::InvalidResponse(format!(
                 "username {:?} doesn't fit spew mesh names",
                 clean(username)
@@ -624,6 +624,9 @@ pub struct DeviceInfo {
     /// Platform it registered with.
     #[serde(default)]
     pub platform: Option<String>,
+    /// Its home relay as last reported, for display.
+    #[serde(default)]
+    pub relay: Option<String>,
     /// When it was registered, in ms.
     #[serde(default)]
     pub created_at: Option<u64>,
@@ -752,11 +755,12 @@ struct ChallengeResponse {
     nonce: String,
 }
 
+// 14.3 says `{"devices": [...]}`; a bare array is the earlier shape, still accepted.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum DeviceList {
-    Bare(Vec<DeviceInfo>),
     Wrapped { devices: Vec<DeviceInfo> },
+    Bare(Vec<DeviceInfo>),
 }
 
 #[derive(Deserialize)]
@@ -1332,9 +1336,9 @@ impl SpewApi {
         name: &str,
         platform: &str,
     ) -> Result<RegisteredDevice, ApiError> {
-        if !is_valid_name(name, MAX_DEVICE_NAME) {
+        if !is_valid_device_name(name) {
             return Err(ApiError::Device(format!(
-                "device name {:?} must be 1 to {MAX_DEVICE_NAME} ASCII letters, digits, '.', '_' or '-'",
+                "device name {:?} must be {DEVICE_NAME_RULE}",
                 clean(name)
             )));
         }
@@ -1405,7 +1409,7 @@ impl SpewApi {
     ) -> Result<(), ApiError> {
         let mut body = serde_json::json!({ "relay": relay.map(|r| r.to_string()) });
         if let Some(name) = name {
-            if !is_valid_name(name, MAX_DEVICE_NAME) {
+            if !is_valid_device_name(name) {
                 return Err(ApiError::Device(format!(
                     "bad device name {:?}",
                     clean(name)
@@ -1820,24 +1824,30 @@ async fn read_json<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, Ap
     serde_json::from_slice(&bytes).map_err(|e| ApiError::InvalidResponse(e.to_string()))
 }
 
+/// The code and message of an error body: spew's `{"error": {"code", "message"}}`, or OAuth's
+/// `{"error": "<code>", "error_description"}` (also the earlier short form of 14.3's 409).
+fn parse_error_body(bytes: &[u8]) -> Option<(String, String)> {
+    match serde_json::from_slice::<ErrorBody>(bytes).ok()? {
+        ErrorBody {
+            error: ErrorField::Detail { code, message },
+            ..
+        } => Some((code, message)),
+        ErrorBody {
+            error: ErrorField::Code(code),
+            error_description,
+        } => Some((code, error_description.unwrap_or_default())),
+    }
+}
+
 /// Turns an error response into [`ApiError::Server`], reading spew's or OAuth's error body when there is one.
 async fn error_from(resp: reqwest::Response) -> ApiError {
     let status = resp.status();
     let fallback = status.canonical_reason().unwrap_or("error").to_string();
-    let (code, message) = match read_body(resp).await {
-        Ok(bytes) => match serde_json::from_slice::<ErrorBody>(&bytes) {
-            Ok(ErrorBody {
-                error: ErrorField::Detail { code, message },
-                ..
-            }) => (code, message),
-            Ok(ErrorBody {
-                error: ErrorField::Code(code),
-                error_description,
-            }) => (code, error_description.unwrap_or_default()),
-            Err(_) => (fallback, String::new()),
-        },
-        Err(_) => (fallback, String::new()),
-    };
+    let (code, message) = read_body(resp)
+        .await
+        .ok()
+        .and_then(|bytes| parse_error_body(&bytes))
+        .unwrap_or((fallback, String::new()));
     ApiError::Server {
         status: status.as_u16(),
         code: clean(&code),
@@ -1953,6 +1963,7 @@ mod tests {
             name: name.into(),
             public_key: key(s),
             platform: None,
+            relay: None,
             created_at: None,
             last_seen_at: None,
             is_self,
@@ -1979,14 +1990,34 @@ mod tests {
     }
 
     #[test]
+    fn error_bodies() {
+        assert_eq!(
+            parse_error_body(br#"{"error": {"code": "grant-has-device", "message": "m"}}"#),
+            Some(("grant-has-device".into(), "m".into()))
+        );
+        assert_eq!(
+            parse_error_body(br#"{"error": "grant-has-device"}"#),
+            Some(("grant-has-device".into(), String::new()))
+        );
+        assert_eq!(
+            parse_error_body(br#"{"error": "invalid_grant", "error_description": "reused"}"#),
+            Some(("invalid_grant".into(), "reused".into()))
+        );
+        assert_eq!(parse_error_body(b"<html>"), None);
+    }
+
+    #[test]
     fn device_lists_bare_or_wrapped() {
         let key = iroh::SecretKey::from_bytes(&[5; 32]).public();
-        let one = format!(r#"{{"name": "sam-mbp", "public_key": "{key}", "self": true}}"#);
+        let one = format!(
+            r#"{{"name": "sam-mbp", "public_key": "{key}", "relay": "https://relay.example.com", "self": true}}"#
+        );
         for text in [format!("[{one}]"), format!(r#"{{"devices": [{one}]}}"#)] {
             let (DeviceList::Bare(d) | DeviceList::Wrapped { devices: d }) =
                 serde_json::from_str(&text).unwrap();
             assert_eq!(d.len(), 1);
             assert!(d[0].is_self);
+            assert_eq!(d[0].relay.as_deref(), Some("https://relay.example.com"));
         }
     }
 

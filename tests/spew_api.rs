@@ -429,6 +429,9 @@ async fn devices_list_update_and_revoke() {
         let d = s.devices.iter().find(|d| d.name == "sam-mbp").unwrap();
         assert_eq!(d.relay.as_deref(), Some(relay.to_string().as_str()));
     });
+    let listed = api.list_devices().await.unwrap();
+    let me = listed.iter().find(|d| d.is_self).unwrap();
+    assert_eq!(me.relay.as_deref(), Some(relay.to_string().as_str()));
 
     assert!(matches!(
         api.revoke_device_named("sam-mbp").await,

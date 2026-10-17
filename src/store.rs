@@ -185,6 +185,13 @@ pub enum StoreError {
     NotWal(String),
 }
 
+impl StoreError {
+    /// Whether a constraint failed, such as a second live session with the same name.
+    pub fn is_constraint(&self) -> bool {
+        matches!(self, StoreError::Sql { error, .. } if is_constraint(error))
+    }
+}
+
 trait Context<T> {
     fn ctx(self, what: &'static str) -> Result<T, StoreError>;
 }
@@ -1827,7 +1834,11 @@ mod tests {
             first.id
         );
         // A live name is unique.
-        assert!(s.put_session(&session(2, "claude-api")).is_err());
+        assert!(
+            s.put_session(&session(2, "claude-api"))
+                .unwrap_err()
+                .is_constraint()
+        );
         s.put_card(&first.id, "spew#42", "spew", 5).unwrap();
         first.activity = Some("fixing tests".into());
         first.state = ActivityState::Busy;

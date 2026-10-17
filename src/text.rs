@@ -322,8 +322,14 @@ pub fn render_batch(blocks: &[Block], budget: Option<usize>) -> Rendered {
             rendered.shown.push(block.id.clone());
             continue;
         }
-        parts.pop();
         let later = blocks.len() - index - 1;
+        // The reserve is generous; the block may still fit beside the exact "N more" line.
+        if assemble(&parts, &origins, later).len() <= budget {
+            rendered.shown.push(block.id.clone());
+            rendered.more = later;
+            break;
+        }
+        parts.pop();
         let without = assemble(&parts, &origins, later).len();
         // The cut block is joined to the rest by one newline.
         let cut = budget
@@ -750,6 +756,17 @@ mod tests {
         assert_eq!(out.cut, Some(blocks[0].id.clone()));
         assert!(out.shown.is_empty());
         assert_eq!(out.more, 0);
+    }
+
+    #[test]
+    fn a_block_that_fits_beside_the_exact_summary_is_shown() {
+        let blocks: Vec<Block> = (1..=10).map(|n| numbered(n, "hello")).collect();
+        let exact = assemble(&[blocks[0].render()], &[&blocks[0].origin], 9).len();
+        let out = render_batch(&blocks, Some(exact));
+        assert_eq!(out.shown, vec![blocks[0].id.clone()]);
+        assert_eq!(out.cut, None);
+        assert_eq!(out.more, 9);
+        assert_eq!(out.text.len(), exact);
     }
 
     #[test]

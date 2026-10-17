@@ -1,7 +1,7 @@
 //! The device key and name (4.1).
 //!
 //! `identity/device.json` holds the ed25519 secret key the daemon gives iroh as its endpoint secret. It is created
-//! once, never replaced silently, and read and written under `identity/device.lock` so two processes starting at
+//! once, never replaced silently, and read and written under an exclusive lock on `identity/device.lock` so two processes starting at
 //! once can't create two keys.
 
 use std::fmt;
@@ -102,8 +102,9 @@ pub enum IdentityError {
     InvalidName(String),
 }
 
-/// Takes `identity/device.lock`: shared for reading, exclusive for creating or renaming.
-fn lock(home: &Home, exclusive: bool) -> Result<File, IdentityError> {
+// Takes `identity/device.lock`. Every access is exclusive: even a load may move a corrupt file aside or tighten
+// its mode, and loads are rare.
+fn lock(home: &Home) -> Result<File, IdentityError> {
     ensure_private_dir(&home.identity_dir())?;
     let path = home.device_lock();
     let file = private_open_options()
@@ -115,12 +116,8 @@ fn lock(home: &Home, exclusive: bool) -> Result<File, IdentityError> {
             path: path.clone(),
             error,
         })?;
-    let locked = if exclusive {
-        file.lock()
-    } else {
-        file.lock_shared()
-    };
-    locked.map_err(|error| IdentityError::Lock { path, error })?;
+    file.lock()
+        .map_err(|error| IdentityError::Lock { path, error })?;
     Ok(file)
 }
 
@@ -128,7 +125,7 @@ impl DeviceIdentity {
     /// Reads the device file; `Ok(None)` when there is none yet. A file that doesn't parse is moved aside to
     /// `device.json.corrupt-<ms>` and reported (4.1).
     pub fn load(home: &Home, now_ms: u64) -> Result<Option<DeviceIdentity>, IdentityError> {
-        let _guard = lock(home, false)?;
+        let _guard = lock(home)?;
         read_device_file(&home.device_file(), now_ms)
     }
 
@@ -142,7 +139,7 @@ impl DeviceIdentity {
         if !is_device_name(name) {
             return Err(IdentityError::InvalidName(name.to_string()));
         }
-        let _guard = lock(home, true)?;
+        let _guard = lock(home)?;
         let path = home.device_file();
         if let Some(identity) = read_device_file(&path, now_ms)? {
             return Ok((identity, false));
@@ -164,7 +161,7 @@ impl DeviceIdentity {
         if !is_device_name(name) {
             return Err(IdentityError::InvalidName(name.to_string()));
         }
-        let _guard = lock(home, true)?;
+        let _guard = lock(home)?;
         let renamed = DeviceIdentity {
             name: name.to_string(),
             ..self.clone()
@@ -321,8 +318,12 @@ pub fn platform_short(platform: &str) -> &str {
 }
 
 /// The default device name `<person>-<platform>`, then `-2`, `-3` while one of your devices has it (2). The host
-/// name is never used.
-pub fn default_device_name(person: &str, platform: &str, taken: impl Fn(&str) -> bool) -> String {
+/// name is never used. `None` only when a thousand names are taken.
+pub fn default_device_name(
+    person: &str,
+    platform: &str,
+    taken: impl Fn(&str) -> bool,
+) -> Option<String> {
     let base = slugify(
         &format!("{person}-{}", platform_short(platform)),
         MAX_DEVICE,
@@ -333,18 +334,14 @@ pub fn default_device_name(person: &str, platform: &str, taken: impl Fn(&str) ->
         base
     };
     if !taken(&base) {
-        return base;
+        return Some(base);
     }
-    let mut n: u32 = 2;
-    loop {
+    (2..1000u32).find_map(|n| {
         let suffix = format!("-{n}");
         let stem_len = base.len().min(MAX_DEVICE - suffix.len());
         let candidate = format!("{}{suffix}", base[..stem_len].trim_end_matches('-'));
-        if !taken(&candidate) {
-            return candidate;
-        }
-        n += 1;
-    }
+        (!taken(&candidate)).then_some(candidate)
+    })
 }
 
 #[cfg(test)]
@@ -517,26 +514,32 @@ mod tests {
 
     #[test]
     fn default_names() {
-        assert_eq!(default_device_name("maya", "macos", |_| false), "maya-mac");
         assert_eq!(
-            default_device_name("maya", "linux", |_| false),
+            default_device_name("maya", "macos", |_| false).unwrap(),
+            "maya-mac"
+        );
+        assert_eq!(
+            default_device_name("maya", "linux", |_| false).unwrap(),
             "maya-linux"
         );
         assert_eq!(
-            default_device_name("maya", "linux", |n| n == "maya-linux"),
+            default_device_name("maya", "linux", |n| n == "maya-linux").unwrap(),
             "maya-linux-2"
         );
         assert_eq!(
             default_device_name("maya", "linux", |n| n == "maya-linux"
-                || n == "maya-linux-2"),
+                || n == "maya-linux-2")
+            .unwrap(),
             "maya-linux-3"
         );
         assert_eq!(
-            default_device_name("sam_o.k", "freebsd", |_| false),
+            default_device_name("sam_o.k", "freebsd", |_| false).unwrap(),
             "sam-o-k-freebsd"
         );
         let long = "p".repeat(60);
-        let name = default_device_name(&long, "linux", |n| n.len() == 48 && !n.ends_with("-2"));
+        let name =
+            default_device_name(&long, "linux", |n| n.len() == 48 && !n.ends_with("-2")).unwrap();
+        assert_eq!(default_device_name("maya", "linux", |_| true), None);
         assert!(is_device_name(&name), "{name}");
         assert!(name.ends_with("-2"));
         assert_eq!(

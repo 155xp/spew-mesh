@@ -404,15 +404,17 @@ pub fn exec_args(a: &ExecArgs<'_>) -> Vec<OsString> {
     push("--skip-git-repo-check");
     push("-C");
     v.push(a.cwd.as_os_str().to_owned());
-    // `--ignore-user-config` turns the plugins feature back on even when the person turned it off, and with it
-    // Codex 0.163.0 clones its plugin marketplace from github.com at the start of every run. A serve run needs
-    // no plugins and should reach nothing but the model.
+    // `--ignore-user-config` drops the person's opt-outs too. Codex 0.163.0 then clones its plugin marketplace
+    // from github.com and sends usage metrics to ab.chatgpt.com on every run. A serve run needs neither and
+    // should reach nothing but the model.
     for s in [
         "--ignore-user-config",
         "--disable",
         "hooks",
         "--disable",
         "plugins",
+        "-c",
+        "analytics.enabled=false",
         "--thread-source",
         PROFILE,
         "-c",
@@ -1036,6 +1038,8 @@ query_params = { api-version = "2026-01-01" }
                 "hooks",
                 "--disable",
                 "plugins",
+                "-c",
+                "analytics.enabled=false",
                 "--thread-source",
                 "spew-mesh-serve",
                 "-c",
@@ -1068,7 +1072,7 @@ query_params = { api-version = "2026-01-01" }
         };
         let args = strings(&exec_args(&base));
         assert_eq!(
-            args[16..],
+            args[18..],
             [
                 "-m",
                 "gpt-6",

@@ -251,14 +251,51 @@ fn reporter(serving: String) -> Report {
 
 // The serve process logs to the daemon's log file, where `doctor` and bug reports look (9, 11).
 fn init_logging(home: &Home, env: &Env) -> Result<(), Problem> {
-    let file = open_private_append(&home.log_file())
+    let path = home.log_file();
+    open_private_append(&path)
         .map_err(|e| Problem::new(e, "check that the spew mesh home is yours and writable"))?;
     let filter = tracing_subscriber::EnvFilter::try_new(env.log.as_deref().unwrap_or("info"))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::sync::Mutex::new(file))
+        .with_writer(log_writer(path))
         .with_ansi(false)
         .try_init();
     Ok(())
+}
+
+// Opens the log for each line: a daemon that serve starts may rotate it (11), and a held file would follow the
+// old one. A line that can't be written is dropped.
+fn log_writer(path: PathBuf) -> impl Fn() -> Box<dyn Write + Send> + Send + Sync + 'static {
+    move || match open_private_append(&path) {
+        Ok(file) => Box::new(file),
+        Err(_) => Box::new(std::io::sink()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_log_line_goes_to_the_current_log_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mesh.log");
+        let make = log_writer(log.clone());
+        make().write_all(b"one\n").unwrap();
+        // What a starting daemon's rotation does.
+        std::fs::rename(&log, tmp.path().join("mesh.log.1")).unwrap();
+        make().write_all(b"two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "two\n");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("mesh.log.1")).unwrap(),
+            "one\n"
+        );
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A log that can't be opened drops the line.
+        let gone = log_writer(tmp.path().join("missing").join("mesh.log"));
+        gone().write_all(b"lost\n").unwrap();
+    }
 }

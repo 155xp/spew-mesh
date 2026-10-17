@@ -16,7 +16,7 @@ use crate::control::server::Conn;
 use crate::identity::parse_endpoint_id;
 use crate::link::Links;
 use crate::resolve::{Asker, resolve};
-use crate::responder::limits::{Gate, MAX_WAITING, Refusal};
+use crate::responder::limits::{Gate, GateSettings, MAX_WAITING, Refusal};
 use crate::sessions::directory::Entry;
 use crate::store::{
     Message, MessageState, NewOutbox, OutboxKind, Party, SessionRecord, StoredMessage,
@@ -157,6 +157,8 @@ impl<L: Links> Courier<L> {
         }
     }
 
+    // The responder's gate: the limits it sent in `session.open`, else this daemon's `[serve]` settings (a
+    // question can arrive after a daemon restart before the responder re-opens).
     pub(super) fn responder_gate<'c>(
         &self,
         c: &'c mut Core,
@@ -164,16 +166,18 @@ impl<L: Links> Courier<L> {
     ) -> &'c mut Gate {
         c.gates
             .entry(target.id.clone())
-            .or_insert_with(|| Gate::new(&self.cfg.serve))
+            .or_insert_with(|| Gate::new(&GateSettings::from(&self.cfg.serve)))
     }
 
-    // The checks a local delivery shares with 5.5 steps 6 and 7.
+    // The checks a local delivery shares with 5.5 steps 6 and 7. Returns the asker whose run to count once the
+    // message is stored, for a question to a responder.
     fn accept_local(
         &self,
         c: &mut Core,
         msg: &Message,
         target: &SessionRecord,
-    ) -> Result<(), RefusalCode> {
+    ) -> Result<Option<crate::responder::Asker>, RefusalCode> {
+        let mut counted = None;
         let now = self.now();
         if target.kind == SessionKind::Responder
             && matches!(msg.kind, MessageKind::Ask | MessageKind::Tell)
@@ -191,16 +195,17 @@ impl<L: Links> Courier<L> {
                 room,
             };
             self.responder_gate(c, target)
-                .admit(now, &asker, true, has_room)
+                .check(now, &asker, true, has_room)
                 .map_err(|r| match r {
                     Refusal::Busy => RefusalCode::Busy,
                     Refusal::NoSuchSession => RefusalCode::NoSuchSession,
                 })?;
+            counted = Some(asker);
         }
         if !c.guard.allows(&msg.conversation, now) {
             return Err(RefusalCode::ConversationLimit);
         }
-        Ok(())
+        Ok(counted)
     }
 
     // Stores and routes one message. Returns the stored row (when stored), how it went, and for another device
@@ -241,13 +246,17 @@ impl<L: Links> Courier<L> {
             let Some(record) = record else {
                 return Ok((msg, Sent::Refused(RefusalCode::SessionEnded), None));
             };
-            if let Err(code) = self.accept_local(c, &msg, &record) {
-                return Ok((msg, Sent::Refused(code), None));
-            }
+            let counted = match self.accept_local(c, &msg, &record) {
+                Ok(counted) => counted,
+                Err(code) => return Ok((msg, Sent::Refused(code), None)),
+            };
             let mut msg = msg;
             msg.to.session.clone_from(&record.id);
             c.store.insert_message(&msg, now).map_err(store_err)?;
             c.guard.record(&msg.conversation, now);
+            if let Some(asker) = counted {
+                self.responder_gate(c, &record).record(now, &asker);
+            }
             self.wake(c, &record.id);
             if record.kind == SessionKind::Responder {
                 self.presence_changed();
@@ -677,6 +686,30 @@ impl<L: Links> Courier<L> {
                     ))
                 })?;
             let o = &original.message;
+            // A responder resending after a dropped connection would otherwise answer twice, the second time as
+            // a tell; its first reply already went out.
+            if sender.kind == SessionKind::Responder && p.wait_seconds.is_none() {
+                let answered = match o.kind {
+                    MessageKind::Ask => o.state == MessageState::Answered,
+                    // A tell has no answered state: look for this session's reply to it.
+                    MessageKind::Tell => {
+                        let ids = c.reg.ids_of(&sender.id);
+                        c.store
+                            .conversation(&o.conversation)
+                            .map_err(store_err)?
+                            .iter()
+                            .any(|m| {
+                                m.message.in_reply_to.as_deref() == Some(o.id.as_str())
+                                    && m.message.from.device == self.cfg.device.hex
+                                    && ids.contains(&m.message.from.session)
+                            })
+                    }
+                    _ => false,
+                };
+                if answered {
+                    return Err(RpcError::conflict(format!("{} is already answered", p.id)));
+                }
+            }
             let answers_ask = o.kind == MessageKind::Ask && o.state != MessageState::Answered;
             let follow_up = p.wait_seconds.is_some() && o.kind != MessageKind::Ask;
             let kind = if follow_up {

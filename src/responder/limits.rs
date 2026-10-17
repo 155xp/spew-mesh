@@ -5,10 +5,63 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use super::{Asker, ServeFrom, ServeSettings};
 
 /// Most questions that may wait behind the running one.
 pub const MAX_WAITING: usize = 8;
+
+/// The largest run limit a responder may announce, the same bound settings.toml has (11).
+pub const MAX_RUN_LIMIT: u32 = 10_000;
+
+/// The part of `[serve]` the daemon applies when a question for a responder arrives (9, 5.5 step 6).
+///
+/// A responder sends the values it read at its start in `session.open`, so what `spew mesh serve` reports is
+/// what the daemon enforces even when settings.toml changed after the daemon started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateSettings {
+    /// Who may ask: `room` or `own`.
+    #[serde(serialize_with = "serialize_from")]
+    pub from: ServeFrom,
+    /// Runs per asking person per rolling hour; asks from your own devices don't count here.
+    pub max_runs_per_person_per_hour: u32,
+    /// Runs per rolling hour in all.
+    pub max_runs_per_hour: u32,
+}
+
+// `ServeFrom` reads `room` and `own` from settings.toml; the control protocol writes the same words.
+fn serialize_from<S: serde::Serializer>(from: &ServeFrom, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(match from {
+        ServeFrom::Room => "room",
+        ServeFrom::Own => "own",
+    })
+}
+
+impl GateSettings {
+    /// Refuses limits above [`MAX_RUN_LIMIT`]. Zero is allowed and refuses every question, as in settings.toml.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_runs_per_person_per_hour > MAX_RUN_LIMIT
+            || self.max_runs_per_hour > MAX_RUN_LIMIT
+        {
+            return Err(format!(
+                "serve run limits are at most {MAX_RUN_LIMIT} per hour"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl From<&ServeSettings> for GateSettings {
+    fn from(s: &ServeSettings) -> Self {
+        GateSettings {
+            from: s.from,
+            max_runs_per_person_per_hour: s.max_runs_per_person_per_hour,
+            max_runs_per_hour: s.max_runs_per_hour,
+        }
+    }
+}
 
 /// The run limits' rolling window.
 pub const WINDOW: Duration = Duration::from_secs(3600);
@@ -100,12 +153,18 @@ pub struct RunLimits {
 
 impl RunLimits {
     /// Limits from the settings.
-    pub fn new(settings: &ServeSettings) -> Self {
+    pub fn new(settings: &GateSettings) -> Self {
         RunLimits {
             per_person: settings.max_runs_per_person_per_hour,
             total: settings.max_runs_per_hour,
             runs: VecDeque::new(),
         }
+    }
+
+    /// New caps; the runs already counted stay counted.
+    pub fn set_caps(&mut self, settings: &GateSettings) {
+        self.per_person = settings.max_runs_per_person_per_hour;
+        self.total = settings.max_runs_per_hour;
     }
 
     /// Whether one more run for this asker fits, without counting it.
@@ -130,9 +189,14 @@ impl RunLimits {
     /// Counts one run for this asker when it fits; otherwise refuses with `busy` and counts nothing.
     pub fn admit(&mut self, now_ms: u64, asker: &Asker) -> Result<(), Refusal> {
         self.check(now_ms, asker)?;
+        self.record(now_ms, asker);
+        Ok(())
+    }
+
+    /// Counts one run for this asker without checking.
+    pub fn record(&mut self, now_ms: u64, asker: &Asker) {
         let person = (!asker.own).then(|| asker.person.clone());
         self.runs.push_back((now_ms, person));
-        Ok(())
     }
 
     /// Runs counted in the last hour.
@@ -222,16 +286,28 @@ pub struct Gate {
 
 impl Gate {
     /// A gate from the settings.
-    pub fn new(settings: &ServeSettings) -> Self {
+    pub fn new(settings: &GateSettings) -> Self {
         Gate {
             from: settings.from,
             limits: RunLimits::new(settings),
         }
     }
 
-    /// Admits a question and counts its run, or says why not. `queue_has_room` is false when
-    /// [`MAX_WAITING`] questions already wait.
-    pub fn admit(
+    /// Who may ask.
+    pub fn from(&self) -> ServeFrom {
+        self.from
+    }
+
+    /// Takes new settings (a responder re-opened its session); runs already counted stay counted.
+    pub fn update(&mut self, settings: &GateSettings) {
+        self.from = settings.from;
+        self.limits.set_caps(settings);
+    }
+
+    /// Says whether a question may be stored, without counting it. `queue_has_room` is false when
+    /// [`MAX_WAITING`] questions already wait. [`Gate::record`] counts it once it is stored, so a question a
+    /// later check refuses uses up nothing.
+    pub fn check(
         &mut self,
         now_ms: u64,
         asker: &Asker,
@@ -242,7 +318,25 @@ impl Gate {
         if !queue_has_room {
             return Err(Refusal::Busy);
         }
-        self.limits.admit(now_ms, asker)
+        self.limits.check(now_ms, asker)
+    }
+
+    /// Counts the run of a question that was stored.
+    pub fn record(&mut self, now_ms: u64, asker: &Asker) {
+        self.limits.record(now_ms, asker);
+    }
+
+    /// [`Gate::check`], then [`Gate::record`] when it passes.
+    pub fn admit(
+        &mut self,
+        now_ms: u64,
+        asker: &Asker,
+        shares_room: bool,
+        queue_has_room: bool,
+    ) -> Result<(), Refusal> {
+        self.check(now_ms, asker, shares_room, queue_has_room)?;
+        self.record(now_ms, asker);
+        Ok(())
     }
 
     /// The run limits, for presence and `doctor`.
@@ -268,10 +362,14 @@ mod tests {
         }
     }
 
+    fn gate_settings(s: &ServeSettings) -> GateSettings {
+        GateSettings::from(s)
+    }
+
     #[test]
     fn per_person_limit_and_window() {
         let clock = ManualClock::new(1_000_000);
-        let mut limits = RunLimits::new(&ServeSettings::default());
+        let mut limits = RunLimits::new(&gate_settings(&ServeSettings::default()));
         let maya = asker("maya", false);
         for _ in 0..10 {
             limits.admit(clock.now_ms(), &maya).unwrap();
@@ -293,7 +391,7 @@ mod tests {
             max_runs_per_hour: 3,
             ..Default::default()
         };
-        let mut limits = RunLimits::new(&settings);
+        let mut limits = RunLimits::new(&gate_settings(&settings));
         limits.admit(clock.now_ms(), &asker("maya", false)).unwrap();
         limits.admit(clock.now_ms(), &asker("sam", true)).unwrap();
         limits.admit(clock.now_ms(), &asker("lee", false)).unwrap();
@@ -313,7 +411,7 @@ mod tests {
             max_runs_per_person_per_hour: 1,
             ..Default::default()
         };
-        let mut limits = RunLimits::new(&settings);
+        let mut limits = RunLimits::new(&gate_settings(&settings));
         let sam = asker("sam", true);
         for _ in 0..5 {
             limits.admit(clock.now_ms(), &sam).unwrap();
@@ -334,7 +432,7 @@ mod tests {
             max_runs_per_hour: 2,
             ..Default::default()
         };
-        let mut limits = RunLimits::new(&settings);
+        let mut limits = RunLimits::new(&gate_settings(&settings));
         let maya = asker("maya", false);
         limits.admit(0, &maya).unwrap();
         for _ in 0..5 {
@@ -384,7 +482,7 @@ mod tests {
             max_runs_per_hour: 1,
             ..Default::default()
         };
-        let mut gate = Gate::new(&settings);
+        let mut gate = Gate::new(&gate_settings(&settings));
         assert_eq!(
             gate.admit(0, &asker("maya", false), true, true),
             Err(Refusal::NoSuchSession)
@@ -399,5 +497,93 @@ mod tests {
             gate.admit(0, &asker("sam", true), false, true),
             Err(Refusal::Busy)
         );
+    }
+
+    #[test]
+    fn check_counts_nothing_until_recorded() {
+        let settings = ServeSettings {
+            max_runs_per_person_per_hour: 1,
+            ..Default::default()
+        };
+        let mut gate = Gate::new(&gate_settings(&settings));
+        let maya = asker("maya", false);
+        for _ in 0..3 {
+            assert_eq!(gate.check(0, &maya, true, true), Ok(()));
+        }
+        gate.record(0, &maya);
+        assert_eq!(gate.check(0, &maya, true, true), Err(Refusal::Busy));
+    }
+
+    #[test]
+    fn an_update_keeps_the_count_and_takes_the_new_rules() {
+        let mut gate = Gate::new(&gate_settings(&ServeSettings::default()));
+        let maya = asker("maya", false);
+        gate.admit(0, &maya, true, true).unwrap();
+        gate.admit(0, &maya, true, true).unwrap();
+        let tighter = GateSettings {
+            from: ServeFrom::Room,
+            max_runs_per_person_per_hour: 2,
+            max_runs_per_hour: 30,
+        };
+        gate.update(&tighter);
+        assert_eq!(gate.check(0, &maya, true, true), Err(Refusal::Busy));
+        gate.update(&GateSettings {
+            from: ServeFrom::Own,
+            ..tighter
+        });
+        assert_eq!(
+            gate.check(0, &asker("lee", false), true, true),
+            Err(Refusal::NoSuchSession)
+        );
+        // Zero refuses everyone, as `max_runs_per_hour = 0` in settings.toml does.
+        gate.update(&GateSettings {
+            from: ServeFrom::Room,
+            max_runs_per_person_per_hour: 10,
+            max_runs_per_hour: 0,
+        });
+        assert_eq!(
+            gate.check(0, &asker("sam", true), true, true),
+            Err(Refusal::Busy)
+        );
+    }
+
+    #[test]
+    fn gate_settings_travel_as_json() {
+        let s = GateSettings {
+            from: ServeFrom::Own,
+            max_runs_per_person_per_hour: 2,
+            max_runs_per_hour: 5,
+        };
+        let json = serde_json::to_value(s).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"from": "own", "max_runs_per_person_per_hour": 2, "max_runs_per_hour": 5})
+        );
+        assert_eq!(serde_json::from_value::<GateSettings>(json).unwrap(), s);
+        let room: GateSettings = serde_json::from_value(
+            serde_json::json!({"from": "room", "max_runs_per_person_per_hour": 1, "max_runs_per_hour": 1}),
+        )
+        .unwrap();
+        assert_eq!(room.from, ServeFrom::Room);
+        for bad in [
+            serde_json::json!({"from": "anyone", "max_runs_per_person_per_hour": 1, "max_runs_per_hour": 1}),
+            serde_json::json!({"from": "own", "max_runs_per_person_per_hour": 1}),
+            serde_json::json!({"from": "own", "max_runs_per_person_per_hour": 1, "max_runs_per_hour": 1, "x": 1}),
+            serde_json::json!({"from": "own", "max_runs_per_person_per_hour": -1, "max_runs_per_hour": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<GateSettings>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            GateSettings {
+                max_runs_per_hour: MAX_RUN_LIMIT + 1,
+                ..s
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(s.validate().is_ok());
     }
 }

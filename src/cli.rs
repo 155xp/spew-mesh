@@ -231,9 +231,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let Top::Mesh(mesh) = cli.command;
     // The hidden commands come first: they must work before anything else is set up.
     match &mesh.command {
-        Some(Command::McpServer) => return Ok(mcp_server_not_built()),
-        Some(Command::Hook { client, event }) => return Ok(hook_not_built(client, event)),
-        Some(Command::Serve(args)) => return Ok(serve_not_built(args)),
+        Some(Command::McpServer) => return Ok(mcp_server(mesh.home.as_deref())),
+        Some(Command::Hook { client, event }) => {
+            return Ok(hook(mesh.home.as_deref(), client, event));
+        }
+        Some(Command::Serve(args)) => return Ok(serve(mesh.home.as_deref(), args)),
         _ => {}
     }
     let home = Home::from_env(mesh.home.as_deref()).context("can't find the spew mesh home")?;
@@ -279,22 +281,32 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// `spew mesh mcp-server`: built by mesh#8 part 2.
-pub fn mcp_server_not_built() -> ExitCode {
-    eprintln!("spew mesh mcp-server: not built yet");
-    ExitCode::FAILURE
+/// `spew mesh mcp-server`: the stdio MCP server agents run (8.6).
+pub fn mcp_server(home: Option<&std::path::Path>) -> ExitCode {
+    crate::agents::mcp::main(home)
 }
 
-/// `spew mesh hook <client> <event>`: built by mesh#8 part 2.
-pub fn hook_not_built(client: &str, event: &str) -> ExitCode {
-    eprintln!("spew mesh hook {client} {event}: not built yet");
-    ExitCode::FAILURE
+/// `spew mesh hook <client> <event>`: one hook event (8.1). Whatever happens it exits 0, printing nothing on
+/// any problem, so it never breaks the agent.
+pub fn hook(home: Option<&std::path::Path>, client: &str, event: &str) -> ExitCode {
+    let Ok(home) = Home::from_env(home) else {
+        return ExitCode::SUCCESS;
+    };
+    let mut daemon = crate::agents::hook_daemon::SocketHookDaemon::new(home, None);
+    crate::agents::hook::main(client, event, &mut daemon)
 }
 
-/// `spew mesh serve`: built by mesh#10 part 2.
-pub fn serve_not_built(args: &ServeArgs) -> ExitCode {
-    eprintln!("spew mesh serve {}: not built yet", args.client);
-    ExitCode::FAILURE
+/// `spew mesh serve` (9).
+pub fn serve(home: Option<&std::path::Path>, args: &ServeArgs) -> ExitCode {
+    let opts = crate::responder::command::ServeOptions {
+        client: args.client.clone(),
+        name: args.name.clone(),
+        cwd: args.cwd.clone(),
+        allow_edits: args.allow_edits,
+        timeout: args.timeout,
+        model: args.model.clone(),
+    };
+    crate::responder::command::run(home, &opts)
 }
 
 fn block_on<T, F: Future<Output = anyhow::Result<T>>>(f: F) -> anyhow::Result<T> {
@@ -350,6 +362,7 @@ async fn terminal(client: &Client) -> anyhow::Result<String> {
             kind: SessionKind::Terminal,
             name: None,
             spew_project: std::env::var(PROJECT_ENV).ok().filter(|v| !v.is_empty()),
+            serve: None,
         })
         .await?;
     Ok(opened.token)

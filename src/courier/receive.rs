@@ -118,6 +118,9 @@ impl<L: Links> Courier<L> {
             return Err(RefusalCode::SessionEnded);
         }
         let room = self.message_room(c, peer, &target);
+        // mesh#10: the gate is checked here and the run counted only once the message is stored, so a question
+        // a later step refuses uses up nothing.
+        let mut counted = None;
         if target.kind == SessionKind::Responder
             && matches!(env.kind, MessageKind::Ask | MessageKind::Tell)
         {
@@ -133,11 +136,12 @@ impl<L: Links> Courier<L> {
             };
             let has_room = (self.queue_len(c, &target) as usize) < MAX_WAITING;
             self.responder_gate(c, &target)
-                .admit(now, &asker, shares_target_room, has_room)
+                .check(now, &asker, shares_target_room, has_room)
                 .map_err(|r| match r {
                     Refusal::Busy => RefusalCode::Busy,
                     Refusal::NoSuchSession => RefusalCode::NoSuchSession,
                 })?;
+            counted = Some(asker);
         }
         // 7. Conversation guard.
         if !c.guard.allows(&env.conversation, now) {
@@ -176,6 +180,9 @@ impl<L: Links> Courier<L> {
             }
         }
         c.guard.record(&msg.conversation, now);
+        if let Some(asker) = counted {
+            self.responder_gate(c, &target).record(now, &asker);
+        }
         self.wake(c, &target.id);
         if target.kind == SessionKind::Responder {
             self.presence_changed();

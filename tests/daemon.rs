@@ -172,6 +172,7 @@ async fn open(device: &Device, cwd: &str) -> Session {
             kind: SessionKind::Live,
             name: None,
             spew_project: None,
+            serve: None,
         })
         .await
         .unwrap();

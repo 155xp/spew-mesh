@@ -376,6 +376,11 @@ pub struct SessionOpen {
     /// `SPEW_PROJECT` from the client's environment (11). Not in 6.2's table; the room needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spew_project: Option<String>,
+    /// A responder's `[serve]` limits as serve read them (9). Not in 6.2's table: the daemon applies them when
+    /// a question arrives (5.5 step 6), so a settings change that serve picked up holds even when the daemon
+    /// started before it. Only responders send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<crate::responder::limits::GateSettings>,
 }
 
 /// `session.open` result.

@@ -1591,6 +1591,45 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_store_with_a_session_upgrades_and_reads_had_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store.sqlite3");
+        let id = ulid(1);
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(V1).unwrap();
+            tx.pragma_update(None, "user_version", 1).unwrap();
+            tx.commit().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, name, client, kind, client_session, client_pid, client_pid_start, \
+                 token_hash, cwd, repo, branch, place, room, room_source, reach, state, state_since, activity, \
+                 activity_project, opened_at, last_seen_at, ended_at) VALUES (?1, 'codex-api', 'codex', 'live', \
+                 'thread-1', NULL, NULL, 'hash', '/work/api', 'acme/api', 'main', 'api', 'spew', 'spew-json', \
+                 'hooked', 'idle', 10, NULL, NULL, 10, 20, NULL)",
+                params![id],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.version().unwrap(), schema_version());
+        let kept = s
+            .session(&id)
+            .unwrap()
+            .expect("the session survives the upgrade");
+        assert_eq!(kept.name, "codex-api");
+        assert_eq!(kept.reach, Reach::Hooked);
+        // A session from before the column existed counts as never connected, so rule 3 doesn't end it early.
+        assert!(s.had_connection().unwrap().is_empty());
+        s.mark_had_connection(&id).unwrap();
+        let connected = s.had_connection().unwrap();
+        assert!(connected.len() == 1 && connected.contains(&id));
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(s.had_connection().unwrap().contains(&id));
+    }
+
+    #[test]
     fn refuses_a_newer_store() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("store.sqlite3");

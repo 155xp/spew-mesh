@@ -826,11 +826,22 @@ async fn frame_limits_and_errors() {
     let conn = raw_connect(&raw, &b).await;
     let error = |code| Response::Error { code };
 
-    // Before hello, nothing else is taken.
+    // Before hello, nothing else is taken, and nothing but a hello is parsed: broken frames are refused on
+    // their head alone.
     assert_eq!(
         raw_request(&conn, &Request::Ping).await,
         error(ErrorCode::HelloRequired)
     );
+    for frame in [
+        &b"{"[..],
+        br#"{"t":"ping","extra":1}"#,
+        br#"{"t":"teleport"}"#,
+    ] {
+        assert_eq!(
+            raw_call(&conn, &raw_frame(frame)).await,
+            error(ErrorCode::HelloRequired)
+        );
+    }
     assert!(matches!(raw_hello(&conn).await, Response::Hello(_)));
     b.expect_up(kr.public()).await;
 
@@ -983,6 +994,40 @@ async fn at_most_16_inbound_streams_per_link() {
         Response::parse(&payload).unwrap(),
         Response::Error { .. }
     ));
+}
+
+#[tokio::test]
+async fn calls_before_hello_count_toward_the_rate_limits() {
+    let (kr, kb) = ordered(28, 29);
+    let mut b = node(
+        kb.clone(),
+        admission(kb.public(), &[other(kr.public(), "maya", "maya-mbp")]),
+        fast(),
+    )
+    .await;
+    let raw = raw_endpoint(kr.clone()).await;
+    let conn = raw_connect(&raw, &b).await;
+    for _ in 0..DELIVER_PER_MINUTE {
+        assert_eq!(
+            raw_request(&conn, &Request::Deliver(envelope())).await,
+            Response::Error {
+                code: ErrorCode::HelloRequired
+            }
+        );
+    }
+    assert!(matches!(raw_hello(&conn).await, Response::Hello(_)));
+    b.expect_up(kr.public()).await;
+    let env = envelope();
+    assert_eq!(
+        raw_request(&conn, &Request::Deliver(env.clone())).await,
+        Response::Receipt(DeliverReceipt {
+            id: env.id,
+            state: DeliverState::Refused,
+            code: Some(RefusalCode::RateLimited),
+        }),
+        "the minute's delivers were used before hello"
+    );
+    assert!(b.drain_calls().is_empty());
 }
 
 #[tokio::test]

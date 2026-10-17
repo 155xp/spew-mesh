@@ -12,12 +12,18 @@ pub const MAX_CLIENT: usize = 16;
 pub const MAX_CARD: usize = 40;
 /// Longest repo slug (5.5).
 pub const MAX_REPO: usize = 100;
-/// Longest person name. The spec gives no limit; names share the session-name limit.
-pub const MAX_PERSON: usize = 48;
-/// Longest device name. The spec gives no limit; names share the session-name limit.
+/// Longest person name (2).
+pub const MAX_PERSON: usize = 32;
+/// Longest device name (2).
 pub const MAX_DEVICE: usize = 48;
-/// Longest room id. The spec gives no limit; rooms share the session-name limit.
-pub const MAX_ROOM: usize = 48;
+/// Longest room id (2).
+pub const MAX_ROOM: usize = 32;
+/// The word that means "yourself" wherever a person goes (2.2), so never a person name or room id.
+pub const ME: &str = "me";
+/// The person-name and room-id rule in words, for error messages (2).
+pub const PERSON_RULE: &str = "1 to 32 lowercase letters, digits, '.', '_' or '-', and not \"me\"";
+/// The device-name rule in words, for error messages (2).
+pub const DEVICE_RULE: &str = "1 to 48 lowercase letters, digits, '.', '_' or '-'";
 /// The sender name reserved for the daemon's own notices (7.6).
 pub const RESERVED_NAME: &str = "mesh";
 /// The client kinds setup wires and serve runs (2, 9).
@@ -44,38 +50,31 @@ pub fn is_client(s: &str) -> bool {
     is_slug(s, MAX_CLIENT)
 }
 
-/// A device name such as `maya-mbp` (2).
+/// A device name such as `maya-mbp`: lowercase ASCII letters, digits, `.`, `_` and `-`, 1 to 48 (2). `setup
+/// --device-name` slugs what it's given with [`slugify`], whose output always fits.
 pub fn is_device_name(s: &str) -> bool {
-    is_slug(s, MAX_DEVICE)
+    is_token(s, MAX_DEVICE)
 }
 
-// Person names and rooms come from spew usernames, project keys and roster files. The spec names no character
-// set, so they allow `.` and `_` besides the slug characters, and never `/`, `@`, `#`, `|` or `]`, which the
-// address syntax and the message header need.
+// The character set the spec gives person names, room ids and device names (2). None of `/`, `@`, `#`, `|` or
+// `]` can appear, which the address syntax and the message header rely on. Peers check names by this same rule
+// (`hello`, presence), so it is exactly the spec's and no stricter.
 fn is_token(s: &str, max: usize) -> bool {
-    let edge_ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    let bytes = s.as_bytes();
-    match (bytes.first(), bytes.last()) {
-        (Some(&first), Some(&last)) => {
-            s.len() <= max
-                && edge_ok(first)
-                && edge_ok(last)
-                && bytes
-                    .iter()
-                    .all(|&b| edge_ok(b) || b == b'-' || b == b'_' || b == b'.')
-        }
-        _ => false,
-    }
+    !s.is_empty()
+        && s.len() <= max
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.'
+        })
 }
 
-/// A person name such as `maya` (2).
+/// A person name such as `maya`: the token rule, at most 32, never `me` (2).
 pub fn is_person(s: &str) -> bool {
-    is_token(s, MAX_PERSON)
+    is_token(s, MAX_PERSON) && s != ME
 }
 
-/// A room id: a spew project key or a roster room name (2).
+/// A room id: a spew project key or a roster room name, with the person-name rule (2).
 pub fn is_room(s: &str) -> bool {
-    is_token(s, MAX_ROOM)
+    is_token(s, MAX_ROOM) && s != ME
 }
 
 /// A card ref `<key>#<number>` with key `[a-z0-9-]+`, at most 40 bytes (7.7).
@@ -400,15 +399,46 @@ mod tests {
         assert!(is_person("maya"));
         assert!(is_person("maya.k"));
         assert!(is_person("sam_2"));
+        assert!(is_person("_sam-"));
+        assert!(is_person("a"));
+        assert!(is_person(&"p".repeat(32)));
+        assert!(!is_person(&"p".repeat(33)));
+        assert!(!is_person("me"));
+        assert!(is_person("me2"));
         assert!(!is_person("maya/claude"));
         assert!(!is_person("maya@x"));
-        assert!(!is_person(".maya"));
-        assert!(!is_person("maya-"));
+        assert!(!is_person("maya#1"));
         assert!(!is_person("Maya"));
+        assert!(!is_person("maya k"));
+        assert!(!is_person("mayä"));
         assert!(!is_person(""));
         assert!(is_room("spew"));
+        assert!(is_room("acme.web_2"));
+        assert!(is_room(&"r".repeat(32)));
+        assert!(!is_room(&"r".repeat(33)));
+        assert!(!is_room("me"));
         assert!(!is_room("a|b"));
         assert!(!is_room("a]b"));
+        assert!(!is_room(""));
+    }
+
+    #[test]
+    fn device_names() {
+        assert!(is_device_name("maya-mbp"));
+        assert!(is_device_name("sam.mbp"));
+        assert!(is_device_name("sam_mac-2"));
+        assert!(is_device_name("me"));
+        assert!(is_device_name(&"d".repeat(48)));
+        assert!(!is_device_name(&"d".repeat(49)));
+        assert!(!is_device_name(""));
+        assert!(!is_device_name("Sam's Mac"));
+        assert!(!is_device_name("sam@mac"));
+        assert!(!is_device_name("sam/mac"));
+        // What setup does with --device-name always fits.
+        for text in ["Sam's MacBook Pro", "maya_k.mbp", &"x".repeat(80), "--"] {
+            let slug = slugify(text, MAX_DEVICE);
+            assert!(slug.is_empty() || is_device_name(&slug), "{slug}");
+        }
     }
 
     #[test]
@@ -562,12 +592,15 @@ mod tests {
             "maya@mbp/",
             "@mbp/claude",
             "maya@mbp/claude/x",
-            "maya@m_bp/claude",
+            "maya@m!bp/claude",
+            "maya@m bp/claude",
+            &format!("maya@{}/claude", "d".repeat(49)),
+            &format!("{}/claude", "p".repeat(33)),
             "maya/claude_api",
             "a b",
             "maya|x",
             "x]",
-            "-x",
+            "x!",
         ] {
             assert!(Address::parse(bad).is_err(), "{bad}");
         }
@@ -576,6 +609,12 @@ mod tests {
             Err(AddressError::Card(_))
         ));
         assert!(matches!(Address::parse("maya#4"), Ok(Address::Card(_))));
+        // Device and person names take `.`, `_` and `-` anywhere (2).
+        assert!(matches!(
+            Address::parse("maya.k@m_bp.2/claude"),
+            Ok(Address::Exact { .. })
+        ));
+        assert_eq!(Address::parse("_x").unwrap(), Address::Bare("_x".into()));
     }
 
     #[test]

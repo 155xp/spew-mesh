@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD;
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
-use crate::address::{MAX_DEVICE, is_device_name, slugify};
+use crate::address::{DEVICE_RULE, MAX_DEVICE, is_device_name, slugify};
 use crate::paths::{
     FILE_MODE, Home, PathsError, ensure_private_dir, mode_of, private_open_options, set_mode,
     write_atomic,
@@ -82,9 +82,10 @@ pub enum IdentityError {
     },
     /// The file parses but holds a name that isn't a valid device name. The key is fine, so the file stays.
     #[error(
-        "{} holds the device name \"{name}\", which is not a valid device name (lowercase letters, digits and \
-         hyphens); fix it there or run `spew mesh setup --device-name NAME`",
-        path.display()
+        "{} holds the device name \"{name}\", which is not a valid device name ({rule}); fix it there or run \
+         `spew mesh setup --device-name NAME`",
+        path.display(),
+        rule = DEVICE_RULE
     )]
     BadName {
         /// The device file.
@@ -96,9 +97,7 @@ pub enum IdentityError {
     #[error("could not encode the device file: {0}")]
     Encode(String),
     /// A new name isn't a valid device name.
-    #[error(
-        "\"{0}\" is not a valid device name: use lowercase letters, digits and hyphens, at most 48"
-    )]
+    #[error("\"{0}\" is not a valid device name: use {rule}", rule = DEVICE_RULE)]
     InvalidName(String),
 }
 
@@ -324,10 +323,12 @@ pub fn default_device_name(
     platform: &str,
     taken: impl Fn(&str) -> bool,
 ) -> Option<String> {
-    let base = slugify(
-        &format!("{person}-{}", platform_short(platform)),
-        MAX_DEVICE,
-    );
+    let joined = format!("{person}-{}", platform_short(platform));
+    let base = if is_device_name(&joined) {
+        joined
+    } else {
+        slugify(&joined, MAX_DEVICE)
+    };
     let base = if base.is_empty() {
         "device".to_string()
     } else {
@@ -534,7 +535,11 @@ mod tests {
         );
         assert_eq!(
             default_device_name("sam_o.k", "freebsd", |_| false).unwrap(),
-            "sam-o-k-freebsd"
+            "sam_o.k-freebsd"
+        );
+        assert_eq!(
+            default_device_name("Sam K", "linux", |_| false).unwrap(),
+            "sam-k-linux"
         );
         let long = "p".repeat(60);
         let name =

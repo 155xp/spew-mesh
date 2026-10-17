@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use url::Url;
 
-use crate::address::{MAX_PERSON, is_client, is_device_name, is_person, is_room, slugify};
+use crate::address::{
+    DEVICE_RULE, MAX_PERSON, PERSON_RULE, is_client, is_device_name, is_person, is_room, slugify,
+};
 use crate::paths::{Home, expand_tilde};
 
 /// The default spew server (11, 14).
@@ -405,12 +407,17 @@ impl Settings {
         user_home: Option<&Path>,
     ) -> Result<Settings, String> {
         let defaults = Settings::defaults(home);
-        let username = optional(raw.username, is_person, "username", "a valid person name")?;
+        let username = optional(
+            raw.username,
+            is_person,
+            "username",
+            &format!("a valid person name ({PERSON_RULE})"),
+        )?;
         let device_name = optional(
             raw.device_name,
             is_device_name,
             "device_name",
-            "a valid device name (lowercase letters, digits and hyphens)",
+            &format!("a valid device name ({DEVICE_RULE})"),
         )?;
 
         let file = match raw.roster.file.filter(|f| !f.is_empty()) {
@@ -434,7 +441,7 @@ impl Settings {
                 raw.roster.default_room,
                 is_room,
                 "[roster] default_room",
-                "a valid room",
+                &format!("a valid room id ({PERSON_RULE})"),
             )?,
         };
 
@@ -569,7 +576,7 @@ impl Settings {
         }
         os_user
             .map(|u| slugify(u, MAX_PERSON))
-            .filter(|u| !u.is_empty())
+            .filter(|u| is_person(u))
             .unwrap_or_else(|| "local".to_string())
     }
 }
@@ -896,9 +903,15 @@ max_budget_usd = 1
 
     #[test]
     fn bad_values_fail() {
+        let long_user = format!("username = \"{}\"", "p".repeat(33));
+        let long_device = format!("device_name = \"{}\"", "d".repeat(49));
         for (text, needle) in [
             ("username = \"Sam Smith\"", "username"),
-            ("device_name = \"Sam's Mac\"", "device_name"),
+            ("username = \"me\"", "not \"me\""),
+            (long_user.as_str(), "1 to 32"),
+            ("device_name = \"Sam's Mac\"", "1 to 48"),
+            (long_device.as_str(), "device_name"),
+            ("[roster]\ndefault_room = \"me\"", "default_room"),
             ("[roster]\nkind = \"ldap\"", "ldap"),
             ("[roster]\ndefault_room = \"a b\"", "default_room"),
             ("[spew]\nrefresh_seconds = 1", "refresh_seconds"),
@@ -1011,6 +1024,7 @@ max_budget_usd = 1
         let mut s = parse("").unwrap();
         assert_eq!(s.local_username(Some("Sam Smith")), "sam-smith");
         assert_eq!(s.local_username(Some("日本")), "local");
+        assert_eq!(s.local_username(Some("Me")), "local");
         assert_eq!(s.local_username(None), "local");
         s.username = Some("maya".into());
         assert_eq!(s.local_username(Some("sam")), "maya");

@@ -2,7 +2,7 @@
 //! 7.8).
 
 use crate::address::{
-    is_card, is_client, is_device_name, is_person, is_repo, is_session_name, is_ulid,
+    is_card, is_client, is_device_name, is_person, is_repo, is_room, is_session_name, is_ulid,
 };
 use crate::wire::{MessageKind, RefusalCode};
 
@@ -127,7 +127,7 @@ impl Origin {
                 Some(room) => format!(
                     "{}'s agents, a teammate in project {}",
                     safe(person, is_person),
-                    safe(room, is_person)
+                    safe(room, is_room)
                 ),
                 None => format!("{}'s agents, a teammate", safe(person, is_person)),
             }),
@@ -380,7 +380,7 @@ pub fn unanswered_line(asks: usize) -> String {
 /// The start-hook line when there is nothing unread (8.1).
 pub fn start_line(person: &str, name: &str, device: &str, room: Option<&str>) -> String {
     let place = match room {
-        Some(room) => format!("project {}", safe(room, is_person)),
+        Some(room) => format!("project {}", safe(room, is_room)),
         None => "private: no .spew.json".to_string(),
     };
     format!(

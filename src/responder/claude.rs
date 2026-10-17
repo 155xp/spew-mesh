@@ -5,12 +5,41 @@ use serde_json::Value;
 use super::process::RunOutput;
 use super::{RunFailure, RunResult, ServeError, one_line, random_bytes};
 
-/// `--settings` for every run: no hooks, no cross-session messages, and reads of secret files denied.
-pub const SETTINGS: &str = concat!(
-    r#"{"disableAllHooks":true,"crossSessionInbound":"refuse","permissions":{"deny":["#,
-    r#""Read(./.env)","Read(./.env.*)","Read(./**/.env)","Read(./**/.env.*)","Read(./**/*.pem)","#,
-    r#""Read(./**/*.key)","Read(./**/id_rsa*)","Read(./**/id_ed25519*)","Read(./.git/config)"]}}"#,
-);
+/// The secret files a run may never read (8.2), as permission patterns relative to the serve folder.
+pub const SECRET_FILES: &[&str] = &[
+    "./.env",
+    "./.env.*",
+    "./**/.env",
+    "./**/.env.*",
+    "./**/*.pem",
+    "./**/*.key",
+    "./**/id_rsa*",
+    "./**/id_ed25519*",
+    "./.git/config",
+];
+
+/// `--settings` for every run: no hooks, no cross-session messages, and reads of secret files denied. With
+/// `--allow-edits`, Edit and Write are denied for the same files and for `./.git/**`, so a run can't plant
+/// a git hook or rewrite a key.
+pub fn settings(allow_edits: bool) -> String {
+    let mut deny: Vec<String> = SECRET_FILES.iter().map(|p| format!("Read({p})")).collect();
+    if allow_edits {
+        for tool in ["Edit", "Write"] {
+            deny.extend(
+                SECRET_FILES
+                    .iter()
+                    .chain(&["./.git/**"])
+                    .map(|p| format!("{tool}({p})")),
+            );
+        }
+    }
+    // Built by hand to keep the spec's key order; the patterns hold no quotes or backslashes.
+    let list: Vec<String> = deny.iter().map(|d| format!("\"{d}\"")).collect();
+    format!(
+        r#"{{"disableAllHooks":true,"crossSessionInbound":"refuse","permissions":{{"deny":[{}]}}}}"#,
+        list.join(",")
+    )
+}
 
 /// Variables that describe the parent Claude Code session; dropped from the child environment.
 pub const SCRUB: &[&str] = &[
@@ -71,6 +100,7 @@ pub fn args(session: Session<'_>, opts: &Options<'_>) -> Vec<String> {
     } else {
         "dontAsk"
     };
+    let settings = settings(opts.allow_edits);
     let (session_flag, id) = match session {
         Session::New(id) => ("--session-id", id),
         Session::Resume(id) => ("--resume", id),
@@ -90,7 +120,7 @@ pub fn args(session: Session<'_>, opts: &Options<'_>) -> Vec<String> {
         "--permission-mode",
         mode,
         "--settings",
-        SETTINGS,
+        &settings,
         "--max-turns",
     ]
     .iter()
@@ -257,6 +287,13 @@ mod tests {
         }
     }
 
+    /// The read-only settings exactly as 8.2 prints them.
+    const SETTINGS: &str = concat!(
+        r#"{"disableAllHooks":true,"crossSessionInbound":"refuse","permissions":{"deny":["Read(./.env)","Read(./.env.*)","#,
+        r#""Read(./**/.env)","Read(./**/.env.*)","Read(./**/*.pem)","Read(./**/*.key)","Read(./**/id_rsa*)","#,
+        r#""Read(./**/id_ed25519*)","Read(./.git/config)"]}}"#,
+    );
+
     #[test]
     fn first_run_argv_is_exact() {
         assert_eq!(
@@ -310,7 +347,7 @@ mod tests {
         );
         assert_eq!(a[7], "Read,Grep,Glob,Edit,Write");
         assert_eq!(a[12], "acceptEdits");
-        assert_eq!(a[14], SETTINGS, "the deny rules stay with --allow-edits");
+        assert_eq!(a[14], settings(true));
         assert_eq!(a[16], "8");
         assert_eq!(a[18], "1.25");
         assert_eq!(
@@ -332,7 +369,36 @@ mod tests {
     }
 
     #[test]
+    fn edit_settings_keep_the_read_rules_and_deny_edits_to_secrets_and_git() {
+        let v: Value = serde_json::from_str(&settings(true)).unwrap();
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap())
+            .collect();
+        assert_eq!(deny.len(), 9 + 10 + 10);
+        let read: Value = serde_json::from_str(SETTINGS).unwrap();
+        let read: Vec<&str> = read["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_str().unwrap())
+            .collect();
+        assert_eq!(deny[..9], read[..], "the read rules stay");
+        for tool in ["Edit", "Write"] {
+            for file in SECRET_FILES.iter().chain(&["./.git/**"]) {
+                let rule = format!("{tool}({file})");
+                assert!(deny.contains(&rule.as_str()), "{rule}");
+            }
+        }
+        assert_eq!(v["disableAllHooks"], true);
+        assert_eq!(v["crossSessionInbound"], "refuse");
+    }
+
+    #[test]
     fn settings_is_the_spec_json() {
+        assert_eq!(settings(false), SETTINGS);
         let v: Value = serde_json::from_str(SETTINGS).unwrap();
         assert_eq!(
             v,

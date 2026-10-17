@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -273,7 +273,8 @@ where
             return Err(RunFailure::new("the Codex responder wasn't prepared"));
         };
         let thread = known.filter(|id| is_safe_id(id));
-        let run_file = RunFile::new(&self.cfg.run_dir);
+        let run_file = RunFile::create(&self.cfg.run_dir)
+            .map_err(|e| RunFailure::new(format!("can't create the Codex run file: {e}")))?;
         let mut style = setup.resume;
         loop {
             let args = codex::exec_args(&codex::ExecArgs {
@@ -286,6 +287,11 @@ where
             let spec = self.spec(args, prompt.clone().into_bytes());
             let out = execute(&self.runner, spec, self.cfg.client).await?;
             if thread.is_some() && style == ResumeStyle::Dash && codex::rejected_resume_dash(&out) {
+                log_output(
+                    self.cfg.client,
+                    &out,
+                    &RunFailure::new("Codex rejected `resume <thread id> -`"),
+                );
                 tracing::warn!(
                     "Codex rejected `resume <thread id> -`; follow-ups pass a positional prompt from now on"
                 );
@@ -456,10 +462,16 @@ struct RunFile {
 }
 
 impl RunFile {
-    fn new(dir: &Path) -> Self {
-        RunFile {
-            path: dir.join(format!("{}.txt", ulid::Ulid::new())),
-        }
+    /// Creates the file empty and 0600 before Codex writes it, so the answer never sits in a file other
+    /// local users can read.
+    fn create(dir: &Path) -> std::io::Result<Self> {
+        let path = dir.join(format!("{}.txt", ulid::Ulid::new()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        Ok(RunFile { path })
     }
 
     fn path(&self) -> &Path {
@@ -522,11 +534,17 @@ mod tests {
     }
 
     #[test]
-    fn run_file_is_deleted_on_drop() {
+    fn run_file_is_created_0600_and_deleted_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = {
-            let f = RunFile::new(dir.path());
+            let f = RunFile::create(dir.path()).unwrap();
+            let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(f.read(10).as_deref(), Some(""));
             std::fs::write(f.path(), "answer").unwrap();
+            let mode = std::fs::metadata(f.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "writing over it keeps the mode");
             assert_eq!(f.read(3).as_deref(), Some("ans"));
             f.path().to_path_buf()
         };

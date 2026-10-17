@@ -27,7 +27,21 @@ pub const PROJECT_KEYS: &[&str] = &["sandbox_mode", "mcp_servers", "hooks", "not
 /// The only keys copied from the person's `[model_providers.<id>]` table.
 pub const PROVIDER_KEYS: &[&str] = &["name", "base_url", "env_key", "wire_api", "query_params"];
 
-/// The permission profile, with `<codex dir>` filled in. `--allow-edits` makes the workspace writable.
+/// Paths in the workspace that stay out of reach, read-only or with `--allow-edits`.
+pub const WORKSPACE_DENY: &[&str] = &[
+    "**/.env",
+    "**/*.env",
+    "**/.env.*",
+    "**/*.pem",
+    "**/*.key",
+    "**/id_rsa*",
+    "**/id_ed25519*",
+    ".git/config",
+    ".git/hooks",
+];
+
+/// The permission profile, with `<codex dir>` filled in. `--allow-edits` makes the workspace writable;
+/// the deny entries stay.
 pub fn profile(codex_dir: &Path, allow_edits: bool) -> Result<String, ServeError> {
     let dir = codex_dir.to_str().ok_or_else(|| {
         ServeError::Invalid(format!(
@@ -36,10 +50,13 @@ pub fn profile(codex_dir: &Path, allow_edits: bool) -> Result<String, ServeError
         ))
     })?;
     let workspace = if allow_edits { "write" } else { "read" };
+    let deny: String = WORKSPACE_DENY
+        .iter()
+        .map(|p| format!(", {}=\"deny\"", toml_string(p)))
+        .collect();
     Ok(format!(
         "{{extends=\":read-only\", filesystem={{\":root\"=\"deny\", \":minimal\"=\"read\", {dir}=\"read\", \
-         glob_scan_max_depth=3, \":workspace_roots\"={{\".\"=\"{workspace}\", \"**/*.env\"=\"deny\", \
-         \"**/.env.*\"=\"deny\"}}}}, network={{enabled=false}}}}",
+         glob_scan_max_depth=3, \":workspace_roots\"={{\".\"=\"{workspace}\"{deny}}}}}, network={{enabled=false}}}}",
         dir = toml_string(dir),
     ))
 }
@@ -513,7 +530,7 @@ pub struct Canary<'a> {
 }
 
 /// The startup self-check (8.3): through `codex sandbox` with the serve profile, reading a file inside
-/// `--cwd` must work and reading a canary file outside it must not.
+/// `--cwd` must work, and reading a canary file outside it or a `.env` canary inside it must not.
 pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Result<(), ServeError> {
     if c.outside_dir.starts_with(c.cwd) {
         return Err(ServeError::Canary(format!(
@@ -523,8 +540,26 @@ pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Resul
     }
     let inside_token = random_hex(16)?;
     let outside_token = random_hex(16)?;
+    let env_token = random_hex(16)?;
     let inside = probe_file(c.cwd, ".spew-mesh-canary-", &inside_token)?;
     let outside = probe_file(c.outside_dir, "canary-", &outside_token)?;
+    // A `.env` of its own in a fresh folder, so an existing `.env` in the repo is never touched.
+    let env_dir = tempfile::Builder::new()
+        .prefix(".spew-mesh-canary-")
+        .tempdir_in(c.cwd)
+        .map_err(|e| {
+            ServeError::io(
+                format!("can't write a canary file in {}", c.cwd.display()),
+                e,
+            )
+        })?;
+    let env_file = env_dir.path().join(".env");
+    std::fs::write(&env_file, &env_token).map_err(|e| {
+        ServeError::io(
+            format!("can't write a canary file in {}", c.cwd.display()),
+            e,
+        )
+    })?;
     let read = |file: &Path| RunSpec {
         program: c.program.to_path_buf(),
         args: sandbox_args(c.cwd, c.profile, file),
@@ -534,11 +569,20 @@ pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Resul
         timeout: c.timeout,
         stdout_cap: 64 * 1024,
     };
+    let run = |file: &Path| {
+        let spec = read(file);
+        async move {
+            runner
+                .run(spec)
+                .await
+                .map_err(|e| ServeError::io("can't run codex sandbox", e))
+        }
+    };
+    let leaked = |out: &RunOutput, token: &str| {
+        out.stdout_text().contains(token) || out.stderr_text().contains(token)
+    };
 
-    let out = runner
-        .run(read(inside.path()))
-        .await
-        .map_err(|e| ServeError::io("can't run codex sandbox", e))?;
+    let out = run(inside.path()).await?;
     if !(out.success() && out.stdout_text().contains(&inside_token)) {
         let detail = one_line(&out.stderr_text(), 200);
         return Err(ServeError::Canary(format!(
@@ -552,14 +596,20 @@ pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Resul
         )));
     }
 
-    let out = runner
-        .run(read(outside.path()))
-        .await
-        .map_err(|e| ServeError::io("can't run codex sandbox", e))?;
-    if out.stdout_text().contains(&outside_token) || out.stderr_text().contains(&outside_token) {
+    let out = run(outside.path()).await?;
+    if leaked(&out, &outside_token) {
         return Err(ServeError::Canary(
             "a sandboxed command read a file outside --cwd, so Codex doesn't enforce the serve \
              profile here"
+                .into(),
+        ));
+    }
+
+    let out = run(&env_file).await?;
+    if leaked(&out, &env_token) {
+        return Err(ServeError::Canary(
+            "a sandboxed command read a .env file inside --cwd, so Codex doesn't enforce the serve \
+             profile's deny rules here"
                 .into(),
         ));
     }
@@ -609,12 +659,32 @@ mod tests {
             profile(Path::new(DIR), false).unwrap(),
             "{extends=\":read-only\", filesystem={\":root\"=\"deny\", \":minimal\"=\"read\", \
              \"/opt/codex/lib/node_modules/@openai/codex\"=\"read\", glob_scan_max_depth=3, \
-             \":workspace_roots\"={\".\"=\"read\", \"**/*.env\"=\"deny\", \"**/.env.*\"=\"deny\"}}, \
+             \":workspace_roots\"={\".\"=\"read\", \"**/.env\"=\"deny\", \"**/*.env\"=\"deny\", \
+             \"**/.env.*\"=\"deny\", \"**/*.pem\"=\"deny\", \"**/*.key\"=\"deny\", \"**/id_rsa*\"=\"deny\", \
+             \"**/id_ed25519*\"=\"deny\", \".git/config\"=\"deny\", \".git/hooks\"=\"deny\"}}, \
              network={enabled=false}}"
         );
+    }
+
+    #[test]
+    fn allow_edits_keeps_every_deny_entry() {
+        let read = profile(Path::new(DIR), false).unwrap();
         let edits = profile(Path::new(DIR), true).unwrap();
-        assert!(edits.contains("{\".\"=\"write\", "));
-        assert!(!edits.contains("\".\"=\"read\""));
+        assert_eq!(edits, read.replace("\".\"=\"read\"", "\".\"=\"write\""));
+        let value: Value = edits.parse().unwrap();
+        let fs = value.as_inline_table().unwrap().get("filesystem").unwrap();
+        let roots = fs
+            .as_inline_table()
+            .unwrap()
+            .get(":workspace_roots")
+            .unwrap()
+            .as_inline_table()
+            .unwrap();
+        assert_eq!(roots.get(".").unwrap().as_str(), Some("write"));
+        for entry in WORKSPACE_DENY {
+            assert_eq!(roots.get(entry).unwrap().as_str(), Some("deny"), "{entry}");
+        }
+        assert_eq!(roots.len(), 1 + WORKSPACE_DENY.len());
     }
 
     #[test]
@@ -1035,6 +1105,22 @@ query_params = { api-version = "2026-01-01" }
         output(0, &std::fs::read_to_string(file).unwrap())
     }
 
+    fn is_env(f: &Path) -> bool {
+        let name = f.file_name().unwrap().to_string_lossy();
+        name == ".env" || name.ends_with(".env") || name.starts_with(".env.")
+    }
+
+    /// What an enforcing sandbox does: the repo is readable except its `.env` files, nothing else is.
+    fn enforced(cwd: PathBuf) -> impl Fn(&Path) -> RunOutput + Send + Sync {
+        move |f: &Path| {
+            if f.starts_with(&cwd) && !is_env(f) {
+                cat(f)
+            } else {
+                denied(f)
+            }
+        }
+    }
+
     fn denied(_: &Path) -> RunOutput {
         RunOutput {
             exit: Exit::Code(1),
@@ -1078,24 +1164,20 @@ query_params = { api-version = "2026-01-01" }
     #[tokio::test]
     async fn canary_passes_when_only_the_repo_is_readable() {
         let d = canary_dirs();
-        let cwd = d.cwd.clone();
         let runner = FakeSandbox {
-            answer: move |f: &Path| {
-                if f.starts_with(&cwd) {
-                    cat(f)
-                } else {
-                    denied(f)
-                }
-            },
+            answer: enforced(d.cwd.clone()),
             calls: Mutex::new(vec![]),
         };
         let prof = profile(Path::new(DIR), false).unwrap();
         canary_check(&runner, &canary(&d, &prof)).await.unwrap();
         let calls = runner.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].args[0], "sandbox");
         assert!(PathBuf::from(calls[0].args.last().unwrap()).starts_with(&d.cwd));
         assert!(PathBuf::from(calls[1].args.last().unwrap()).starts_with(&d.outside));
+        let env = PathBuf::from(calls[2].args.last().unwrap());
+        assert!(env.starts_with(&d.cwd));
+        assert_eq!(env.file_name().unwrap(), ".env");
         drop(calls);
         // Both probe files are gone afterwards.
         assert_eq!(std::fs::read_dir(&d.cwd).unwrap().count(), 0);
@@ -1113,6 +1195,27 @@ query_params = { api-version = "2026-01-01" }
         let err = canary_check(&runner, &canary(&d, &prof)).await.unwrap_err();
         assert!(matches!(err, ServeError::Canary(_)), "{err}");
         assert!(err.to_string().contains("outside --cwd"));
+    }
+
+    #[tokio::test]
+    async fn canary_fails_when_a_dot_env_inside_cwd_is_readable() {
+        let d = canary_dirs();
+        let cwd = d.cwd.clone();
+        let runner = FakeSandbox {
+            answer: move |f: &Path| {
+                if f.starts_with(&cwd) {
+                    cat(f)
+                } else {
+                    denied(f)
+                }
+            },
+            calls: Mutex::new(vec![]),
+        };
+        let prof = profile(Path::new(DIR), false).unwrap();
+        let err = canary_check(&runner, &canary(&d, &prof)).await.unwrap_err();
+        assert!(err.to_string().contains(".env file inside --cwd"), "{err}");
+        assert_eq!(runner.calls.lock().unwrap().len(), 3);
+        assert_eq!(std::fs::read_dir(&d.cwd).unwrap().count(), 0);
     }
 
     #[tokio::test]

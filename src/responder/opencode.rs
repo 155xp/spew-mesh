@@ -11,14 +11,18 @@ use super::{RunFailure, RunResult, is_safe_id, one_line};
 /// The agent every run uses, defined in [`config_content`].
 pub const AGENT: &str = "spew-mesh-serve";
 
-/// The spec lists no OpenCode variables to drop; the two serve sets replace any inherited value.
-pub const SCRUB: &[&str] = &[];
+/// Dropped from the child environment before the serve variables are added: `OPENCODE_PERMISSION` could
+/// widen the agent's permissions, and `OPENCODE` and `OPENCODE_PID` describe a parent OpenCode process.
+pub const SCRUB: &[&str] = &["OPENCODE_PERMISSION", "OPENCODE", "OPENCODE_PID"];
 
-/// `OPENCODE_CONFIG_CONTENT`, which outranks the person's global config. `--allow-edits` adds
-/// `"edit": "allow"` to the agent.
+/// `OPENCODE_CONFIG_CONTENT`, which outranks the person's global config. `--allow-edits` adds an `edit`
+/// path map to the agent that still refuses `.git/` and secret files.
 pub fn config_content(allow_edits: bool) -> String {
     let edit = if allow_edits {
-        r#","edit":"allow""#
+        concat!(
+            r#","edit":{"*":"allow",".git/*":"deny","*.env":"deny","*.env.*":"deny","#,
+            r#""*.pem":"deny","*.key":"deny"}"#
+        )
     } else {
         ""
     };
@@ -68,26 +72,22 @@ pub fn args(
     v
 }
 
-/// True when stderr says OpenCode fell back to its default agent because ours wasn't found. The exact
-/// wording isn't documented, so any line naming an agent together with a fallback or "not found" counts.
+/// True when stderr says OpenCode fell back to its default agent because ours wasn't found: a line naming
+/// the agent with "not found", "fall back" or "falling back". The wording isn't pinned by a test against
+/// OpenCode yet (8.4).
 pub fn names_fallback(stderr: &str) -> bool {
     stderr.lines().any(|line| {
         let l = line.to_ascii_lowercase();
-        l.contains("agent")
-            && [
-                "fall back",
-                "falling back",
-                "fallback",
-                "not found",
-                "default agent",
-            ]
-            .iter()
-            .any(|w| l.contains(w))
+        l.contains(AGENT)
+            && ["not found", "fall back", "falling back"]
+                .iter()
+                .any(|w| l.contains(w))
     })
 }
 
 /// Reads the JSON events: the session id from the first event, the answer from the text parts after the
-/// last tool event. A non-zero exit, an `error` event or the fallback warning fails the run.
+/// last tool event. A non-zero exit, an `error` event or the fallback warning fails the run. Only `type`,
+/// `sessionID`, `part.type`, `part.text` and `error` are read.
 pub fn parse(out: &RunOutput) -> Result<RunResult, RunFailure> {
     let mut session_id: Option<String> = None;
     let mut texts: Vec<String> = Vec::new();
@@ -113,10 +113,7 @@ pub fn parse(out: &RunOutput) -> Result<RunResult, RunFailure> {
         } else if kind.starts_with("tool") || part_kind == "tool" {
             texts.clear();
         } else if kind == "text"
-            && let Some(text) = part
-                .and_then(|p| p.get("text"))
-                .or_else(|| event.get("text"))
-                .and_then(Value::as_str)
+            && let Some(text) = part.and_then(|p| p.get("text")).and_then(Value::as_str)
         {
             texts.push(text.to_string());
         }
@@ -155,7 +152,7 @@ fn error_text(event: &Value) -> String {
         .and_then(|d| d.get("message"))
         .or_else(|| err.and_then(|e| e.get("message")))
         .or_else(|| err.and_then(|e| e.get("name")))
-        .or_else(|| event.get("message"))
+        .or_else(|| err.filter(|e| e.is_string()))
         .and_then(Value::as_str);
     one_line(message.unwrap_or("an error event"), 200)
 }
@@ -208,12 +205,24 @@ mod tests {
     }
 
     #[test]
-    fn allow_edits_adds_edit_to_the_agent_only() {
+    fn allow_edits_adds_the_edit_path_map_to_the_agent_only() {
         let v: Value = serde_json::from_str(&config_content(true)).unwrap();
         let perm = &v["agent"]["spew-mesh-serve"]["permission"];
-        assert_eq!(perm["edit"], "allow");
+        assert_eq!(
+            perm["edit"],
+            serde_json::json!({"*": "allow", ".git/*": "deny", "*.env": "deny", "*.env.*": "deny",
+                               "*.pem": "deny", "*.key": "deny"})
+        );
         assert_eq!(perm["*"], "deny");
+        assert_eq!(perm["read"]["*.env"], "deny");
         assert_eq!(v["permission"], serde_json::json!({"*": "deny"}));
+        assert_eq!(
+            config_content(true),
+            config_content(false).replace(
+                r#""list":"allow"}"#,
+                r#""list":"allow","edit":{"*":"allow",".git/*":"deny","*.env":"deny","*.env.*":"deny","*.pem":"deny","*.key":"deny"}}"#
+            )
+        );
     }
 
     #[test]
@@ -336,8 +345,33 @@ mod tests {
         assert!(names_fallback(
             "Agent spew-mesh-serve not found, using build"
         ));
-        assert!(names_fallback("warning: falling back to default agent"));
+        assert!(names_fallback(
+            "warning: agent spew-mesh-serve missing, falling back to build"
+        ));
+        assert!(names_fallback(
+            "could not load spew-mesh-serve; fall back to default"
+        ));
         assert!(!names_fallback("loading config\n"));
         assert!(!names_fallback("file not found: x.ts"));
+        assert!(!names_fallback("agent build not found"));
+    }
+
+    #[test]
+    fn only_the_listed_fields_are_read() {
+        // Text outside `part.text` and a message outside `error` are ignored.
+        let out = concat!(
+            r#"{"type":"text","sessionID":"ses_1","text":"top-level text"}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"the answer"}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","message":"not an error"}"#,
+            "\n",
+        );
+        assert_eq!(parse(&output(0, out, "")).unwrap().answer, "the answer");
+        let plain = r#"{"type":"error","sessionID":"ses_1","error":"quota exceeded"}"#;
+        assert_eq!(
+            parse(&output(0, plain, "")).unwrap_err().reason,
+            "OpenCode reported an error: quota exceeded"
+        );
     }
 }

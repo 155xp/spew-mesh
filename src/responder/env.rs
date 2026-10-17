@@ -160,6 +160,31 @@ mod tests {
     }
 
     #[test]
+    fn opencode_scrub_drops_its_parent_and_permission_variables() {
+        let host = HostEnv::new([
+            ("OPENCODE_PERMISSION", "{\"*\":\"allow\"}"),
+            ("OPENCODE", "1"),
+            ("OPENCODE_PID", "4242"),
+            ("OPENCODE_CONFIG_DIR", "/home/sam/oc"),
+            ("XDG_CONFIG_HOME", "/home/sam/.config"),
+            ("CODEX_THREAD_ID", "t"),
+        ]);
+        let env = host.child_env(
+            ServeClient::Opencode,
+            &[("OPENCODE_DISABLE_PROJECT_CONFIG", "1".to_string())],
+        );
+        assert_eq!(
+            keys(&env),
+            [
+                "OPENCODE_CONFIG_DIR",
+                "XDG_CONFIG_HOME",
+                "CODEX_THREAD_ID",
+                "OPENCODE_DISABLE_PROJECT_CONFIG"
+            ]
+        );
+    }
+
+    #[test]
     fn adds_replace_inherited_values() {
         let host = HostEnv::new([
             ("OPENCODE_CONFIG_CONTENT", "{\"permission\":\"allow\"}"),

@@ -65,18 +65,17 @@ pub enum IdentityError {
     /// The system random source failed.
     #[error("could not generate a device key: {0}")]
     Random(String),
-    /// The file doesn't parse as a device identity. It was moved aside so the next start can create a new key.
+    /// The file doesn't parse as a device identity. It is left exactly as it is: the daemon never moves or
+    /// replaces it (4.1).
     #[error(
-        "{} could not be read ({reason}). It was moved to {}. The next start creates a new device key: sign in \
-         again with `spew mesh login`, then revoke the old device with `spew mesh devices revoke <name>`.",
-        path.display(),
-        moved_to.display()
+        "{} could not be read ({reason}). The daemon will not replace it. To start over with a new device key, \
+         move the file away yourself (the next start creates a new key), sign in again with `spew mesh login`, \
+         then revoke the old device with `spew mesh devices revoke <name>`.",
+        path.display()
     )]
     Corrupt {
         /// The device file.
         path: PathBuf,
-        /// Where it went.
-        moved_to: PathBuf,
         /// What was wrong.
         reason: String,
     },
@@ -101,8 +100,8 @@ pub enum IdentityError {
     InvalidName(String),
 }
 
-// Takes `identity/device.lock`. Every access is exclusive: even a load may move a corrupt file aside or tighten
-// its mode, and loads are rare.
+// Takes `identity/device.lock`. Every access is exclusive: even a load may tighten the file's mode, and loads are
+// rare.
 fn lock(home: &Home) -> Result<File, IdentityError> {
     ensure_private_dir(&home.identity_dir())?;
     let path = home.device_lock();
@@ -121,15 +120,16 @@ fn lock(home: &Home) -> Result<File, IdentityError> {
 }
 
 impl DeviceIdentity {
-    /// Reads the device file; `Ok(None)` when there is none yet. A file that doesn't parse is moved aside to
-    /// `device.json.corrupt-<ms>` and reported (4.1).
-    pub fn load(home: &Home, now_ms: u64) -> Result<Option<DeviceIdentity>, IdentityError> {
+    /// Reads the device file; `Ok(None)` when there is none yet. A file that doesn't parse is left in place and
+    /// reported as [`IdentityError::Corrupt`] (4.1).
+    pub fn load(home: &Home) -> Result<Option<DeviceIdentity>, IdentityError> {
         let _guard = lock(home)?;
-        read_device_file(&home.device_file(), now_ms)
+        read_device_file(&home.device_file())
     }
 
     /// Reads the device file, or creates it with a new key and `name` when there is none. Returns the identity
-    /// and whether it was created now.
+    /// and whether it was created now. A file that doesn't parse is never replaced: this fails with
+    /// [`IdentityError::Corrupt`] for as long as it is there (4.1).
     pub fn load_or_create(
         home: &Home,
         name: &str,
@@ -140,7 +140,7 @@ impl DeviceIdentity {
         }
         let _guard = lock(home)?;
         let path = home.device_file();
-        if let Some(identity) = read_device_file(&path, now_ms)? {
+        if let Some(identity) = read_device_file(&path)? {
             return Ok((identity, false));
         }
         let mut bytes = [0u8; 32];
@@ -155,19 +155,28 @@ impl DeviceIdentity {
         Ok((identity, true))
     }
 
-    /// Changes the device name and saves it (`setup --device-name`, 2).
-    pub fn rename(&mut self, home: &Home, name: &str) -> Result<(), IdentityError> {
+    /// Changes the device name in the device file and returns what the file now holds (`setup --device-name`,
+    /// 2). The file is read again under the lock and only its name changes, so a key written since this process
+    /// last read it is kept. It also repairs a file whose name is invalid. `Ok(None)` when there is no device file
+    /// yet; a file that doesn't parse fails with [`IdentityError::Corrupt`] and stays as it is.
+    pub fn rename(home: &Home, name: &str) -> Result<Option<DeviceIdentity>, IdentityError> {
         if !is_device_name(name) {
             return Err(IdentityError::InvalidName(name.to_string()));
         }
         let _guard = lock(home)?;
-        let renamed = DeviceIdentity {
-            name: name.to_string(),
-            ..self.clone()
+        let path = home.device_file();
+        let Some(file) = read_parsed(&path)? else {
+            return Ok(None);
         };
-        renamed.write(&home.device_file())?;
-        *self = renamed;
-        Ok(())
+        let renamed = DeviceIdentity {
+            secret_key: file.0,
+            name: name.to_string(),
+            created_at: file.2,
+        };
+        if file.1 != name {
+            renamed.write(&path)?;
+        }
+        Ok(Some(renamed))
     }
 
     fn write(&self, path: &Path) -> Result<(), IdentityError> {
@@ -215,7 +224,26 @@ impl DeviceIdentity {
     }
 }
 
-fn read_device_file(path: &Path, now_ms: u64) -> Result<Option<DeviceIdentity>, IdentityError> {
+fn read_device_file(path: &Path) -> Result<Option<DeviceIdentity>, IdentityError> {
+    let Some((secret_key, name, created_at)) = read_parsed(path)? else {
+        return Ok(None);
+    };
+    if !is_device_name(&name) {
+        return Err(IdentityError::BadName {
+            path: path.to_path_buf(),
+            name,
+        });
+    }
+    Ok(Some(DeviceIdentity {
+        secret_key,
+        name,
+        created_at,
+    }))
+}
+
+// Reads and parses the device file without checking the name, tightening its mode when others could read it. The
+// caller holds the lock.
+fn read_parsed(path: &Path) -> Result<Option<(SecretKey, String, u64)>, IdentityError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -228,16 +256,10 @@ fn read_device_file(path: &Path, now_ms: u64) -> Result<Option<DeviceIdentity>, 
             .into());
         }
     };
-    let file = match parse_device_file(&bytes) {
-        Ok(file) => file,
-        Err(reason) => return Err(move_aside(path, now_ms, reason)),
-    };
-    if !is_device_name(&file.1) {
-        return Err(IdentityError::BadName {
-            path: path.to_path_buf(),
-            name: file.1,
-        });
-    }
+    let file = parse_device_file(&bytes).map_err(|reason| IdentityError::Corrupt {
+        path: path.to_path_buf(),
+        reason,
+    })?;
     // A key file others could read may already be copied; tightening it is all that can be done here.
     if let Ok(Some(mode)) = mode_of(path)
         && mode & 0o077 != 0
@@ -249,11 +271,7 @@ fn read_device_file(path: &Path, now_ms: u64) -> Result<Option<DeviceIdentity>, 
             error,
         })?;
     }
-    Ok(Some(DeviceIdentity {
-        secret_key: file.0,
-        name: file.1,
-        created_at: file.2,
-    }))
+    Ok(Some(file))
 }
 
 fn parse_device_file(bytes: &[u8]) -> Result<(SecretKey, String, u64), String> {
@@ -267,23 +285,6 @@ fn parse_device_file(bytes: &[u8]) -> Result<(SecretKey, String, u64), String> {
         .map_err(|_| format!("secret_key is {} bytes, not 32", raw.len()));
     raw.fill(0);
     Ok((key?, file.name, file.created_at))
-}
-
-fn move_aside(path: &Path, now_ms: u64, reason: String) -> IdentityError {
-    let moved_to = path.with_file_name(format!("device.json.corrupt-{now_ms}"));
-    match std::fs::rename(path, &moved_to) {
-        Ok(()) => IdentityError::Corrupt {
-            path: path.to_path_buf(),
-            moved_to,
-            reason,
-        },
-        Err(error) => PathsError::Io {
-            action: "move aside the unreadable device file",
-            path: path.to_path_buf(),
-            error,
-        }
-        .into(),
-    }
 }
 
 /// The short form of an endpoint id: its first 10 hex characters (4.1).
@@ -358,7 +359,7 @@ mod tests {
     #[test]
     fn creates_once_then_loads() {
         let (_tmp, home) = home();
-        assert!(DeviceIdentity::load(&home, 1).unwrap().is_none());
+        assert!(DeviceIdentity::load(&home).unwrap().is_none());
         let (created, fresh) =
             DeviceIdentity::load_or_create(&home, "sam-mbp", 1_730_000_000_000).unwrap();
         assert!(fresh);
@@ -368,7 +369,7 @@ mod tests {
         assert!(!fresh);
         assert_eq!(again.endpoint_id(), created.endpoint_id());
         assert_eq!(again.name(), "sam-mbp");
-        let loaded = DeviceIdentity::load(&home, 1).unwrap().unwrap();
+        let loaded = DeviceIdentity::load(&home).unwrap().unwrap();
         assert_eq!(
             loaded.secret_key().to_bytes(),
             created.secret_key().to_bytes()
@@ -384,7 +385,7 @@ mod tests {
         assert_eq!(mode_of(&home.device_lock()).unwrap(), Some(0o600));
         assert_eq!(mode_of(&home.identity_dir()).unwrap(), Some(0o700));
         set_mode(&home.device_file(), 0o644).unwrap();
-        DeviceIdentity::load(&home, 1).unwrap().unwrap();
+        DeviceIdentity::load(&home).unwrap().unwrap();
         assert_eq!(mode_of(&home.device_file()).unwrap(), Some(0o600));
     }
 
@@ -421,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_is_moved_aside_with_instructions() {
+    fn corrupt_file_stays_and_keeps_failing() {
         for bad in [
             &b"not json"[..],
             br#"{"secret_key": "!!!", "name": "sam-mbp", "created_at": 1}"#,
@@ -431,17 +432,39 @@ mod tests {
             let (_tmp, home) = home();
             ensure_private_dir(&home.identity_dir()).unwrap();
             std::fs::write(home.device_file(), bad).unwrap();
-            let err = DeviceIdentity::load(&home, 77).unwrap_err();
+            let err = DeviceIdentity::load(&home).unwrap_err();
             let message = err.to_string();
             assert!(matches!(err, IdentityError::Corrupt { .. }), "{message}");
             assert!(message.contains("device.json"), "{message}");
+            assert!(message.contains("move the file away"), "{message}");
             assert!(message.contains("spew mesh login"), "{message}");
             assert!(message.contains("spew mesh devices revoke"), "{message}");
-            assert!(!home.device_file().exists());
-            let moved = home.identity_dir().join("device.json.corrupt-77");
-            assert_eq!(std::fs::read(&moved).unwrap(), bad);
-            // The next start creates a new key.
-            let (_, fresh) = DeviceIdentity::load_or_create(&home, "sam-mbp", 78).unwrap();
+            // Every later start fails the same way and never touches the file.
+            for now in [2, 3] {
+                assert!(matches!(
+                    DeviceIdentity::load_or_create(&home, "sam-mbp", now),
+                    Err(IdentityError::Corrupt { .. })
+                ));
+                assert_eq!(std::fs::read(home.device_file()).unwrap(), bad);
+            }
+            assert!(matches!(
+                DeviceIdentity::rename(&home, "sam-linux"),
+                Err(IdentityError::Corrupt { .. })
+            ));
+            assert_eq!(std::fs::read(home.device_file()).unwrap(), bad);
+            let others: Vec<_> = std::fs::read_dir(home.identity_dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|n| n != "device.json" && n != "device.lock")
+                .collect();
+            assert!(others.is_empty(), "{others:?}");
+            // Once the person moves it away, the next start creates a new key.
+            std::fs::rename(
+                home.device_file(),
+                home.identity_dir().join("device.json.old"),
+            )
+            .unwrap();
+            let (_, fresh) = DeviceIdentity::load_or_create(&home, "sam-mbp", 4).unwrap();
             assert!(fresh);
         }
     }
@@ -452,9 +475,16 @@ mod tests {
         DeviceIdentity::load_or_create(&home, "sam-mbp", 1).unwrap();
         let text = std::fs::read_to_string(home.device_file()).unwrap();
         std::fs::write(home.device_file(), text.replace("sam-mbp", "Sam's Mac")).unwrap();
-        let err = DeviceIdentity::load(&home, 1).unwrap_err();
+        let err = DeviceIdentity::load(&home).unwrap_err();
         assert!(matches!(err, IdentityError::BadName { .. }), "{err}");
+        assert!(err.to_string().contains("1 to 48"), "{err}");
         assert!(home.device_file().exists());
+        // Renaming repairs it and keeps the key.
+        let id = DeviceIdentity::rename(&home, "sam-mbp").unwrap().unwrap();
+        assert_eq!(
+            DeviceIdentity::load(&home).unwrap().unwrap().endpoint_id(),
+            id.endpoint_id()
+        );
     }
 
     #[test]
@@ -466,26 +496,38 @@ mod tests {
         json["future"] = serde_json::json!(true);
         std::fs::write(home.device_file(), serde_json::to_vec(&json).unwrap()).unwrap();
         assert_eq!(
-            DeviceIdentity::load(&home, 1)
-                .unwrap()
-                .unwrap()
-                .endpoint_id(),
+            DeviceIdentity::load(&home).unwrap().unwrap().endpoint_id(),
             identity.endpoint_id()
         );
     }
 
     #[test]
-    fn rename_keeps_the_key() {
+    fn rename_changes_only_the_name() {
         let (_tmp, home) = home();
-        let (mut identity, _) = DeviceIdentity::load_or_create(&home, "sam-mbp", 1).unwrap();
-        let id = identity.endpoint_id();
-        identity.rename(&home, "sam-linux").unwrap();
-        assert_eq!(identity.name(), "sam-linux");
-        let loaded = DeviceIdentity::load(&home, 1).unwrap().unwrap();
-        assert_eq!(loaded.name(), "sam-linux");
-        assert_eq!(loaded.endpoint_id(), id);
+        assert!(
+            DeviceIdentity::rename(&home, "sam-linux")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!home.device_file().exists());
+        let (stale, _) = DeviceIdentity::load_or_create(&home, "sam-mbp", 1).unwrap();
+        // Another process replaces the key after this one read it.
+        std::fs::remove_file(home.device_file()).unwrap();
+        let (current, _) = DeviceIdentity::load_or_create(&home, "sam-mbp", 9).unwrap();
+        assert_ne!(stale.endpoint_id(), current.endpoint_id());
+        let renamed = DeviceIdentity::rename(&home, "sam.linux").unwrap().unwrap();
+        assert_eq!(renamed.name(), "sam.linux");
+        assert_eq!(renamed.endpoint_id(), current.endpoint_id());
+        assert_eq!(renamed.created_at(), 9);
+        let loaded = DeviceIdentity::load(&home).unwrap().unwrap();
+        assert_eq!(loaded.name(), "sam.linux");
+        assert_eq!(loaded.endpoint_id(), current.endpoint_id());
+        assert_eq!(loaded.created_at(), 9);
+        let err = DeviceIdentity::rename(&home, "Bad Name").unwrap_err();
+        assert!(matches!(err, IdentityError::InvalidName(_)), "{err}");
+        assert!(err.to_string().contains("1 to 48"), "{err}");
         assert!(matches!(
-            identity.rename(&home, "Bad Name"),
+            DeviceIdentity::rename(&home, &"d".repeat(49)),
             Err(IdentityError::InvalidName(_))
         ));
         assert!(matches!(

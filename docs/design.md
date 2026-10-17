@@ -917,7 +917,8 @@ person approves each send. (Under `opencode run` an `ask` rule rejects the call,
 startup. setup writes `<config folder>/plugins/spew-mesh.js`, a short generated file with the absolute path of
 `spew` in it. For each event it runs `<spew> mesh hook opencode <event>` with a small JSON payload on stdin
 (`session_id`, `cwd`, `pid`, and for tools `tool_name`, `tool_input`, `tool_response`), reads at most one JSON
-object from stdout (`{"context": "..."}` or nothing), kills the child after 6 s, and ignores every failure.
+object from stdout (`{"context": "..."}` or nothing), kills the child after 8 s (the 8 s hook budget of 8.1),
+and ignores every failure.
 
 | OpenCode plugin hook or event | Mesh event | What the plugin does with `context` |
 |---|---|---|
@@ -1011,9 +1012,11 @@ Server name `mesh` (it must not contain "spew", so spew's own hooks never mistak
   (`claude-code`, `codex-mcp-client`, `opencode`), else `other`. Clients setup doesn't wire, such as
   Cursor or Gemini CLI, add the server by hand with `SPEW_MESH_CLIENT` set; docs/agents.md has the snippets. They
   are `inbox` sessions (7.3).
-- The server answers `initialize` and `server/discover` at once, without waiting for the daemon. It connects to
-  the daemon (starting it if needed, 6.1) and opens or attaches to its session on the first tool call, using the
-  client's identity sources (8.2 to 8.4).
+- The server answers `initialize` and `server/discover` at once, without waiting for the daemon. Right after the
+  handshake it connects to the daemon in the background (starting it if needed, 6.1) and opens its session (6.4)
+  with what it knows at spawn time (`SPEW_MESH_CLIENT`, cwd, parent pid, `CLAUDE_CODE_SESSION_ID` or
+  `OPENCODE_PID`). Identity that arrives only with a call (Codex `_meta.sessionId` or `_meta.threadId`, OpenCode
+  `_mesh_session`) is bound at the first tool call, merging sessions as 6.4 says.
 - `ask` sends `notifications/progress` every 15 s when the call carries a progress token. Clients limit long
   calls in their own ways (8.2 to 8.4); the wait limits in 7.2 fit all three.
 - With rmcp 3.5.1, each tool handler takes `RequestContext<RoleServer>`: `context.client_info()` gives
@@ -1162,7 +1165,7 @@ place = true                      # send the folder name to teammates (same rule
 
 [serve]
 timeout_seconds = 300
-max_turns = 20                    # Claude Code and OpenCode runs
+max_turns = 20                    # Claude Code runs (--max-turns)
 from = "room"                     # room | own: who may ask a responder
 max_runs_per_person_per_hour = 10
 max_runs_per_hour = 30
@@ -1267,7 +1270,9 @@ JSON. Errors: `{"error": {"code": "...", "message": "..."}}`.
 
 Each device signs in on its own, so each has its own sign-in grant. spew binds a registered device to the grant
 that registered it; later calls with that grant's tokens (refresh keeps the grant) act for that device. A grant
-holds at most one device. `logout` calls `DELETE /api/mesh/v1/devices/self`, then revokes the refresh token at the `revocation_endpoint`.
+holds at most one device: registering a different key under a grant that already holds one is refused with 409
+and `{"error": "grant-has-device"}`. Every sign-in (14.1) creates a new grant, so starting over after a lost
+identity (4.1) works. `logout` calls `DELETE /api/mesh/v1/devices/self`, then revokes the refresh token at the `revocation_endpoint`.
 
 ### 14.4 Peers
 

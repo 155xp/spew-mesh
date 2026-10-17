@@ -68,6 +68,15 @@ pub struct LinkStatus {
     pub relay: Option<String>,
     /// One entry per open link.
     pub links: Vec<LinkInfo>,
+    /// `Endpoint::bound_sockets()` (5.1).
+    pub bound_sockets: Vec<String>,
+    /// Home relay status from `Endpoint::home_relay_status()`, for `doctor` (5.1).
+    pub relays: Vec<RelayInfo>,
+    /// Why the endpoint isn't up although another device is admitted (a bind failure; it is retried).
+    pub error: Option<String>,
+    /// The last thing that kept each admitted device from linking, cleared when a link comes up: `doctor`
+    /// shows these (5.2, 5.4).
+    pub problems: Vec<LinkProblem>,
 }
 
 /// One open link.
@@ -79,6 +88,16 @@ pub struct LinkInfo {
     pub path: String,
     /// Round-trip time of the selected path, in ms.
     pub rtt_ms: Option<u64>,
+    /// The device name from the roster.
+    pub name: String,
+    /// The device's person.
+    pub person: String,
+    /// Unix ms when the link came up.
+    pub since_ms: u64,
+    /// The protocol version `hello` settled on.
+    pub version: u32,
+    /// Whether this device dialed the link.
+    pub dialed: bool,
 }
 
 /// What the link layer offers the rest of the daemon.
@@ -111,4 +130,42 @@ pub trait Links: Send + Sync + 'static {
 pub trait Inbound: Send + Sync + 'static {
     /// Handles one call from `peer` and returns the response frame.
     fn handle(&self, peer: Peer, call: Incoming) -> impl Future<Output = Response> + Send;
+}
+
+// ---- Implementation (below the boundary) ----
+
+mod config;
+mod endpoint;
+mod limits;
+mod links;
+
+pub use config::{LinkConfig, MAX_INBOUND_STREAMS, MDNS_SERVICE, Timing};
+pub use limits::{DELIVER_PER_MINUTE, DELIVER_WINDOW, PRESENCE_GAP};
+pub use links::{IrohLinks, LinkError};
+
+/// One home relay's state (5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RelayInfo {
+    /// The relay URL.
+    pub url: String,
+    /// Whether the endpoint is connected to it.
+    pub connected: bool,
+    /// The last connection error, if any.
+    pub error: Option<String>,
+    /// Why the relay refused our token, if it did (`own` mode with `relay_token`).
+    pub auth_denied: Option<String>,
+}
+
+/// What last kept a device from linking (5.2, 5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkProblem {
+    /// The device's endpoint id.
+    pub device: String,
+    /// `unreachable`, `refused` (its roster doesn't admit this device), `version` (no common protocol version)
+    /// or `protocol` (a broken `hello`).
+    pub problem: String,
+    /// One line for people.
+    pub detail: String,
+    /// Unix ms when it happened.
+    pub at_ms: u64,
 }

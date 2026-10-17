@@ -293,6 +293,11 @@ impl Gate {
         }
     }
 
+    /// Who may ask.
+    pub fn from(&self) -> ServeFrom {
+        self.from
+    }
+
     /// Takes new settings (a responder re-opened its session); runs already counted stay counted.
     pub fn update(&mut self, settings: &GateSettings) {
         self.from = settings.from;

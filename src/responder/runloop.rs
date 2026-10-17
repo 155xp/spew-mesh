@@ -244,6 +244,10 @@ where
                     id: p.id,
                     status: r.status,
                 }),
+                Some(Err(e)) if already_replied(&e) => report(&ServeEvent::Replied {
+                    id: p.id,
+                    status: SendStatus::Queued,
+                }),
                 Some(Err(e)) if lost(&e) && !stopping => {
                     pending = Some(p);
                     drop_live(&live, &reopen).await;
@@ -407,6 +411,10 @@ async fn finish(live: Option<Arc<Live>>, last: Option<Pending>, cfg: &LoopConfig
                 id: p.id,
                 status: r.status,
             },
+            Ok(Err(e)) if already_replied(&e) => ServeEvent::Replied {
+                id: p.id,
+                status: SendStatus::Queued,
+            },
             Ok(Err(e)) => ServeEvent::NotSent {
                 id: p.id,
                 error: e.to_string(),
@@ -473,6 +481,12 @@ async fn drop_live(live: &Live, reopen: &Notify) {
 // Errors that mean the connection is gone, so the same call can go again on the next one.
 fn lost(e: &ClientError) -> bool {
     matches!(e, ClientError::Disconnected | ClientError::Io(_))
+}
+
+// The daemon took an earlier send of this reply before the connection dropped: `message.reply` refuses a
+// responder's second answer to one ask with a conflict. Where it is now is unknown here, hence `Queued`.
+fn already_replied(e: &ClientError) -> bool {
+    matches!(e, ClientError::Rpc(e) if e.reason == Reason::Conflict)
 }
 
 /// `<home>/run/stopped`: while it exists, a reconnecting responder doesn't start a daemon (6.1). `daemon stop`
@@ -623,6 +637,18 @@ mod tests {
         );
         assert!(!reconnect_options(&cfg, true).start);
         assert!(!reconnect_options(&cfg, true).upgrade);
+    }
+
+    #[test]
+    fn a_resent_reply_the_daemon_already_has_counts_as_replied() {
+        use crate::control::protocol::RpcError;
+        assert!(already_replied(&ClientError::Rpc(RpcError::conflict(
+            "01J is already answered"
+        ))));
+        assert!(!already_replied(&ClientError::Rpc(RpcError::not_found(
+            "gone"
+        ))));
+        assert!(!already_replied(&ClientError::Disconnected));
     }
 
     #[test]

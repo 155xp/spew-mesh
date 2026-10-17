@@ -395,6 +395,33 @@ async fn claude_forgets_a_session_it_no_longer_has() {
 }
 
 #[tokio::test]
+async fn a_failed_follow_up_still_marks_the_conversation_used() {
+    let fake = Fake::new("claude");
+    fake.set("stdout", 1, &claude_ok("one", 0.0));
+    fake.set("stderr", 2, "Error: something broke\n");
+    fake.set("exit", 2, "1");
+    let clock = std::sync::Arc::new(ManualClock::new(1_000));
+    let mut r = Responder::start(
+        fake.config(ServeClient::Claude),
+        &fake.host(),
+        SystemRunner,
+        MemoryConversations::new(),
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    let q = question(Q1, C1, "q");
+    r.answer(&q).await.unwrap();
+    let key = ConversationKey::of(ServeClient::Claude, &q);
+    assert_eq!(r.conversations().used_at(&key), Some(1_000));
+    // The store's sweep goes by this time (11.1).
+    clock.advance(Duration::from_secs(60));
+    assert!(r.answer(&question(Q2, C1, "q2")).await.is_err());
+    assert_eq!(r.conversations().used_at(&key), Some(61_000));
+    assert!(r.conversations().get(&key).unwrap().is_some());
+}
+
+#[tokio::test]
 async fn timeout_kills_the_run_and_its_children() {
     let fake = Fake::new("claude");
     fake.set("sleep", 1, "");

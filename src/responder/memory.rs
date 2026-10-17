@@ -146,6 +146,11 @@ impl MemoryConversations {
         len - self.map.len()
     }
 
+    /// When a conversation was last used, ms.
+    pub fn used_at(&self, key: &ConversationKey) -> Option<u64> {
+        self.map.get(key).map(|(_, at)| *at)
+    }
+
     /// Number of conversations held.
     pub fn len(&self) -> usize {
         self.map.len()

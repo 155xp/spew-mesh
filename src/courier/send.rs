@@ -675,6 +675,30 @@ impl<L: Links> Courier<L> {
                     ))
                 })?;
             let o = &original.message;
+            // A responder resending after a dropped connection would otherwise answer twice, the second time as
+            // a tell; its first reply already went out.
+            if sender.kind == SessionKind::Responder && p.wait_seconds.is_none() {
+                let answered = match o.kind {
+                    MessageKind::Ask => o.state == MessageState::Answered,
+                    // A tell has no answered state: look for this session's reply to it.
+                    MessageKind::Tell => {
+                        let ids = c.reg.ids_of(&sender.id);
+                        c.store
+                            .conversation(&o.conversation)
+                            .map_err(store_err)?
+                            .iter()
+                            .any(|m| {
+                                m.message.in_reply_to.as_deref() == Some(o.id.as_str())
+                                    && m.message.from.device == self.cfg.device.hex
+                                    && ids.contains(&m.message.from.session)
+                            })
+                    }
+                    _ => false,
+                };
+                if answered {
+                    return Err(RpcError::conflict(format!("{} is already answered", p.id)));
+                }
+            }
             let answers_ask = o.kind == MessageKind::Ask && o.state != MessageState::Answered;
             let follow_up = p.wait_seconds.is_some() && o.kind != MessageKind::Ask;
             let kind = if follow_up {

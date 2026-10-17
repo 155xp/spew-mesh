@@ -755,10 +755,17 @@ impl<L: Links> Courier<L> {
 
     fn snapshot_for(&self, c: &Core, device: &EndpointId, seq: u64) -> Option<PresenceSnapshot> {
         let admitted = c.roster.admission().get(device)?;
+        // A responder that serves only its owner is hidden from teammates as well as refusing them (9).
+        let own_only = |s: &SessionRecord| {
+            s.kind == SessionKind::Responder
+                && c.gates.get(&s.id).map_or(self.cfg.serve.from, |g| g.from())
+                    == crate::settings::ServeFrom::Own
+        };
         let locals: Vec<_> = warn_store(c.store.live_sessions(), "could not list live sessions")
             .unwrap_or_default()
             .iter()
             .filter(|s| s.kind != SessionKind::Terminal)
+            .filter(|s| admitted.own || !own_only(s))
             .map(|s| {
                 let cards = warn_store(c.store.cards(&s.id), "could not read a session's cards")
                     .unwrap_or_default();

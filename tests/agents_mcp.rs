@@ -1,6 +1,6 @@
 //! `spew mesh mcp-server` driven over its stdio against a real daemon on a temp home (8.6): both handshakes, the
 //! tool list, every tool, progress on a waiting ask, the Codex `_meta` binding, OpenCode's `_mesh_session`
-//! argument, and reconnecting when the daemon restarts.
+//! argument, reconnecting after a crash, a stop that holds until a tool call, and closing sessions on exit.
 
 mod agents_support;
 
@@ -197,11 +197,11 @@ async fn every_tool_works_and_a_waiting_ask_reports_progress() {
     let again = mcp.call("messages", json!({}));
     assert_eq!(text(&again), "No messages from other agents.");
 
-    // ask with a progress token: the answer comes after more than 15 s, with progress on the way (8.6).
+    // ask with a progress token: the answer comes only after a progress notification (8.6).
     let asked_at = Instant::now();
     let call = mcp.start_call(
         "ask",
-        json!({"to": "gemini-cli", "text": "which port does the api use?", "wait_seconds": 40}),
+        json!({"to": "gemini-cli", "text": "which port does the api use?", "wait_seconds": 120}),
         Some(json!({"progressToken": "ask-1"})),
     );
     let ask = loop {
@@ -216,7 +216,8 @@ async fn every_tool_works_and_a_waiting_ask_reports_progress() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(ask.body, "which port does the api use?");
-    tokio::time::sleep(Duration::from_secs(16).saturating_sub(asked_at.elapsed())).await;
+    let first = mcp.wait_for_note("notifications/progress", Duration::from_secs(60));
+    assert_eq!(first["params"]["progressToken"], "ask-1");
     control
         .reply(&ReplyParams {
             token: token.clone(),
@@ -243,7 +244,11 @@ async fn every_tool_works_and_a_waiting_ask_reports_progress() {
         "no progress notifications: {:?}",
         mcp.notes
     );
-    assert_eq!(progress[0]["params"]["progressToken"], "ask-1");
+    assert!(
+        progress
+            .iter()
+            .all(|p| p["params"]["progressToken"] == "ask-1")
+    );
     assert!(progress[0]["params"]["progress"].as_f64().unwrap() >= 15.0);
 
     // reply: answer an ask the other agent sent.
@@ -456,30 +461,76 @@ async fn opencode_names_sessions_with_an_argument_the_schemas_leave_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_server_reconnects_and_reopens_when_the_daemon_restarts() {
+async fn the_server_reconnects_and_reopens_when_the_daemon_crashes() {
     let mesh = Mesh::new();
     let mut mcp = mesh.mcp("api", &[("SPEW_MESH_CLIENT", "claude")]);
     mcp.initialize("2025-11-25", "claude-code");
     let before = mcp.call("who", json!({}));
     assert!(text(&before).contains("/claude-api."), "{}", text(&before));
 
-    let stopped = mesh.run(&["daemon", "stop"]);
-    assert!(stopped.status.success());
-    // The server notices, starts a new daemon and re-opens its session under the same name.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let who = mcp.call("who", json!({}));
-        if !is_error(&who) {
-            assert!(text(&who).contains("/claude-api."), "{}", text(&who));
-            break;
-        }
-        assert!(Instant::now() < deadline, "never reconnected: {who}");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    // A crash leaves no run/stopped, so the server starts a new daemon on its own, with no tool call, and
+    // re-opens its session under the same name (6.1).
+    mesh.crash_daemon().await;
+    assert!(!mesh.stopped_file().exists());
+    mesh.wait_for_sessions("the session after the restart", |rows| {
+        rows.iter().any(|r| r.name == "claude-api")
+    })
+    .await;
+    let who = mcp.call("who", json!({}));
+    assert!(!is_error(&who), "{who}");
+    assert!(text(&who).contains("/claude-api."), "{}", text(&who));
     let rows = mesh.sessions().await;
     assert_eq!(
         rows.iter().filter(|r| r.client == "claude").count(),
         1,
         "{rows:#?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_daemon_stays_down_until_a_tool_call() {
+    let mesh = Mesh::new();
+    let mut mcp = mesh.mcp("api", &[("SPEW_MESH_CLIENT", "claude")]);
+    mcp.initialize("2025-11-25", "claude-code");
+    assert!(!is_error(&mcp.call("who", json!({}))));
+
+    // `daemon stop` writes run/stopped before stopping (6.1); the test writes it itself so it doesn't depend on
+    // which card wires that into the CLI.
+    std::fs::write(mesh.stopped_file(), "").unwrap();
+    let stopped = mesh.run(&["daemon", "stop"]);
+    assert!(stopped.status.success());
+    // Several reconnect attempts (0.5 s, 1 s, 2 s with jitter) go by without starting it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!mesh.daemon_running().await, "a reconnect undid the stop");
+
+    // A tool call is agent activity: it starts the daemon whatever run/stopped says.
+    let who = mcp.call("who", json!({}));
+    assert!(!is_error(&who), "{who}");
+    assert!(text(&who).contains("/claude-api."), "{}", text(&who));
+    assert!(mesh.daemon_running().await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_without_a_process_close_when_the_client_goes_away() {
+    let mesh = Mesh::new();
+    mesh.start_daemon();
+    // A client the daemon can't watch by process, and a Claude Code session it can (this test is its parent).
+    let mut ide = mesh.mcp("web", &[]);
+    ide.initialize("2025-11-25", "some-ide");
+    let mut claude = mesh.mcp("api", &[("SPEW_MESH_CLIENT", "claude")]);
+    claude.initialize("2025-11-25", "claude-code");
+    mesh.wait_for_sessions("both sessions", |rows| {
+        rows.iter().any(|r| r.client == "other") && rows.iter().any(|r| r.client == "claude")
+    })
+    .await;
+
+    let begun = Instant::now();
+    assert!(ide.close(Duration::from_secs(5)).success());
+    assert!(claude.close(Duration::from_secs(5)).success());
+    // Well inside rule 3's 10 s grace: only an explicit session.close ends it this soon.
+    let rows = mesh.sessions().await;
+    assert!(begun.elapsed() < Duration::from_secs(8));
+    assert!(!rows.iter().any(|r| r.client == "other"), "{rows:#?}");
+    // Claude Code's session belongs to its process (rule 2), which is still running.
+    assert!(rows.iter().any(|r| r.client == "claude"), "{rows:#?}");
 }

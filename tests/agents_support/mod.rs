@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,34 @@ impl Mesh {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Whether a daemon answers for this home, without starting one.
+    pub async fn daemon_running(&self) -> bool {
+        let home = Home::at(self.home()).unwrap();
+        Client::connect(&home, &ConnectOptions::existing())
+            .await
+            .is_ok()
+    }
+
+    /// Kills the daemon the way a crash would: no clean shutdown and no `run/stopped`.
+    pub async fn crash_daemon(&self) {
+        let pid = self.control().await.status().await.unwrap().pid;
+        let pid = i32::try_from(pid).unwrap();
+        // SAFETY: kill(2) takes plain integers and touches no memory of ours; the pid is the test daemon's.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert_eq!(r, 0, "could not kill the daemon");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.daemon_running().await {
+            assert!(Instant::now() < deadline, "the daemon outlived SIGKILL");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// `<home>/run/stopped`, which `daemon stop` writes (6.1).
+    pub fn stopped_file(&self) -> PathBuf {
+        self.home().join("run").join("stopped")
     }
 
     /// A control client of the running daemon.
@@ -181,7 +209,7 @@ pub async fn open_session(client: &Client, name_client: &str, cwd: &str) -> (Str
 /// One `spew mesh mcp-server` process spoken to over stdio.
 pub struct Mcp {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<Value>,
     /// Notifications that arrived while waiting for responses.
     pub notes: Vec<Value>,
@@ -212,7 +240,7 @@ impl Mcp {
         });
         Mcp {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines,
             notes: Vec::new(),
             next_id: 1,
@@ -222,8 +250,25 @@ impl Mcp {
     pub fn send(&mut self, message: &Value) {
         let mut line = message.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin is still open");
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Closes stdin, as a client that goes away does, and waits up to `limit` for the server to exit.
+    pub fn close(&mut self, limit: Duration) -> ExitStatus {
+        drop(self.stdin.take());
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server didn't exit within {limit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Sends a request and waits up to `limit` for its response, keeping notifications that come first.
@@ -238,8 +283,12 @@ impl Mcp {
         self.request_within(method, params, Duration::from_secs(30))
     }
 
-    /// Waits for the response with `id`.
+    /// Waits for the response with `id`, which may have arrived already while waiting for a notification.
     pub fn response(&mut self, id: &Value, limit: Duration) -> Value {
+        let is_it = |m: &Value| m.get("id") == Some(id) && m.get("method").is_none();
+        if let Some(i) = self.notes.iter().position(is_it) {
+            return self.notes.remove(i);
+        }
         let deadline = Instant::now() + limit;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -251,6 +300,25 @@ impl Mcp {
                 return msg;
             }
             self.notes.push(msg);
+        }
+    }
+
+    /// Waits up to `limit` for a notification with `method`, keeping everything that arrives in `notes`.
+    pub fn wait_for_note(&mut self, method: &str, limit: Duration) -> Value {
+        if let Some(n) = self.notes.iter().find(|n| n["method"] == method) {
+            return n.clone();
+        }
+        let deadline = Instant::now() + limit;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let msg = self
+                .lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no {method} within {limit:?}: {:?}", self.notes));
+            self.notes.push(msg.clone());
+            if msg["method"] == method {
+                return msg;
+            }
         }
     }
 

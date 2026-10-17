@@ -19,6 +19,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::Value;
 
 use self::link::{Binding, DaemonLink, Failure, SpawnFacts, valid_client_session};
+use self::tools::{MAX_WAIT, capped_wait};
 use crate::control::client::ConnectOptions;
 use crate::control::protocol::{AskParams, DirectoryQuery, FetchParams, ReplyParams, TellParams};
 use crate::paths::Home;
@@ -32,12 +33,12 @@ pub const MESH_SESSION_ARG: &str = "_mesh_session";
 /// How often a waiting call reports progress when the client asked for it (8.6).
 pub const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 
-/// The longest wait any mesh call takes (7.2).
-const MAX_WAIT: u64 = 900;
 /// `ask`'s default wait (7.2).
 const DEFAULT_ASK_WAIT: u64 = 100;
 /// How much longer than its own wait a call gives the daemon before giving up on it.
 const DAEMON_MARGIN: Duration = Duration::from_secs(30);
+/// How long each session.close may take when the server exits.
+const CLOSE_LIMIT: Duration = Duration::from_secs(1);
 
 /// The instructions sent to the client with the handshake (8.6).
 pub const INSTRUCTIONS: &str = "spew mesh links this session with other agent sessions: your person's own, and \
@@ -108,16 +109,15 @@ impl MeshServer {
         match name {
             tools::name::WHO => {
                 let a: tools::WhoArgs = tools::parse(args)?;
-                let dir = link
-                    .with_session(&binding, |client, token| {
-                        let q = DirectoryQuery {
-                            token: Some(token),
-                            filter: a.filter.clone(),
-                            include_offline: a.offline.unwrap_or(false),
-                        };
-                        async move { client.directory(&q).await }
-                    })
-                    .await?;
+                let call = link.with_session(&binding, |client, token| {
+                    let q = DirectoryQuery {
+                        token: Some(token),
+                        filter: a.filter.clone(),
+                        include_offline: a.offline.unwrap_or(false),
+                    };
+                    async move { client.directory(&q).await }
+                });
+                let dir = self.waiting(call, 0, context).await?;
                 Ok(tools::who(&dir, now_ms()))
             }
             tools::name::ASK => {
@@ -129,7 +129,7 @@ impl MeshServer {
                         to: a.to.clone(),
                         text: a.text.clone(),
                         card: a.card.clone(),
-                        wait_seconds: a.wait_seconds,
+                        wait_seconds: capped_wait(a.wait_seconds),
                     };
                     async move { client.ask(&p).await }
                 });
@@ -159,7 +159,7 @@ impl MeshServer {
                         token,
                         id: a.id.clone(),
                         text: a.text.clone(),
-                        wait_seconds: a.wait_seconds,
+                        wait_seconds: capped_wait(a.wait_seconds),
                     };
                     async move { client.reply(&p).await }
                 });
@@ -172,7 +172,7 @@ impl MeshServer {
                 let call = link.with_session(&binding, |client, token| {
                     let p = FetchParams {
                         token,
-                        wait_seconds: a.wait_seconds,
+                        wait_seconds: capped_wait(a.wait_seconds),
                         keep_unread: false,
                     };
                     async move { client.fetch(&p).await }
@@ -187,8 +187,9 @@ impl MeshServer {
         }
     }
 
-    // Runs a daemon call that may wait up to `wait_secs`: bounded by that wait plus a margin, ended early when
-    // the client cancels, and reporting progress every 15 s when the call carries a progress token (8.6).
+    // Runs a daemon call that may wait up to `wait_secs`: bounded by that wait plus a margin (which also covers
+    // connecting, binding and re-opening the session), ended early when the client cancels, and reporting
+    // progress every 15 s when the call carries a progress token (8.6).
     async fn waiting<T>(
         &self,
         call: impl Future<Output = Result<T, Failure>>,
@@ -342,7 +343,9 @@ pub async fn serve(home: Home, facts: SpawnFacts) -> anyhow::Result<()> {
     // started here, right after the handshake.
     let name = running.peer_info().map(|i| i.client_info.name.clone());
     link.start(name.as_deref());
-    running.waiting().await?;
+    let ended = running.waiting().await;
+    link.close_all(CLOSE_LIMIT).await;
+    ended?;
     Ok(())
 }
 

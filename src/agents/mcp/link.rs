@@ -1,7 +1,8 @@
 //! The MCP server's link to the daemon (6.1, 6.4, 8.6): it connects in the background once the handshake is
 //! answered, opens the server's session with what is known at spawn time, binds identity that only arrives with
 //! a tool call (Codex `_meta.sessionId`, OpenCode `_mesh_session`), and reconnects and re-opens its sessions
-//! when the daemon restarts.
+//! when the daemon restarts. A reconnect starts a missing daemon only while `run/stopped` is absent; a tool call
+//! may start one whatever it says (6.1).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 
 use crate::address::{RESERVED_NAME, is_client};
 use crate::control::client::{Client, ClientError, ConnectOptions, reconnect_delay};
@@ -21,6 +22,14 @@ use crate::wire::SessionKind;
 /// How long a tool call waits for the daemon connection before it reports the problem: the 8 s a client waits
 /// for a daemon to start (6.1), and a little more for the session to open.
 pub const CALL_CONNECT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long one session step (open, bind, probe) may take: the daemon answers these at once, so a longer wait
+/// means it is stuck.
+const STEP_LIMIT: Duration = Duration::from_secs(10);
+
+/// `<home>/run/stopped`, which `daemon stop` and `uninstall` write and a daemon removes once it holds the lock
+/// (6.1). The CLI and the daemon own the file; the MCP server only looks for it.
+const STOPPED_FILE: &str = "stopped";
 
 /// The longest client session id the daemon takes.
 const MAX_CLIENT_SESSION: usize = 200;
@@ -189,6 +198,10 @@ pub struct DaemonLink {
     client_name: OnceLock<Option<String>>,
     state: watch::Sender<State>,
     sessions: Mutex<Sessions>,
+    // Set by a tool call that found no daemon: the next attempt may start one even after a stop (6.1).
+    start_wanted: AtomicBool,
+    // Cuts the backoff short for that attempt.
+    wake: Notify,
 }
 
 impl DaemonLink {
@@ -204,6 +217,8 @@ impl DaemonLink {
             client_name: OnceLock::new(),
             state,
             sessions: Mutex::new(Sessions::default()),
+            start_wanted: AtomicBool::new(false),
+            wake: Notify::new(),
         })
     }
 
@@ -272,11 +287,16 @@ impl DaemonLink {
     // Connects, opens every session, waits for the connection to drop, and starts over with backoff (6.1).
     async fn keep_connected(self: Arc<Self>) {
         let mut attempt = 0u32;
+        let mut first = true;
         loop {
-            match Client::connect(&self.home, &self.opts).await {
+            let opts = self.attempt_options(first);
+            first = false;
+            match Client::connect(&self.home, &opts).await {
                 Ok(client) => match self.open_all(&client).await {
                     Ok(generation) => {
                         attempt = 0;
+                        // A call that asked for a start while this attempt ran has its connection now.
+                        self.start_wanted.store(false, Ordering::Release);
                         self.state
                             .send_replace(State::Up(client.clone(), generation));
                         client.closed().await;
@@ -291,6 +311,14 @@ impl DaemonLink {
                         });
                     }
                 },
+                Err(ClientError::NotRunning) => {
+                    // Only a reconnect after a stop gets here, so this is expected and logged quietly.
+                    tracing::info!("the daemon is stopped; waiting for something to start it");
+                    self.state.send_replace(State::Failed {
+                        reason: "no daemon is running".into(),
+                        retrying: true,
+                    });
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not reach the spew mesh daemon");
                     self.state.send_replace(State::Failed {
@@ -299,8 +327,36 @@ impl DaemonLink {
                     });
                 }
             }
-            tokio::time::sleep(reconnect_delay(attempt)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(reconnect_delay(attempt)) => {}
+                _ = self.wake.notified() => {}
+            }
             attempt = attempt.saturating_add(1);
+        }
+    }
+
+    // The options for one connection attempt (6.1). The first attempt, and one a tool call asked for, may start
+    // a missing daemon; a reconnect starts one only while `run/stopped` is absent, so a stopped daemon stays
+    // stopped and a crashed one comes back.
+    fn attempt_options(&self, first: bool) -> ConnectOptions {
+        let asked = self.start_wanted.swap(false, Ordering::AcqRel);
+        if first || asked || !self.stopped() {
+            return self.opts.clone();
+        }
+        // No replacing an older daemon either: shutting it down without starting another would leave none.
+        ConnectOptions {
+            start: false,
+            upgrade: false,
+            ..self.opts.clone()
+        }
+    }
+
+    // Whether `run/stopped` is there. Anything but a clear "not found" counts as there, so a reconnect never
+    // undoes a stop it can't see.
+    fn stopped(&self) -> bool {
+        match std::fs::symlink_metadata(self.home.run_dir().join(STOPPED_FILE)) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
         }
     }
 
@@ -311,7 +367,7 @@ impl DaemonLink {
             .main
             .as_mut()
             .ok_or_else(|| Failure::new("the session isn't set up yet"))?;
-        let opened = client.session_open(&main.open).await?;
+        let opened = step("open the session", client.session_open(&main.open)).await?;
         main.token = Some(opened.token);
         // The hooks keep a Claude Code session's id current through a clear or resume (8.2); re-opening by the
         // process alone keeps a reconnect from binding the id this server saw at spawn time again.
@@ -320,10 +376,10 @@ impl DaemonLink {
         }
         let mut gone = Vec::new();
         for (id, slot) in s.extra.iter_mut() {
-            match client.session_open(&slot.open).await {
+            match step("open the session", client.session_open(&slot.open)).await {
                 Ok(opened) => slot.token = Some(opened.token),
                 Err(e) => {
-                    tracing::info!(session = %id, error = %e, "dropped a session that would not re-open");
+                    tracing::info!(session = %id, error = %e.message, "dropped a session that would not re-open");
                     gone.push(id.clone());
                 }
             }
@@ -335,29 +391,52 @@ impl DaemonLink {
         Ok(s.generation)
     }
 
-    // The connection, waiting up to `limit` for one.
+    // The connection, waiting up to `limit` for one. A failed attempt that will be retried doesn't end the wait:
+    // the call asks for the next attempt at once, allowed to start a daemon (6.1), and waits for it.
     async fn connection(&self, limit: Duration) -> Result<(Client, u64), Failure> {
         let mut rx = self.state.subscribe();
         let deadline = tokio::time::Instant::now() + limit;
+        let mut asked = false;
+        let mut last_reason = None;
         loop {
             let state = rx.borrow_and_update().clone();
             match state {
                 State::Up(client, generation) if !client.is_closed() => {
                     return Ok((client, generation));
                 }
-                State::Failed { reason, .. } => {
+                State::Failed {
+                    reason,
+                    retrying: false,
+                } => {
                     return Err(Failure::new(format!(
                         "spew mesh can't reach its daemon: {reason}"
                     )));
+                }
+                State::Failed {
+                    reason,
+                    retrying: true,
+                } => {
+                    // Once per call, so a daemon that can't start isn't spawned in a tight loop.
+                    if !asked {
+                        asked = true;
+                        self.start_wanted.store(true, Ordering::Release);
+                        self.wake.notify_one();
+                    }
+                    last_reason = Some(reason);
                 }
                 _ => {}
             }
             match tokio::time::timeout_at(deadline, rx.changed()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => {
-                    return Err(Failure::new(
-                        "the spew mesh daemon didn't answer in time; `spew mesh doctor` shows what is wrong",
-                    ));
+                    return Err(Failure::new(match last_reason {
+                        Some(reason) => format!(
+                            "spew mesh can't reach its daemon: {reason}; `spew mesh doctor` shows what is wrong"
+                        ),
+                        None => "the spew mesh daemon didn't answer in time; `spew mesh doctor` shows what \
+                                 is wrong"
+                            .to_string(),
+                    }));
                 }
             }
         }
@@ -401,13 +480,12 @@ impl DaemonLink {
                 // The first call that names the session binds the server's own session to it; the daemon merges
                 // it with a session the hooks opened for the same id (6.4).
                 let token = main_token(s)?;
-                client
-                    .session_update(&SessionUpdate {
-                        token: token.clone(),
-                        client_session: Some(id.clone()),
-                        ..SessionUpdate::default()
-                    })
-                    .await?;
+                let update = SessionUpdate {
+                    token: token.clone(),
+                    client_session: Some(id.clone()),
+                    ..SessionUpdate::default()
+                };
+                step("bind the session", client.session_update(&update)).await?;
                 if let Some(main) = s.main.as_mut() {
                     main.open.client_session = Some(id);
                 }
@@ -447,7 +525,7 @@ impl DaemonLink {
             None => return Err(Failure::new("the mesh session isn't open yet")),
         };
         open.client_session = Some(id.clone());
-        let opened = client.session_open(&open).await?;
+        let opened = step("open the session", client.session_open(&open)).await?;
         s.extra.insert(
             id,
             Slot {
@@ -466,7 +544,7 @@ impl DaemonLink {
             SlotKey::Opencode(id) => s.extra.get_mut(id),
         }
         .ok_or_else(|| Failure::new("the mesh session is gone"))?;
-        let opened = client.session_open(&slot.open).await?;
+        let opened = step("re-open the session", client.session_open(&slot.open)).await?;
         slot.token = Some(opened.token.clone());
         Ok(opened.token)
     }
@@ -491,6 +569,36 @@ impl DaemonLink {
         }
     }
 
+    /// Closes this server's sessions that have no client process for the daemon to watch, each within `limit`,
+    /// best effort: called when the client goes away, so they end now instead of 10 s later (rule 3 of 6.4).
+    /// A session tied to a process (Claude Code, OpenCode) stays: hooks share it, rule 2 ends it with the
+    /// process, and a client that only restarts its MCP server keeps its session and unread messages.
+    pub async fn close_all(&self, limit: Duration) {
+        let state = self.state.borrow().clone();
+        let State::Up(client, _) = state else { return };
+        if client.is_closed() {
+            return;
+        }
+        let Ok(s) = tokio::time::timeout(limit, self.sessions.lock()).await else {
+            return;
+        };
+        let tokens: Vec<String> = s
+            .main
+            .iter()
+            .chain(s.extra.values())
+            .filter(|slot| slot.open.client_pid.is_none())
+            .filter_map(|slot| slot.token.clone())
+            .collect();
+        drop(s);
+        for token in tokens {
+            match tokio::time::timeout(limit, client.session_close(&token)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(error = %e, "could not close a session on exit"),
+                Err(_) => tracing::debug!("closing a session on exit took too long"),
+            }
+        }
+    }
+
     /// Whether the link has given up for good (a bad `SPEW_MESH_CLIENT`), with the reason.
     pub fn fatal(&self) -> Option<String> {
         match &*self.state.borrow() {
@@ -503,16 +611,31 @@ impl DaemonLink {
     }
 }
 
-// Whether the daemon no longer knows `token`: an empty update touches nothing else.
+// Whether the daemon no longer knows `token`: an empty update touches nothing else. No answer in time counts
+// as alive, so the call's own error stands.
 async fn token_is_dead(client: &Client, token: &str) -> bool {
     let probe = SessionUpdate {
         token: token.to_string(),
         ..SessionUpdate::default()
     };
     matches!(
-        client.session_update(&probe).await,
-        Err(ClientError::Rpc(e)) if e.reason == Reason::NotFound
+        tokio::time::timeout(STEP_LIMIT, client.session_update(&probe)).await,
+        Ok(Err(ClientError::Rpc(e))) if e.reason == Reason::NotFound
     )
+}
+
+// One session step, bounded by STEP_LIMIT; `what` finishes "the daemon didn't ... in time".
+async fn step<T>(
+    what: &str,
+    call: impl Future<Output = Result<T, ClientError>>,
+) -> Result<T, Failure> {
+    match tokio::time::timeout(STEP_LIMIT, call).await {
+        Ok(r) => r.map_err(Failure::from),
+        Err(_) => Err(Failure {
+            message: format!("the spew mesh daemon didn't {what} in time"),
+            reason: Some("timeout"),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -628,8 +751,8 @@ mod tests {
         assert!(err.message.contains("SPEW_MESH_CLIENT"), "{}", err.message);
     }
 
-    #[tokio::test]
-    async fn no_daemon_is_reported_without_hanging() {
+    #[tokio::test(start_paused = true)]
+    async fn no_daemon_is_reported_when_the_call_wait_runs_out() {
         let tmp = tempfile::tempdir().unwrap();
         let facts = SpawnFacts {
             cwd: "/w".into(),
@@ -642,10 +765,39 @@ mod tests {
         );
         link.start(None);
         assert_eq!(link.client(), Some("other"));
+        let begun = tokio::time::Instant::now();
         let err = link
             .with_session(&Binding::None, |_, _| async { Ok::<_, ClientError>(()) })
             .await
             .unwrap_err();
         assert!(err.message.contains("can't reach"), "{}", err.message);
+        assert!(
+            err.message.contains("no daemon is running"),
+            "{}",
+            err.message
+        );
+        // A failed attempt that will be retried doesn't fail the call before its wait is over.
+        assert!(begun.elapsed() >= CALL_CONNECT_WAIT);
+    }
+
+    #[test]
+    fn reconnects_start_a_daemon_only_while_it_was_not_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("mesh")).unwrap();
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let link = DaemonLink::new(home.clone(), SpawnFacts::default(), ConnectOptions::cli());
+        let starts = |o: &ConnectOptions| (o.start, o.upgrade);
+        assert_eq!(starts(&link.attempt_options(true)), (true, true));
+        assert_eq!(starts(&link.attempt_options(false)), (true, true));
+        std::fs::write(home.run_dir().join(STOPPED_FILE), "").unwrap();
+        // The first connect is the agent starting: it may start the daemon.
+        assert_eq!(starts(&link.attempt_options(true)), (true, true));
+        assert_eq!(starts(&link.attempt_options(false)), (false, false));
+        // A tool call asked: that one attempt may start it, once.
+        link.start_wanted.store(true, Ordering::Release);
+        assert_eq!(starts(&link.attempt_options(false)), (true, true));
+        assert_eq!(starts(&link.attempt_options(false)), (false, false));
+        std::fs::remove_file(home.run_dir().join(STOPPED_FILE)).unwrap();
+        assert_eq!(starts(&link.attempt_options(false)), (true, true));
     }
 }

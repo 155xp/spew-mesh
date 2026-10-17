@@ -281,6 +281,17 @@ spew mesh: 2 messages waiting; the messages tool shows them.
 `ask` waits up to 900 seconds. If your client stops tool calls sooner, raise its timeout or pass a shorter
 `wait_seconds`; the answer still arrives later through `messages`.
 
+## The daemon
+
+Agents start the daemon when they need it. A `start` or `prompt` hook, or a mesh tool call, starts a daemon that
+isn't running. Hooks never wait for it: a hook that starts the daemon prints nothing that time, and the next one
+works as usual. An MCP server answers the client's handshake at once and connects in the background.
+
+After `spew mesh daemon stop`, the daemon stays stopped while agents sit idle. MCP servers and `spew mesh serve`
+that lose it keep reconnecting, but they don't start it. The next prompt, a new session or a mesh tool call starts
+it again. A daemon that crashed is started again by the MCP servers and responders still running.
+[network.md](network.md#starting-and-stopping-the-daemon) has the details.
+
 ## Uninstall
 
 ```sh

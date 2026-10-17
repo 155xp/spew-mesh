@@ -53,7 +53,10 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      # Runs the unit tests and every file in tests/, including net.rs, e2e.rs and serve.rs. Those start real
+      # daemons as child processes, linked over iroh in `local` mode on 127.0.0.1 with mDNS off, and fake agents
+      # from temp folders, so they need no network beyond the loopback address.
+      - run: cargo test --locked --no-fail-fast
 
   msrv:
     name: cargo check (Rust 1.91)

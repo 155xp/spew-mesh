@@ -155,7 +155,8 @@ people = ["sam", "maya", "lee"]
   device can belong to only one person, and one person's device names must differ.
 - `relay` and `addrs` are optional dialing hints: the device's home relay, and IP addresses with ports where it can
   be reached. With them, a device can be dialed without any address lookup. A fixed `port` in that device's
-  settings makes `addrs` stable.
+  settings makes `addrs` stable. When a device's hints change, a dial still trying the old ones is dropped and the
+  device is dialed again at the new ones right away.
 - `[[room]]`: `name` uses the person-name characters. `people` lists people from the file, at least one.
 - Your own devices form your private room automatically; you don't list them in a room.
 
@@ -227,8 +228,9 @@ are `true`. Your own devices always see everything.
 
 ## Checking it
 
-`spew mesh doctor` prints the version, paths, the device, the roster and network state, links, and the agents,
-then a `fix:` line for each problem. `spew mesh daemon status` prints the daemon part:
+`spew mesh doctor` prints the version, the home, settings and identity paths, the daemon part below, and the
+agents. Each problem gets a `fix:` line, and doctor exits with status 1 when there is one; otherwise it ends with
+`Nothing to fix.` `spew mesh daemon status` prints only the daemon part:
 
 ```console
 $ spew mesh daemon status
@@ -240,20 +242,36 @@ endpoint id: 1995f53bd11964eb3557122683c5475b01ca4c8f0289045ca730b58a6a807695
 roster: file, roster file /Users/sam/.spew/mesh/roster.toml, version file-4b9f8dd
 rooms: web
 admitted devices: 3
-network: own, relay https://relay.example.com/
-  link 33a9c8693d: direct, 4 ms
+network: own, endpoint 1995f53bd1
+  home relay https://relay.example.com/: connected
 bound: 0.0.0.0:51820, [::]:51820
-sessions: 2, unread: 0, queued: 0, online devices: 1
+  link sam@sam-linux, offline, last seen 2d ago
+  link maya@maya-mbp, online, direct, 4 ms
+  link lee@lee-linux, offline
+  note: lee@lee-linux 1m ago: no link within 15 s
+sessions: 2, unread: 0, queued: 1, online devices: 1
 ```
 
 What the lines mean:
 
+- `socket:` the control socket. When `<home>/run/ipc.sock` would be 100 bytes or longer, it is a
+  `spew-mesh-<random>.sock` file in `$XDG_RUNTIME_DIR`, `$TMPDIR` or `/tmp` instead.
 - `roster:` the provider in use, then its state. `(settings say file)` after the provider means the configured
   roster couldn't be used; the `fix:` line below it says why.
+- `rooms:` the rooms this device is in, besides your private room.
 - `admitted devices:` how many other devices may connect.
-- `network:` the mode, or `off` while no other device is admitted, with the home relay in `n0` and `own` modes.
-- `link <short id>:` one line per connected device: the path (`direct` or `relay`) and the round-trip time.
+- `network:` the mode and the short endpoint id, or `off (no other device is admitted)`.
+- `home relay` (`n0` and `own` modes): the relay this device uses and whether it is connected.
+- `bound:` the sockets the endpoint listens on.
+- `link`: one line per admitted device: online with its path (`direct` or `relay`) and round-trip time, or offline
+  and when it was last seen.
+- `fix:` and `note:` after the links: the last thing that went wrong reaching a device. `fix:` means a person can
+  act, such as `its roster doesn't admit this device`. `note:` means it was unreachable, which is normal while it
+  is off.
 - `queued:` messages in the outbox, waiting for their device to come online.
+
+When no daemon is running, `daemon status` prints `The spew mesh daemon isn't running.` and exits with status 3.
+Neither it nor `doctor` starts one.
 
 `spew mesh who --offline --links` shows each device by name, online or last seen, with its path and round-trip
 time:
@@ -267,6 +285,24 @@ devices
   maya@maya-mbp  online  direct  4 ms
   lee@lee-linux  offline, last seen 3h ago
 ```
+
+## Starting and stopping the daemon
+
+There is no background service. The daemon starts on demand: any `spew mesh` command that needs it, an agent
+session starting, or an agent using a mesh tool. It runs until `spew mesh daemon stop`, `spew mesh uninstall` or a
+restart of the computer.
+
+`daemon stop` keeps it stopped. It writes `<home>/run/stopped` before stopping the daemon, and while that file is
+there, MCP servers and `spew mesh serve` that lose the daemon keep trying to reconnect but don't start it again.
+Any of these starts it, and the new daemon removes the file:
+
+- a `spew mesh` command that talks to the daemon, such as `who`, `ask` or `daemon start` (`daemon status` and
+  `doctor` only report);
+- a `start` or `prompt` hook, so a new agent session or the next prompt in an open one;
+- a mesh tool call from an agent.
+
+`doctor` says when the daemon is stopped this way. A daemon that crashed leaves no `run/stopped`, so the MCP
+servers and responders still running start it again on their own.
 
 ## Environment
 

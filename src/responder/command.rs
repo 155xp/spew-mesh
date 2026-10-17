@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use super::env::HostEnv;
 use super::limits::{GateSettings, SystemClock};
 use super::memory::StoreConversations;
-use super::process::SystemRunner;
+use super::process::{RunGroups, TrackedRunner};
 use super::runloop::{self, LoopConfig, Report, ServeEvent};
 use super::{Responder, ServeClient, ServeConfig, ServeError};
 use crate::address::is_session_name;
@@ -130,11 +130,12 @@ async fn serve(
     limits: GateSettings,
 ) -> Result<ExitCode, Problem> {
     let client = cfg.client;
+    let runs = RunGroups::default();
     // The checks come before the daemon, which is started only for a responder that can run.
     let mut responder = Responder::start(
         cfg,
         &HostEnv::from_process(),
-        SystemRunner,
+        TrackedRunner::new(runs.clone()),
         StoreConversations::open_later(home.store_file()),
         SystemClock,
     )
@@ -159,7 +160,7 @@ async fn serve(
     let report = reporter(format!("{client} in {cwd}, {mode}"));
     let loop_cfg = LoopConfig::new(home, client, cwd, name, env.spew_project.clone(), limits);
     let (stop_tx, stop_rx) = watch::channel(false);
-    tokio::spawn(stop_on_signal(stop_tx));
+    tokio::spawn(stop_on_signal(stop_tx, runs));
     match runloop::serve(&mut responder, loop_cfg, Some(daemon), stop_rx, report).await {
         Ok(()) => {
             let _ = writeln!(std::io::stdout(), "spew mesh serve: stopped");
@@ -170,8 +171,10 @@ async fn serve(
 }
 
 // Turns `stop` true on Ctrl-C, SIGTERM or SIGHUP, and exits with 130 on a second one, so a daemon that doesn't
-// answer can't hold a stopping serve. By then the loop has dropped the run, which killed its process group.
-async fn stop_on_signal(stop: watch::Sender<bool>) {
+// answer can't hold a stopping serve. The loop drops the run on the first signal, which kills its process group,
+// but a second signal can come before the loop gets there, and `exit` runs no destructors: so the run's group is
+// killed here first.
+async fn stop_on_signal(stop: watch::Sender<bool>, runs: RunGroups) {
     use tokio::signal::unix::{Signal, SignalKind, signal};
     async fn next(s: &mut Option<Signal>) {
         let got = match s {
@@ -195,6 +198,7 @@ async fn stop_on_signal(stop: watch::Sender<bool>) {
         if first {
             let _ = stop.send(true);
         } else {
+            runs.kill_all();
             std::process::exit(130);
         }
     }

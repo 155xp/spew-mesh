@@ -165,8 +165,13 @@ impl Home {
     }
 
     /// Whether `run/stopped` is there. Long-lived clients start a missing daemon only while it is absent (6.1).
+    /// A file that can't be checked counts as there, as the MCP server and serve see it: when in doubt, a
+    /// reconnect leaves the daemon stopped.
     pub fn is_stopped(&self) -> bool {
-        fs::symlink_metadata(self.stopped_file()).is_ok()
+        match fs::symlink_metadata(self.stopped_file()) {
+            Ok(_) => true,
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
     }
 
     /// Writes `run/stopped` (0600). A home that doesn't exist yet stays absent: no daemon can run there.

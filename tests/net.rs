@@ -1,401 +1,15 @@
-//! Two and three daemons on real iroh links (15): each is the built `spew` binary run as a child process on its
-//! own temp home, with `[roster] kind = "file"` and `[network] mode = "local"` bound to 127.0.0.1. mDNS is off
-//! and there are no relays, so nothing leaves the machine; the roster's `addrs` come from each daemon's
-//! `daemon.status`. Every wait polls with a deadline, and a daemon is killed when its test ends, even on a panic.
+//! Two and three daemons on real iroh links (15), as child processes on temp homes in `local` mode on 127.0.0.1
+//! (the harness is in `net_support`): presence by room, asks across devices, a tell to a stopped device, a
+//! refused stranger, roster removal, and a device that comes back on a new port.
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+mod net_support;
+
 use std::time::{Duration, Instant};
 
-use iroh::EndpointId;
-use spew_mesh::cli::full_status;
-use spew_mesh::control::Client;
-use spew_mesh::control::client::ConnectOptions;
-use spew_mesh::control::protocol::{
-    AskParams, DirectoryQuery, FetchParams, Fetched, ReplyParams, SendStatus, SessionOpen, Status,
-    TellParams,
-};
-use spew_mesh::daemon::status::NetworkDetails;
-use spew_mesh::identity::DeviceIdentity;
-use spew_mesh::paths::Home;
-use spew_mesh::wire::{MessageKind, SessionKind};
-
-/// Generous, for a loaded machine; every wait ends as soon as its condition holds.
-const WAIT: Duration = Duration::from_secs(60);
-/// A clean close (code 4) reaches the peer at once; an unclean one would take the 30 s idle timeout.
-const CLEAN_CLOSE: Duration = Duration::from_secs(15);
-
-/// One device: a temp folder holding its user home, mesh home, an empty `PATH` folder and work folders, and
-/// the daemon running on them.
-struct Node {
-    person: &'static str,
-    device: &'static str,
-    tmp: tempfile::TempDir,
-    home: Home,
-    id: EndpointId,
-    child: Option<Child>,
-    runs: u32,
-}
-
-impl Node {
-    /// A device whose identity and settings exist but whose daemon isn't running.
-    fn prepare(person: &'static str, device: &'static str, roster: &Path) -> Node {
-        let tmp = tempfile::tempdir().unwrap();
-        for dir in ["user", "bin", "work"] {
-            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
-        }
-        let home = Home::at(tmp.path().join("home")).unwrap();
-        home.ensure().unwrap();
-        let (identity, _) = DeviceIdentity::load_or_create(&home, device, 1).unwrap();
-        let settings = format!(
-            "username = \"{person}\"\n\n[roster]\nkind = \"file\"\nfile = \"{}\"\n\n\
-             [network]\nmode = \"local\"\nbind = \"127.0.0.1\"\nmdns = false\n",
-            roster.display()
-        );
-        std::fs::write(home.settings_file(), settings).unwrap();
-        Node {
-            person,
-            device,
-            id: identity.endpoint_id(),
-            tmp,
-            home,
-            child: None,
-            runs: 0,
-        }
-    }
-
-    /// Two devices, the first with the greater endpoint id, so it is the designated dialer of the pair (5.3).
-    /// Both are made afresh on each try, so every try succeeds with even odds.
-    fn dialer_pair(
-        dialer: (&'static str, &'static str, &Path),
-        other: (&'static str, &'static str, &Path),
-    ) -> (Node, Node) {
-        for _ in 0..64 {
-            let a = Node::prepare(dialer.0, dialer.1, dialer.2);
-            let b = Node::prepare(other.0, other.1, other.2);
-            if a.id.as_bytes() > b.id.as_bytes() {
-                return (a, b);
-            }
-        }
-        panic!("no ordered pair of endpoint ids in 64 tries");
-    }
-
-    fn address(&self) -> String {
-        format!("{}@{}", self.person, self.device)
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_spew"));
-        c.arg("mesh")
-            .args(args)
-            .env_clear()
-            .env("HOME", self.tmp.path().join("user"))
-            .env("SPEW_MESH_DIR", self.home.root())
-            .env("SPEW_MESH_LAN", "0")
-            .env("USER", self.person)
-            .env("PATH", self.tmp.path().join("bin"))
-            .current_dir(self.tmp.path().join("work"))
-            .stdin(Stdio::null());
-        c
-    }
-
-    /// Runs a CLI command that needs the daemon already running (it never starts one here).
-    async fn cli(&self, args: &[&str]) -> Output {
-        tokio::process::Command::from(self.command(args))
-            .output()
-            .await
-            .unwrap()
-    }
-
-    /// Starts `spew mesh daemon run` and waits until it answers on its control socket.
-    async fn start(&mut self) {
-        assert!(self.child.is_none(), "{} is already running", self.device);
-        self.runs += 1;
-        let log = std::fs::File::create(self.log_path(self.runs)).unwrap();
-        let child = self
-            .command(&["daemon", "run"])
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        self.child = Some(child);
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if let Some(child) = self.child.as_mut()
-                && let Some(exit) = child.try_wait().unwrap()
-            {
-                self.child = None;
-                panic!("{} exited with {exit}:\n{}", self.device, self.log());
-            }
-            if let Ok(client) = Client::connect(&self.home, &ConnectOptions::existing()).await
-                && client.status().await.is_ok()
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{} didn't start:\n{}",
-                self.device,
-                self.log()
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    /// `spew mesh daemon stop`, then waits for the process to exit.
-    async fn stop(&mut self) {
-        let out = self.cli(&["daemon", "stop"]).await;
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let deadline = Instant::now() + WAIT;
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        while child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "{} didn't exit", self.device);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    async fn client(&self) -> Client {
-        Client::connect(&self.home, &ConnectOptions::existing())
-            .await
-            .unwrap()
-    }
-
-    async fn status(&self) -> (Status, NetworkDetails) {
-        full_status(&self.client().await).await.unwrap()
-    }
-
-    /// The socket the endpoint is bound to, once it is up.
-    async fn bound(&self) -> String {
-        let mut found = None;
-        eventually(&format!("{} binds its endpoint", self.device), async || {
-            let (_, net) = self.status().await;
-            found = net
-                .bound_sockets
-                .iter()
-                .find(|s| s.starts_with("127.0.0.1:"))
-                .cloned();
-            found.is_some()
-        })
-        .await;
-        found.unwrap()
-    }
-
-    /// Sets `[network] port`, for the next start.
-    fn pin_port(&self, port: &str) {
-        let mut settings = std::fs::read_to_string(self.home.settings_file()).unwrap();
-        // `[network]` is the last table in the file, so the key lands in it.
-        settings.push_str(&format!("port = {port}\n"));
-        std::fs::write(self.home.settings_file(), settings).unwrap();
-    }
-
-    /// The device as this daemon's status shows it, if admitted.
-    async fn link_to(&self, other: &Node) -> Option<spew_mesh::daemon::status::DeviceLink> {
-        let (_, net) = self.status().await;
-        net.devices
-            .into_iter()
-            .find(|d| d.endpoint_id == other.id.to_string())
-    }
-
-    async fn sees_online(&self, other: &Node) -> bool {
-        self.link_to(other).await.is_some_and(|d| d.online)
-    }
-
-    /// A folder for sessions, with a `.spew.json` naming `room`.
-    fn folder(&self, name: &str, room: &str) -> String {
-        let dir = self.tmp.path().join("work").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(".spew.json"),
-            format!("{{\"project\": \"{room}\"}}"),
-        )
-        .unwrap();
-        dir.to_string_lossy().into_owned()
-    }
-
-    fn log_path(&self, run: u32) -> PathBuf {
-        self.tmp.path().join(format!("daemon-{run}.log"))
-    }
-
-    /// Everything the daemon logged, over all its runs.
-    fn log(&self) -> String {
-        (1..=self.runs)
-            .map(|run| std::fs::read_to_string(self.log_path(run)).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if std::thread::panicking() {
-            let log = self.log();
-            let lines: Vec<&str> = log.lines().collect();
-            let tail = lines[lines.len().saturating_sub(60)..].join("\n");
-            eprintln!("--- {} log (last 60 lines) ---\n{tail}", self.device);
-        }
-    }
-}
-
-/// A roster file the daemons share.
-struct Roster {
-    dir: tempfile::TempDir,
-}
-
-impl Roster {
-    fn new() -> Roster {
-        Roster {
-            dir: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn path(&self) -> PathBuf {
-        self.dir.path().join("roster.toml")
-    }
-
-    /// Writes the roster in one rename, so a daemon polling it never reads half a file.
-    fn write(&self, people: &[(&Node, Option<&str>)], rooms: &[(&str, &[&str])]) {
-        let mut text = String::new();
-        for (node, addr) in people {
-            let addrs = addr
-                .map(|a| format!(", addrs = [\"{a}\"]"))
-                .unwrap_or_default();
-            text.push_str(&format!(
-                "[[person]]\nname = \"{}\"\ndevices = [ {{ id = \"{}\", name = \"{}\"{addrs} }} ]\n\n",
-                node.person, node.id, node.device
-            ));
-        }
-        for (room, members) in rooms {
-            let list: Vec<String> = members.iter().map(|m| format!("\"{m}\"")).collect();
-            text.push_str(&format!(
-                "[[room]]\nname = \"{room}\"\npeople = [{}]\n\n",
-                list.join(", ")
-            ));
-        }
-        let next = self.dir.path().join("roster.toml.next");
-        std::fs::write(&next, text).unwrap();
-        std::fs::rename(&next, self.path()).unwrap();
-    }
-
-    /// Lists `people` with the bound sockets of the running ones as their `addrs`, and has every running daemon
-    /// read it now rather than at its next poll.
-    async fn publish(&self, people: &[&Node], rooms: &[(&str, &[&str])]) {
-        let mut entries = Vec::new();
-        for node in people {
-            let addr = match node.child {
-                Some(_) => Some(node.bound().await),
-                None => None,
-            };
-            entries.push((*node, addr));
-        }
-        let listed: Vec<(&Node, Option<&str>)> =
-            entries.iter().map(|(n, a)| (*n, a.as_deref())).collect();
-        self.write(&listed, rooms);
-        for node in people.iter().filter(|n| n.child.is_some()) {
-            node.client().await.refresh().await.unwrap();
-        }
-    }
-}
-
-async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
-    while !check().await {
-        assert!(Instant::now() < deadline, "timed out waiting until {what}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// A session opened through a control connection that stays open.
-struct Session {
-    client: Client,
-    token: String,
-}
-
-async fn open(node: &Node, cwd: &str) -> Session {
-    let client = node.client().await;
-    let opened = client
-        .session_open(&SessionOpen {
-            client: "claude".into(),
-            client_session: None,
-            client_pid: None,
-            cwd: cwd.into(),
-            client_name: None,
-            kind: SessionKind::Live,
-            name: None,
-            spew_project: None,
-            serve: None,
-        })
-        .await
-        .unwrap();
-    Session {
-        client,
-        token: opened.token,
-    }
-}
-
-async fn fetch(s: &Session) -> Fetched {
-    s.client
-        .fetch(&FetchParams {
-            token: s.token.clone(),
-            wait_seconds: None,
-            keep_unread: false,
-        })
-        .await
-        .unwrap()
-}
-
-/// Whether the session's directory lists `address` online.
-async fn sees(s: &Session, address: &str) -> bool {
-    let dir = s
-        .client
-        .directory(&DirectoryQuery {
-            token: Some(s.token.clone()),
-            filter: None,
-            include_offline: true,
-        })
-        .await
-        .unwrap();
-    dir.rooms
-        .iter()
-        .flat_map(|r| &r.people)
-        .flat_map(|p| &p.sessions)
-        .any(|row| row.address == address && row.online)
-}
-
-/// Whether the session's directory names `address` at all, online or not.
-async fn knows(s: &Session, address: &str) -> bool {
-    let dir = s
-        .client
-        .directory(&DirectoryQuery {
-            token: Some(s.token.clone()),
-            filter: None,
-            include_offline: true,
-        })
-        .await
-        .unwrap();
-    dir.rooms
-        .iter()
-        .flat_map(|r| &r.people)
-        .flat_map(|p| &p.sessions)
-        .any(|row| row.address == address)
-}
-
-fn text(o: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&o.stdout),
-        String::from_utf8_lossy(&o.stderr)
-    )
-}
+use net_support::{CLEAN_CLOSE, Node, Roster, Session, eventually, fetch, knows, open, sees, text};
+use spew_mesh::control::protocol::{AskParams, ReplyParams, SendResult, SendStatus, TellParams};
+use spew_mesh::courier::CONVERSATION_LIMIT;
+use spew_mesh::wire::MessageKind;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_devices_link_directly_see_their_rooms_and_ask_across() {
@@ -549,8 +163,15 @@ async fn a_tell_to_a_stopped_device_is_delivered_when_it_starts_again() {
     })
     .await;
     // maya comes back on the port the roster names, as a device with `[network] port` set does.
-    let port = maya.bound().await.rsplit(':').next().unwrap().to_string();
-    maya.pin_port(&port);
+    let port: u16 = maya
+        .bound()
+        .await
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    maya.pin_port(port);
 
     // `daemon stop` records that the daemon is meant to stay stopped and closes its links cleanly, so sam sees
     // maya go offline long before an idle timeout would say so.
@@ -740,4 +361,184 @@ async fn removing_devices_from_the_roster_fails_their_mail_and_closes_links() {
     .await;
     let shown = text(&sam.cli(&["daemon", "status"]).await);
     assert!(shown.contains("network: off"), "{shown}");
+}
+
+/// How soon a designated dialer must reach a device at its new address once the roster names it; a dial stuck
+/// on the old address would give up only after the 15 s dial timeout (5.3).
+const REDIAL: Duration = Duration::from_secs(7);
+
+/// A free UDP port on 127.0.0.1 other than `not`.
+fn free_port(not: u16) -> u16 {
+    loop {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        if port != not {
+            return port;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_restarts_on_a_new_port_is_dialed_there_at_once() {
+    // sam is the designated dialer, so it is sam that has to find maya at her new address.
+    let roster = Roster::new();
+    let (mut sam, mut maya) = Node::dialer_pair(
+        ("sam", "sam-mac", &roster.path()),
+        ("maya", "maya-mbp", &roster.path()),
+    );
+    let rooms: &[(&str, &[&str])] = &[("team", &["sam", "maya"])];
+    roster.write(&[(&sam, None), (&maya, None)], rooms);
+    sam.start().await;
+    maya.start().await;
+    roster.publish(&[&sam, &maya], rooms).await;
+    eventually("sam and maya link", async || sam.sees_online(&maya).await).await;
+    let old = maya.bound().await;
+    let old_port: u16 = old.rsplit(':').next().unwrap().parse().unwrap();
+
+    // Once maya's link closes, sam's dialer dials her old address at once, and nothing answers there.
+    maya.stop().await;
+    eventually("sam sees maya offline", async || {
+        !sam.sees_online(&maya).await
+    })
+    .await;
+    maya.pin_port(free_port(old_port));
+    maya.start().await;
+    let new = maya.bound().await;
+    assert_ne!(new, old);
+
+    // The new address cancels the dial to the old one, and sam dials again right away.
+    let published = Instant::now();
+    roster.publish(&[&sam, &maya], rooms).await;
+    eventually("sam links to maya at her new address", async || {
+        sam.sees_online(&maya).await
+    })
+    .await;
+    assert!(
+        published.elapsed() < REDIAL,
+        "sam reached maya's new address only after {:?}",
+        published.elapsed()
+    );
+    let link = sam.link_to(&maya).await.unwrap();
+    assert_eq!(link.path.as_deref(), Some("direct"), "{link:?}");
+}
+
+async fn tell(from: &Session, to: &str, text: &str) -> SendResult {
+    from.client
+        .tell(&TellParams {
+            token: from.token.clone(),
+            to: to.into(),
+            text: text.into(),
+            card: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn reply(from: &Session, id: &str, text: &str) -> SendResult {
+    from.client
+        .reply(&ReplyParams {
+            token: from.token.clone(),
+            id: id.into(),
+            text: text.into(),
+            wait_seconds: None,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_device_asks_ended_sessions_refuse_and_the_guard_holds_with_links_up() {
+    let roster = Roster::new();
+    let mut sam = Node::prepare("sam", "sam-mac", &roster.path());
+    let mut maya = Node::prepare("maya", "maya-mbp", &roster.path());
+    let rooms: &[(&str, &[&str])] = &[("team", &["sam", "maya"])];
+    roster.write(&[(&sam, None), (&maya, None)], rooms);
+    sam.start().await;
+    maya.start().await;
+    roster.publish(&[&sam, &maya], rooms).await;
+    let api = open(&sam, &sam.folder("api", "team")).await;
+    let notes = open(&sam, &sam.folder("notes", "team")).await;
+    let web = open(&maya, &maya.folder("web", "team")).await;
+    let deploy = open(&maya, &maya.folder("deploy", "team")).await;
+    eventually("sam sees maya's sessions", async || {
+        sees(&api, "maya@maya-mbp/claude-web").await
+            && sees(&api, "maya@maya-mbp/claude-deploy").await
+    })
+    .await;
+
+    // Ask and answer between two sessions on one device while the device is linked to another (C1).
+    let asker = api.client.clone();
+    let token = api.token.clone();
+    let pending = tokio::spawn(async move {
+        asker
+            .ask(&AskParams {
+                token,
+                to: "claude-notes".into(),
+                text: "did the migration run?".into(),
+                card: None,
+                wait_seconds: Some(45),
+            })
+            .await
+            .unwrap()
+    });
+    let mut got = None;
+    eventually("the ask reaches the notes session", async || {
+        got = fetch(&notes).await.messages.into_iter().next();
+        got.is_some()
+    })
+    .await;
+    let question = got.unwrap();
+    assert_eq!(question.kind, MessageKind::Ask);
+    let replied = reply(&notes, &question.id, "yes, at 14:00").await;
+    assert_eq!(replied.status, SendStatus::Delivered, "{}", replied.note);
+    let answered = pending.await.unwrap();
+    assert_eq!(answered.status, SendStatus::Answered, "{}", answered.note);
+    assert_eq!(answered.answer.unwrap().body, "yes, at 14:00");
+
+    // A session that ends with the message unread refuses it with session-ended, and the sender's session
+    // hears so from a notice (6.4, 7.6).
+    let told = tell(&api, "maya/claude-web", "the schema changed").await;
+    assert_eq!(told.status, SendStatus::Delivered, "{}", told.note);
+    web.client.session_close(&web.token).await.unwrap();
+    let mut notices = Vec::new();
+    eventually("sam hears the tell was refused", async || {
+        notices.extend(fetch(&api).await.messages);
+        !notices.is_empty()
+    })
+    .await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].kind, MessageKind::Notice);
+    assert!(
+        notices[0].body.contains(&told.id)
+            && notices[0]
+                .body
+                .contains("that session ended before it saw the message"),
+        "{}",
+        notices[0].body
+    );
+
+    // Two agents on two devices replying to each other: the conversation guard stops the one message too many
+    // (5.5, 7.6).
+    let first = tell(&api, "maya/claude-deploy", "can you look at the login bug?").await;
+    assert_eq!(first.status, SendStatus::Delivered, "{}", first.note);
+    let mut last = first.id;
+    for n in 1..CONVERSATION_LIMIT {
+        let from = if n % 2 == 1 { &deploy } else { &api };
+        let r = reply(from, &last, "more on that").await;
+        assert_eq!(r.status, SendStatus::Delivered, "message {n}: {}", r.note);
+        last = r.id;
+    }
+    let from = if CONVERSATION_LIMIT % 2 == 1 {
+        &deploy
+    } else {
+        &api
+    };
+    let stopped = reply(from, &last, "and another thing").await;
+    assert_eq!(stopped.status, SendStatus::Refused, "{}", stopped.note);
+    assert_eq!(stopped.code.as_deref(), Some("conversation-limit"));
+    assert!(
+        stopped.note.contains("Pause and check with your person"),
+        "{}",
+        stopped.note
+    );
 }

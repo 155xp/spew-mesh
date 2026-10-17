@@ -17,8 +17,8 @@ use tokio::sync::{mpsc as tmpsc, watch};
 
 use spew_mesh::control::client::{Client, ClientError, ConnectOptions};
 use spew_mesh::control::protocol::{
-    AskParams, DirectoryQuery, FetchParams, Reason, ReplyParams, SendResult, SendStatus,
-    SessionOpen, SessionRow,
+    AskParams, DirectoryQuery, FetchParams, MessageView, Reason, ReplyParams, SendResult,
+    SendStatus, SessionOpen, SessionRow,
 };
 use spew_mesh::daemon::testnet::{MemLinks, MemNet};
 use spew_mesh::daemon::{self, Daemon, DaemonOptions};
@@ -36,8 +36,8 @@ use spew_mesh::wire::{ActivityState, MessageKind, SessionKind};
 
 const WAIT: Duration = Duration::from_secs(30);
 
-/// A fake `claude -p`: records argv and stdin of call N as `<rec>/argv.N` and `stdin.N`, sleeps `sleep.N`
-/// seconds when that file exists, then prints `stdout.N` (with `@SESSION@` replaced by the session id from
+/// A fake `claude -p`: records its pid, argv and stdin of call N as `<rec>/pid.N`, `argv.N` and `stdin.N`, sleeps `sleep.N`
+/// seconds when that file exists and waits while `hold.N` exists, then prints `stdout.N` (with `@SESSION@` replaced by the session id from
 /// argv) or a success result answering "answer N", prints `stderr.N` and exits with `exit.N`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin
@@ -45,6 +45,7 @@ rec="$FAKE_REC"
 n=$(cat "$rec/count" 2>/dev/null || echo 0)
 n=$((n+1))
 echo "$n" > "$rec/count"
+echo $$ > "$rec/pid.$n"
 for a in "$@"; do printf '%s\n' "$a"; done > "$rec/argv.$n"
 cat > "$rec/stdin.$n"
 sid=""; prev=""
@@ -53,6 +54,7 @@ for a in "$@"; do
   prev="$a"
 done
 [ -f "$rec/sleep.$n" ] && sleep "$(cat "$rec/sleep.$n")"
+while [ -f "$rec/hold.$n" ]; do sleep 0.1; done
 [ -f "$rec/stderr.$n" ] && cat "$rec/stderr.$n" >&2
 if [ -f "$rec/stdout.$n" ]; then
   sed "s/@SESSION@/$sid/g" "$rec/stdout.$n"
@@ -90,6 +92,10 @@ impl Fake {
 
     fn set(&self, name: &str, n: usize, content: &str) {
         std::fs::write(self.rec.join(format!("{name}.{n}")), content).unwrap();
+    }
+
+    fn clear(&self, name: &str, n: usize) {
+        std::fs::remove_file(self.rec.join(format!("{name}.{n}"))).unwrap();
     }
 
     fn get(&self, name: &str, n: usize) -> String {
@@ -571,6 +577,41 @@ fn a_second_ctrl_c_stops_serve_at_once() {
     drop(paused);
 }
 
+// Whether `pid` is gone, or a zombie nobody reaped yet.
+fn gone(pid: &str) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    stat.is_empty() || stat.starts_with('Z')
+}
+
+#[test]
+fn two_quick_signals_leave_no_run_behind() {
+    let mesh = Mesh::new();
+    let api = mesh.api();
+    let mut serve = mesh.serve(&["claude", "--cwd", api.to_str().unwrap()]);
+    serve.wait_for("Serving claude in");
+
+    // The run holds until it is killed, as a long answer would.
+    mesh.fake.set("hold", 1, "");
+    let asked = mesh.run(&["ask", "claude", "--wait", "0", "a long question"]);
+    assert_eq!(code(&asked), 0, "{}", stderr(&asked));
+    wait_until("the run starts", || mesh.fake.rec.join("pid.1").exists());
+    let run = mesh.fake.get("pid", 1).trim().to_string();
+    assert!(!gone(&run));
+
+    // Two signals back to back, as a script sends them. They may arrive as one, so either exit is fine; the
+    // run must not outlive serve either way (9).
+    kill("-INT", serve.child.id());
+    kill("-INT", serve.child.id());
+    let exit = serve.exit_code();
+    assert!(exit == 130 || exit == 0, "{exit}");
+    wait_until("the run is gone", || gone(&run));
+    mesh.fake.clear("hold", 1);
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // In-process daemons on the in-memory network.
 
@@ -844,22 +885,98 @@ impl Session {
         }
     }
 
-    // The answers among the session's unread messages.
-    async fn answers(&self) -> Vec<String> {
-        let f = self
-            .client
+    // The session's unread messages, left unread so a later look finds them again.
+    async fn unread(&self) -> Vec<MessageView> {
+        self.client
             .fetch(&FetchParams {
                 token: self.token.clone(),
-                wait_seconds: Some(5),
-                keep_unread: false,
+                wait_seconds: None,
+                keep_unread: true,
             })
             .await
-            .unwrap();
-        f.messages
-            .into_iter()
-            .filter(|m| m.kind == MessageKind::Answer)
-            .map(|m| m.body)
-            .collect()
+            .unwrap()
+            .messages
+    }
+
+    // The answer to `asked`: in the result when it came in time, else from the session's messages once it
+    // arrives. A busy machine can end an ask's wait before the answer is back.
+    async fn answer_to(&self, asked: &SendResult) -> String {
+        if let Some(answer) = &asked.answer {
+            return answer.body.clone();
+        }
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(m) = self.unread().await.into_iter().find(|m| {
+                m.kind == MessageKind::Answer && m.in_reply_to.as_deref() == Some(&asked.id)
+            }) {
+                return m.body;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no answer to {}: {}",
+                asked.id,
+                asked.note
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // The refusal code of `sent`: in the result when the receipt came in time, else from the notice that
+    // reports it later (7.6).
+    async fn refusal_of(&self, sent: &SendResult) -> String {
+        if sent.status == SendStatus::Refused {
+            return sent.code.clone().unwrap_or_default();
+        }
+        assert!(
+            matches!(sent.status, SendStatus::Queued | SendStatus::Delivered),
+            "{:?}: {}",
+            sent.status,
+            sent.note
+        );
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(m) = self.unread().await.into_iter().find(|m| {
+                m.kind == MessageKind::Notice && m.in_reply_to.as_deref() == Some(&sent.id)
+            }) {
+                assert!(m.body.contains("was refused"), "{}", m.body);
+                return if m.body.contains("the responder is busy") {
+                    "busy".into()
+                } else {
+                    m.body
+                };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no refusal of {}: {}",
+                sent.id,
+                sent.note
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+// A send that reached the other device, or will: under load its receipt can come after the send stopped waiting
+// for it, so the caller checks the arrival some other way.
+fn on_its_way(sent: &SendResult) {
+    assert!(
+        matches!(sent.status, SendStatus::Delivered | SendStatus::Queued),
+        "{:?}: {}",
+        sent.status,
+        sent.note
+    );
+}
+
+// Polls the responder's row on `session`'s device until `want` holds for it.
+async fn responder_until(session: &Session, what: &str, want: impl Fn(&SessionRow) -> bool) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let row = session.responder_row(false).await;
+        if row.as_ref().is_some_and(&want) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: {row:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -870,7 +987,8 @@ async fn the_per_person_limit_refuses_with_busy_and_own_devices_count_only_towar
     // The daemon started with the default limit of 10; serve reads 1 and the daemon applies it.
     let team = Team::start("\n[serve]\nmax_runs_per_person_per_hour = 1\n").await;
     let fake = Fake::new(&team.mac.root());
-    fake.set("sleep", 1, "4");
+    // The first run holds until the test lets it go, so maya's question stays in the queue meanwhile.
+    fake.set("hold", 1, "");
     let (mut responder, lc) = responder(&team.mac, &fake).await;
     let (report, mut rx) = events();
     let (stop, stop_rx) = watch::channel(false);
@@ -885,9 +1003,11 @@ async fn the_per_person_limit_refuses_with_busy_and_own_devices_count_only_towar
         maya.sees_responder().await;
         linux.sees_responder().await;
 
-        // sam-linux's question runs; maya's waits in the queue and counts as her one run this hour.
+        // sam-linux's question runs; maya's waits in the queue and counts as her one run this hour. Each step
+        // waits for the state it needs rather than expecting it from the first call, so a busy machine only
+        // makes it slower.
         let first = linux.ask(SERVED, "which port?", 0).await;
-        assert_eq!(first.status, SendStatus::Delivered, "{}", first.note);
+        on_its_way(&first);
         next_event(
             &mut rx,
             "the first run",
@@ -895,28 +1015,25 @@ async fn the_per_person_limit_refuses_with_busy_and_own_devices_count_only_towar
         )
         .await;
         let queued = maya.ask(SERVED, "where is the retry logic?", 0).await;
-        assert_eq!(queued.status, SendStatus::Delivered, "{}", queued.note);
+        on_its_way(&queued);
         let mac = Session::open(&team.mac, &team.mac.folder("notes", None)).await;
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let row = mac.responder_row(false).await.unwrap();
-            if row.state == ActivityState::Busy && row.queue == 1 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "presence: {row:?}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        responder_until(&mac, "maya's question in the queue", |row| {
+            row.state == ActivityState::Busy && row.queue == 1
+        })
+        .await;
         let over = maya.ask(SERVED, "and the backoff?", 5).await;
-        assert_eq!(over.status, SendStatus::Refused, "{}", over.note);
-        assert_eq!(over.code.as_deref(), Some("busy"));
+        assert_eq!(maya.refusal_of(&over).await, "busy", "{}", over.note);
 
         // sam's own devices aren't held to the per-person limit.
+        fake.clear("hold", 1);
         let again = linux.ask(SERVED, "and the host?", 20).await;
-        assert_eq!(again.status, SendStatus::Answered, "{}", again.note);
-        assert_eq!(again.answer.unwrap().body, "answer 3");
-        assert_eq!(maya.answers().await, ["answer 2"]);
-        let row = mac.responder_row(false).await.unwrap();
-        assert_eq!((row.state, row.queue), (ActivityState::Idle, 0));
+        assert_eq!(linux.answer_to(&again).await, "answer 3", "{}", again.note);
+        assert_eq!(maya.answer_to(&queued).await, "answer 2");
+        assert_eq!(linux.answer_to(&first).await, "answer 1");
+        responder_until(&mac, "the responder idle", |row| {
+            row.state == ActivityState::Idle && row.queue == 0
+        })
+        .await;
         assert_eq!(fake.calls(), 3);
         stop.send(true).unwrap();
     };

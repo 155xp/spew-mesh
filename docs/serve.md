@@ -207,6 +207,8 @@ output of every failed run. `SPEW_MESH_LOG` sets the log filter (`info` by defau
 
 Ctrl-C (or SIGTERM or SIGHUP) stops serve. It waits up to 5 seconds for a reply in flight and closes the responder
 session, then prints `spew mesh serve: stopped`. Questions still waiting are refused, and each asker gets a notice.
+A run still going is stopped, and its asker gets the failure line. A second signal ends serve at once with status
+130, after killing a run still going.
 
 If the daemon goes away, serve prints `Lost the daemon; reconnecting.` and keeps trying, starting the daemon again
 unless you stopped it with `spew mesh daemon stop`. When it is back, serve prints `Back on the daemon as ...` and

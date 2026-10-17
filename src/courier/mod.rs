@@ -26,7 +26,7 @@ use crate::control::server::Conn;
 use crate::identity::parse_endpoint_id;
 use crate::link::{LinkEvent, Links};
 use crate::presence::{RemotePresence, Seq};
-use crate::roster::{ActiveRoster, Me, PRIVATE_ROOM_ID, Roster};
+use crate::roster::{ActiveRoster, AdmittedDevice, Me, PRIVATE_ROOM_ID, Roster};
 use crate::sessions::directory::{Entry, ListingInput, listing, local_presence};
 use crate::sessions::{Context, EndReason, Registry};
 use crate::spew_api::Clock;
@@ -35,8 +35,8 @@ use crate::store::{
 };
 use crate::text::{NoticeEvent, notice_body};
 use crate::wire::{
-    DEFAULT_TTL_SECS, MessageKind, PresenceDevice, PresencePeer, PresenceSnapshot, ReceiptState,
-    ReceiptUpdate, RefusalCode, SessionKind, filter_for_peer,
+    DEFAULT_TTL_SECS, MessageKind, PresenceDevice, PresencePeer, PresenceSession, PresenceSnapshot,
+    ReceiptState, ReceiptUpdate, RefusalCode, SessionKind, filter_for_peer,
 };
 
 use guard::Guard;
@@ -55,6 +55,8 @@ pub const RECEIPT_WAIT: Duration = Duration::from_secs(8);
 const EXPIRY_CHECK_MS: u64 = 60_000;
 /// How often the store is swept (11.1).
 const SWEEP_MS: u64 = 24 * 60 * 60 * 1000;
+/// Extra wait over a peer's one-second presence gap, so timer jitter never gets a snapshot dropped (5.6).
+const PRESENCE_HOLD_MARGIN_MS: u64 = 250;
 
 /// This device as the courier sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +146,18 @@ pub(crate) fn store_err(e: StoreError) -> RpcError {
     RpcError::unavailable(format!("the store failed: {e}"))
 }
 
+/// Logs a store failure on a path with no caller to answer, so a broken store shows in the log, and gives the
+/// value back when there is one.
+pub(crate) fn warn_store<T>(result: Result<T, StoreError>, what: &str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(error = %e, "the store failed: {what}");
+            None
+        }
+    }
+}
+
 /// What a refusal code means for the sender, in words.
 pub fn refusal_reason(code: RefusalCode) -> &'static str {
     match code {
@@ -164,6 +178,23 @@ pub fn refusal_reason(code: RefusalCode) -> &'static str {
 
 fn hex_of(id: &EndpointId) -> String {
     id.to_string()
+}
+
+// What a peer's session may claim here (2.2, 5.6): a teammate's device only reaches us through rooms we share,
+// so its sessions count only in one of those rooms and only with that room's cards. A device that advertises
+// anything else is ignored rather than trusted. My own devices are shown as they are.
+fn within_shared_rooms(admitted: &AdmittedDevice, s: &PresenceSession) -> Option<PresenceSession> {
+    if admitted.own {
+        return Some(s.clone());
+    }
+    let room = s.room.as_deref()?;
+    if room == PRIVATE_ROOM_ID || !admitted.rooms.contains(room) {
+        return None;
+    }
+    let mut out = s.clone();
+    out.cards
+        .retain(|c| c.split_once('#').map(|(key, _)| key) == Some(room));
+    Some(out)
 }
 
 impl<L: Links> Courier<L> {
@@ -375,6 +406,12 @@ impl<L: Links> Courier<L> {
         if m.message.from.device == self.cfg.device.hex || m.message.kind == MessageKind::Notice {
             return;
         }
+        // A device that left every shared room gets no more receipts; one queued now would only expire (4.3).
+        let admitted = parse_endpoint_id(&m.message.from.device)
+            .is_some_and(|id| c.roster.admission().is_admitted(&id));
+        if !admitted {
+            return;
+        }
         let now = self.now();
         let update = ReceiptUpdate {
             id: m.message.id.clone(),
@@ -435,12 +472,16 @@ impl<L: Links> Courier<L> {
             .map(|s| s.name)
             .unwrap_or_default();
         tracing::info!(session = %name, reason = reason.as_str(), "session ended");
-        let _ = c.store.clear_cards(id);
+        warn_store(
+            c.store.clear_cards(id),
+            "could not clear an ended session's cards",
+        );
         for sid in &ids {
-            let unread = c
-                .store
-                .messages_to(sid, &[MessageState::Delivered])
-                .unwrap_or_default();
+            let unread = warn_store(
+                c.store.messages_to(sid, &[MessageState::Delivered]),
+                "could not read an ended session's unread mail",
+            )
+            .unwrap_or_default();
             for m in unread {
                 self.refuse_received(c, &m, RefusalCode::SessionEnded);
             }
@@ -484,11 +525,13 @@ impl<L: Links> Courier<L> {
     pub(crate) fn entries(&self, c: &Core, include_offline: bool) -> Vec<Entry> {
         let me = c.roster.me().username.clone();
         let mut out = Vec::new();
-        for s in c.store.live_sessions().unwrap_or_default() {
+        let live = warn_store(c.store.live_sessions(), "could not list live sessions");
+        for s in live.unwrap_or_default() {
             if s.kind == SessionKind::Terminal {
                 continue;
             }
-            let cards = c.store.cards(&s.id).unwrap_or_default();
+            let cards = warn_store(c.store.cards(&s.id), "could not read a session's cards")
+                .unwrap_or_default();
             let queue = self.queue_len(c, &s);
             let card_since = cards
                 .iter()
@@ -516,6 +559,9 @@ impl<L: Links> Courier<L> {
                 continue;
             };
             for s in &snapshot.sessions {
+                let Some(s) = within_shared_rooms(admitted, s) else {
+                    continue;
+                };
                 let card_since = s
                     .cards
                     .iter()
@@ -528,7 +574,7 @@ impl<L: Links> Courier<L> {
                     this_device: false,
                     own_device: admitted.own,
                     online: dev.online,
-                    session: s.clone(),
+                    session: s,
                     card_since,
                 });
             }
@@ -546,9 +592,11 @@ impl<L: Links> Courier<L> {
             .ids_of(&s.id)
             .iter()
             .flat_map(|sid| {
-                c.store
-                    .messages_to(sid, &[MessageState::Delivered])
-                    .unwrap_or_default()
+                warn_store(
+                    c.store.messages_to(sid, &[MessageState::Delivered]),
+                    "could not count a responder's questions",
+                )
+                .unwrap_or_default()
             })
             .filter(|m| matches!(m.message.kind, MessageKind::Ask | MessageKind::Tell))
             .count();
@@ -653,8 +701,15 @@ impl<L: Links> Courier<L> {
         for device in &change.removed {
             let hex = hex_of(device);
             c.remote.remove(device);
-            let _ = c.store.remove_presence(&hex);
-            for entry in c.store.outbox_for(&hex).unwrap_or_default() {
+            warn_store(
+                c.store.remove_presence(&hex),
+                "could not forget a removed device's presence",
+            );
+            let queued = warn_store(
+                c.store.outbox_for(&hex),
+                "could not read a removed device's outbox",
+            );
+            for entry in queued.unwrap_or_default() {
                 if entry.kind == OutboxKind::Deliver
                     && let Some(seq) = entry.message_seq
                     && let Ok(Some(m)) = c.store.message_by_seq(seq)
@@ -670,7 +725,10 @@ impl<L: Links> Courier<L> {
                     };
                     self.notice(&mut c, &m.message.from.session, &event, Some(&m.message.id));
                 }
-                let _ = c.store.outbox_remove(entry.seq);
+                warn_store(
+                    c.store.outbox_remove(entry.seq),
+                    "could not drop a removed device's outbox entry",
+                );
             }
             tracing::info!(device = %device.fmt_short(), "a device left every shared room");
         }
@@ -697,14 +755,13 @@ impl<L: Links> Courier<L> {
 
     fn snapshot_for(&self, c: &Core, device: &EndpointId, seq: u64) -> Option<PresenceSnapshot> {
         let admitted = c.roster.admission().get(device)?;
-        let locals: Vec<_> = c
-            .store
-            .live_sessions()
+        let locals: Vec<_> = warn_store(c.store.live_sessions(), "could not list live sessions")
             .unwrap_or_default()
             .iter()
             .filter(|s| s.kind != SessionKind::Terminal)
             .map(|s| {
-                let cards = c.store.cards(&s.id).unwrap_or_default();
+                let cards = warn_store(c.store.cards(&s.id), "could not read a session's cards")
+                    .unwrap_or_default();
                 local_presence(s, &cards, self.queue_len(c, s))
             })
             .collect();
@@ -754,7 +811,8 @@ impl<L: Links> Courier<L> {
                 continue;
             };
             let last = c.presence_sent.get(&device).copied().unwrap_or(0);
-            let hold = (last + crate::presence::MIN_ACCEPT_GAP_MS + 50).saturating_sub(now);
+            let hold = (last + crate::presence::MIN_ACCEPT_GAP_MS + PRESENCE_HOLD_MARGIN_MS)
+                .saturating_sub(now);
             c.presence_sent.insert(device, now + hold);
             out.push((device, snapshot, Duration::from_millis(hold)));
         }
@@ -770,7 +828,8 @@ impl<L: Links> Courier<L> {
         if check_pids {
             c.last_pid_check = now;
         }
-        let live = c.store.live_sessions().unwrap_or_default();
+        let live =
+            warn_store(c.store.live_sessions(), "could not list live sessions").unwrap_or_default();
         let start_time = self.cfg.start_time;
         for (id, reason) in c.reg.due(&live, now, check_pids, &start_time) {
             self.end_session(&mut c, &id, reason);
@@ -789,7 +848,8 @@ impl<L: Links> Courier<L> {
             }
         }
         let mut due = Vec::new();
-        for hex in c.store.outbox_devices().unwrap_or_default() {
+        let devices = warn_store(c.store.outbox_devices(), "could not list the outbox");
+        for hex in devices.unwrap_or_default() {
             if c.pumping.contains(&hex) {
                 continue;
             }
@@ -807,7 +867,8 @@ impl<L: Links> Courier<L> {
 
     // Mail whose time ran out before the target device accepted it (7.4).
     fn expire_outbox(&self, c: &mut Core, now: u64) {
-        for entry in c.store.outbox_expired(now).unwrap_or_default() {
+        let expired = warn_store(c.store.outbox_expired(now), "could not read expired mail");
+        for entry in expired.unwrap_or_default() {
             if c.in_flight.contains(&entry.seq) {
                 continue;
             }
@@ -826,18 +887,22 @@ impl<L: Links> Courier<L> {
                 };
                 self.notice(c, &m.message.from.session, &event, Some(&m.message.id));
             }
-            let _ = c.store.outbox_remove(entry.seq);
+            warn_store(
+                c.store.outbox_remove(entry.seq),
+                "could not drop an expired outbox entry",
+            );
         }
     }
 
     // Stored messages nobody was shown before their time ran out (7.1).
     fn expire_delivered(&self, c: &mut Core, now: u64) {
-        for s in c.store.live_sessions().unwrap_or_default() {
-            for m in c
-                .store
-                .messages_to(&s.id, &[MessageState::Delivered])
-                .unwrap_or_default()
-            {
+        let live = warn_store(c.store.live_sessions(), "could not list live sessions");
+        for s in live.unwrap_or_default() {
+            let unread = warn_store(
+                c.store.messages_to(&s.id, &[MessageState::Delivered]),
+                "could not read unread mail for expiry",
+            );
+            for m in unread.unwrap_or_default() {
                 let ends = m
                     .created_at
                     .saturating_add(m.message.ttl_secs.saturating_mul(1000));

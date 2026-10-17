@@ -144,6 +144,21 @@ fn the_cli_starts_the_daemon_talks_to_a_session_and_stops_it() {
     assert!(text.starts_with("sam-"), "{text}");
     assert!(text.contains("endpoint id: ") && text.contains("short id: "));
 
+    // A device_name written into settings later changes nothing by itself; doctor says how to apply it.
+    std::fs::write(
+        mesh.home().join("settings.toml"),
+        "device_name = \"work-mac\"\n",
+    )
+    .unwrap();
+    let doctor = mesh.run(&["doctor"]);
+    assert!(
+        stdout(&doctor).contains("fix: settings.toml names this device work-mac but it is sam-"),
+        "{}",
+        stdout(&doctor)
+    );
+    assert!(stdout(&doctor).contains("setup --device-name work-mac"));
+    assert_eq!(code(&doctor), 1);
+
     let status = mesh.run(&["daemon", "status"]);
     assert_eq!(code(&status), 0, "{}", stderr(&status));
     let text = stdout(&status);
@@ -234,6 +249,24 @@ fn the_home_flag_and_doctor_work_without_a_daemon() {
     assert!(text.contains("identity: none yet"), "{text}");
     assert!(text.contains("daemon: not running"), "{text}");
     // Doctor never starts the daemon.
+    assert!(!mesh.home().join("run").join("socket").exists());
+}
+
+#[test]
+fn setup_slugs_the_device_name_it_is_given() {
+    let mesh = Mesh::new();
+    let named = mesh.run(&["setup", "--device-name", "Sam's Mac", "--dry-run"]);
+    assert_eq!(code(&named), 0, "{}", stderr(&named));
+    assert!(
+        stdout(&named).contains("Would name this device sam-s-mac."),
+        "{}",
+        stdout(&named)
+    );
+    let empty = mesh.run(&["setup", "--device-name", "!!!", "--dry-run"]);
+    assert_eq!(code(&empty), 1);
+    assert!(stderr(&empty).contains("--device-name needs at least one letter or digit"));
+    // A dry run changes nothing and starts no daemon.
+    assert!(!mesh.home().join("identity").join("device.json").exists());
     assert!(!mesh.home().join("run").join("socket").exists());
 }
 

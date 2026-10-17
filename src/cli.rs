@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand};
 
+use crate::address::{MAX_DEVICE, slugify};
 use crate::agents::Client as Agent;
 use crate::agents::runner::SystemRunner;
 use crate::agents::setup::{ClientPaths, Options as SetupOptions, Setup, Wiring, closing_lines};
@@ -426,7 +427,17 @@ fn setup(
 ) -> anyhow::Result<ExitCode> {
     let agents = agents.map(Agent::parse_list).transpose()?;
     let mut renamed = false;
-    if let Some(name) = device_name {
+    // Setup slugs the name it is given, as it does for a default name (2).
+    let device_name = device_name
+        .map(|given| {
+            let name = slugify(given, MAX_DEVICE);
+            if name.is_empty() {
+                bail!("--device-name needs at least one letter or digit");
+            }
+            Ok(name)
+        })
+        .transpose()?;
+    if let Some(name) = device_name.as_deref() {
         if dry_run {
             println!("Would name this device {name}.");
         } else {
@@ -662,20 +673,36 @@ async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
     println!("spew mesh {}", crate::control::client::own_version());
     println!("home: {}", home.root().display());
     let user_home = user_home_from_env();
-    match Settings::load(home, user_home.as_deref()) {
-        Ok(_) => println!("settings: {}", home.settings_file().display()),
+    let settings = match Settings::load(home, user_home.as_deref()) {
+        Ok(s) => {
+            println!("settings: {}", home.settings_file().display());
+            Some(s)
+        }
         Err(e) => {
             fixes += 1;
             println!("fix: {e}");
+            None
         }
-    }
+    };
     match DeviceIdentity::load(home) {
-        Ok(Some(id)) => println!(
-            "identity: {} ({}), {}",
-            id.name(),
-            id.short_id(),
-            home.device_file().display()
-        ),
+        Ok(Some(id)) => {
+            println!(
+                "identity: {} ({}), {}",
+                id.name(),
+                id.short_id(),
+                home.device_file().display()
+            );
+            // settings.device_name only names a new identity; an edit later changes nothing by itself.
+            if let Some(wanted) = settings.as_ref().and_then(|s| s.device_name.as_deref())
+                && wanted != id.name()
+            {
+                fixes += 1;
+                println!(
+                    "fix: settings.toml names this device {wanted} but it is {}; run `spew mesh setup --device-name {wanted}`",
+                    id.name()
+                );
+            }
+        }
         Ok(None) => println!("identity: none yet; the daemon creates it on its first start"),
         Err(e) => {
             fixes += 1;

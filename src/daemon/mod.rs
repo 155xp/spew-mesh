@@ -479,6 +479,8 @@ async fn link_task<L: Links>(courier: Arc<Courier<L>>, mut events: broadcast::Re
                 // Missed ups and downs: the link layer's status says which links are up now.
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::debug!(missed = n, "link events lagged; resyncing from the link status");
+                    // Skip the retained events: they are older than the status read next.
+                    events = events.resubscribe();
                     let linked = linked_devices(&courier.links().status());
                     courier.resync_links(&linked);
                     let now = tokio::time::Instant::now();

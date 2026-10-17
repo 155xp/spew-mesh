@@ -486,7 +486,8 @@ impl<L: Links> Courier<L> {
             }
         }
         c.reg.forget(id);
-        if let Some(gate) = c.gates.remove(id)
+        if let Some(mut gate) = c.gates.remove(id)
+            && gate.limits().total_in_window(now) > 0
             && let Some(record) = ended.filter(|s| s.kind == SessionKind::Responder)
             && let Some(cs) = record.client_session
         {

@@ -522,6 +522,14 @@ impl Registry {
             survivor.activity = loser.activity.clone();
             survivor.activity_project = loser.activity_project.clone();
         }
+        // Keep the newer known busy/idle state, so the merged session doesn't show unknown until its next hook.
+        if loser.state != ActivityState::Unknown
+            && (survivor.state == ActivityState::Unknown
+                || loser.state_since > survivor.state_since)
+        {
+            survivor.state = loser.state;
+            survivor.state_since = loser.state_since;
+        }
         survivor.last_seen_at = survivor.last_seen_at.max(loser.last_seen_at);
         for card in store.cards(&loser.id).map_err(store_err)? {
             store

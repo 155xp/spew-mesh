@@ -74,6 +74,10 @@ its owner.
   project; in file mode, a `[[room]]` in the roster. Every person also has a private room holding only their own
   devices.
 - **Card**: a spew issue ref, `<project key>#<number>`, such as `spew#42`.
+- **Names**: person names and room ids are lowercase ASCII letters, digits, `.`, `_` and `-`, 1 to 32
+  characters, and never `me`; device names use the same characters, 1 to 48 (`setup --device-name` slugs what
+  it's given). A spew roster entry outside these rules is dropped and named in `doctor`; a roster file with one
+  is refused (4.2).
 
 ### 2.1 Session names
 
@@ -216,6 +220,8 @@ people = ["sam", "maya"]
   max_stale_seconds` (default 86400), and then only this device. A 401 that a refresh can't fix puts the roster
   in "signed out" at once: teammates are dropped, your own devices from the last roster stay as above, local work
   carries on, and `doctor` says to run `spew mesh login`.
+- Both windows count from the last successful fetch (200 or 304), and the teammate window never outlasts
+  `max_stale_seconds`. A roster whose `ttl_secs` is outside 1 to 86400 is refused and the last good one kept.
 - Rooms: one per spew project chosen at consent, `kind = "project"`, `id` = project key.
 
 ### 4.3 Membership changes
@@ -286,11 +292,13 @@ Application close codes: 1 `not-admitted`, 2 `duplicate`, 3 `version`, 4 `shutdo
 - Each call uses its own bidirectional QUIC stream: the caller writes one request frame and finishes its side;
   the callee writes one response frame and finishes. A frame is a 4-byte big-endian length, then that many bytes
   of UTF-8 JSON, at most 128 KiB (a 32 KiB body fits even when JSON escaping doubles it). A malformed or oversized
-  frame ends the stream with an error response when possible.
+  frame ends the stream with `{"t":"error","code":"malformed"}` or `{"t":"error","code":"too-large"}` when
+  possible.
 - The request frame must arrive within 10 s of the stream opening, or the stream is reset. At most 16 inbound
   streams per link are open at once (set in the QUIC transport config).
 - Requests are JSON objects whose `"t"` names the call. An unknown `"t"` gets `{"t":"error","code":
-  "unknown-call"}` so newer peers can probe.
+  "unknown-call"}` so newer peers can probe. A call's fields sit next to `t` in the same object: `deliver` is
+  `{"t":"deliver", "id": "...", ...}` with the envelope fields of 5.5.
 
 | `t` | Purpose | Response |
 |---|---|---|
@@ -339,8 +347,8 @@ The receiving device checks a `deliver` in this order:
    checked before the body is parsed. Over that: `refused` with code `rate-limited`.
 3. Shape: ids are ULIDs; `kind` is `ask`, `tell` or `answer`; names, client, card and repo fit their character
    sets and lengths (name ≤ 48, client ≤ 16, card ≤ 40, repo ≤ 100); `from.name` isn't `mesh` (reserved for the
-   daemon's own notices, 7.6); the body after sanitizing (7.7) is 1 to 32768 bytes. Otherwise `refused` with code
-   `invalid`.
+   daemon's own notices, 7.6); the body after sanitizing (7.7) is 1 to 32768 bytes; `ttl_secs` is 1 to 604800; no unknown fields
+   (a newer field comes with a `hello` feature). Otherwise `refused` with code `invalid`.
 4. Dedupe: when (peer device, id) is already stored, answer `duplicate`, which the sender treats as delivered.
 5. Threading. Without `in_reply_to`, `kind` must be `ask` or `tell` and `conversation` must equal `id`. With
    `in_reply_to`, it must name a message this device sent from `to.session` to the sending device; the
@@ -518,7 +526,8 @@ A sent message moves through these states, recorded with their times:
 | `refused` (code) | (end) | when it happens after the send call returned |
 | `expired` | (end) | yes |
 
-`rate-limited` returns a message to `queued`. A tell has no `answered` state; the receiver's reply to it arrives
+States only move forward through this table, and may skip a step because receipts can arrive out of order;
+`answered`, `refused` and `expired` are final. `rate-limited` returns a message to `queued`. A tell has no `answered` state; the receiver's reply to it arrives
 as a message of its own.
 
 ### 7.2 ask, tell, reply
@@ -578,10 +587,10 @@ person before sending more."
 
 Applied by the receiver before storing, and again before printing to a terminal:
 
-- Remove C0 and C1 control characters except `\n` and `\t`; remove bidi controls (U+202A to U+202E, U+2066 to
-  U+2069), zero-width and invisible format characters (U+200B to U+200F, U+2060 to U+2064, U+FEFF), and tag
+- Remove C0 and C1 control characters except `\n` and `\t`; remove bidi controls (U+061C, U+202A to U+202E, U+2066 to
+  U+2069) and deprecated format characters (U+206A to U+206F), zero-width and invisible format characters (U+200B to U+200F, U+2060 to U+2064, U+FEFF), and tag
   characters (U+E0000 to U+E007F).
-- Normalize line endings to `\n`.
+- Normalize line endings to `\n`; U+2028 and U+2029 also become `\n`.
 - Metadata fields: one line, their own character sets (slugs for names, `[A-Za-z0-9._/-]` for repos,
   `[a-z0-9-]+#[0-9]+` for cards), and the lengths in 5.5.
 
@@ -627,6 +636,8 @@ setup reports it. Configs name the `spew` binary by its absolute path.
   it; if they have (a running agent wrote it), it reads and applies the edit again, up to 3 times, then gives up
   and reports it.
 - Shell-form commands single-quote the path and write a single quote inside it as `'\''`.
+- A config file that is a symlink (a dotfiles setup) is edited at its target: the temporary file and the backup
+  go next to the target, and the manifest records both paths, so the link survives setup and uninstall.
 
 ### 8.1 Hook events
 
@@ -729,7 +740,8 @@ they don't, serve drops Grep and keeps Read and Glob.
 - A conversation's first run uses a new UUID with `--session-id`; follow-ups use `--resume` with every flag
   repeated (resume doesn't restore flags).
 - `--allow-edits` changes the tools to `"Read,Grep,Glob,Edit,Write"` and the permission mode to `acceptEdits`;
-  the deny rules stay.
+  the deny rules stay, and `Edit(...)` and `Write(...)` rules for the same secret files plus `./.git/**` are
+  added, so a run can't plant a git hook or rewrite a key.
 - Read `result`, `is_error`, `subtype` and `session_id` from the JSON result. `is_error: true`, a `subtype`
   other than `success`, or a non-zero exit is a failed run (9).
 - The child's environment drops exactly these, which describe the parent session rather than the person's
@@ -846,8 +858,9 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
 
 ```text
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
- glob_scan_max_depth=3, ":workspace_roots"={"."="read", "**/*.env"="deny", "**/.env.*"="deny"}},
- network={enabled=false}}
+ glob_scan_max_depth=3, ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
+ "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
+ ".git/config"="deny", ".git/hooks"="deny"}}, network={enabled=false}}
 ```
 
 - The prompt goes on stdin (`-` as the prompt). Every flag goes before `resume`; Codex rejects `-C` after it.
@@ -861,7 +874,7 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
   the binary's own folder.
 - At start, `serve codex` checks the profile with `codex sandbox -C <cwd> -c 'permissions.spew-mesh-serve=<profile>'
   -P spew-mesh-serve -- cat <file>`: reading a file in `--cwd` must work, and reading a canary file serve writes
-  outside `--cwd` must fail. If either check fails (for example on a platform where the profile isn't enforced),
+  outside `--cwd`, or a `.env` canary inside it, must fail. If either check fails (for example on a platform where the profile isn't enforced),
   it refuses to serve, and `doctor` shows the error.
 - `--ignore-user-config` is required. Codex silently ignores permission profiles when any loaded config sets
   `sandbox_mode`, and the flag also keeps the person's MCP servers (mesh included) and `notify` out.
@@ -872,7 +885,8 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
   use a provider without inline headers.
 - serve refuses to start when the repo's project config (`<repo root>/.codex/config.toml`, and the one in
   `--cwd` when it differs) sets `sandbox_mode`, `mcp_servers`, `hooks`, `notify` or `features`.
-- `--allow-edits` writes `"."="write"` instead of `"."="read"`.
+- `--allow-edits` writes `"."="write"` instead of `"."="read"`; the deny entries stay, so `.git/hooks`,
+  `.git/config` and secret files stay out of reach.
 - The first run's `thread.started` event gives the thread id for the conversation map. A follow-up that reports a
   different thread id (Codex starts a new thread when it can't find the old one) replaces the mapping and counts
   as a new conversation.
@@ -917,7 +931,8 @@ person approves each send. (Under `opencode run` an `ask` rule rejects the call,
 startup. setup writes `<config folder>/plugins/spew-mesh.js`, a short generated file with the absolute path of
 `spew` in it. For each event it runs `<spew> mesh hook opencode <event>` with a small JSON payload on stdin
 (`session_id`, `cwd`, `pid`, and for tools `tool_name`, `tool_input`, `tool_response`), reads at most one JSON
-object from stdout (`{"context": "..."}` or nothing), kills the child after 6 s, and ignores every failure.
+object from stdout (`{"context": "..."}` or nothing), kills the child after 8 s (the 8 s hook budget of 8.1),
+and ignores every failure.
 
 | OpenCode plugin hook or event | Mesh event | What the plugin does with `context` |
 |---|---|---|
@@ -928,8 +943,9 @@ object from stdout (`{"context": "..."}` or nothing), kills the child after 6 s,
 | event `session.deleted` | `end` | nothing |
 | `tool.execute.before`, for tools named `mesh_*` | none | adds the argument `_mesh_session` with the session id |
 
-- Sessions with a `parentID` are subagents. The plugin keeps a map from session to parent and always reports the
-  root session id, for events and for `_mesh_session`.
+- Sessions with a `parentID` are subagents. The plugin ignores their events (a subagent never sees peer
+  messages, and its idle doesn't mark the root idle), keeps a map from session to parent, and gives `mesh_*`
+  calls made in a subagent the root session id as `_mesh_session`.
 - The plugin never calls `client.session.prompt` or `promptAsync`, which would add a message or start a turn on
   its own.
 - The plugin card verifies with a mock model (as in 15) that a part appended in `chat.message` and text appended
@@ -957,6 +973,8 @@ opencode run --pure --format json --agent spew-mesh-serve [--session <id>] [--mo
 
 with these variables added to the environment:
 
+- First the child's environment drops `OPENCODE_PERMISSION` (it could widen the agent's permissions), and
+  `OPENCODE` and `OPENCODE_PID` (they describe a parent OpenCode process).
 - `OPENCODE_DISABLE_PROJECT_CONFIG=1`, so a repo's `opencode.json`, `.opencode/` agents, plugins and MCP servers
   never load (a committed plugin or MCP command would otherwise run as the person). `--pure` also keeps every
   plugin out, including spew mesh's own.
@@ -979,10 +997,15 @@ with these variables added to the environment:
   `"permission": {"*": "deny"}` keeps even that fallback from editing, running commands or reaching the network,
   and serve treats a run whose stderr names the fallback as failed.
 - The person's other global MCP servers still start (their tools are denied); docs/serve.md says so.
-- `--allow-edits` adds `"edit": "allow"` to the agent (edits outside `--dir` stay refused by `external_directory`).
+- `--allow-edits` adds `"edit": {"*": "allow", ".git/*": "deny", "*.env": "deny", "*.env.*": "deny", "*.pem":
+  "deny", "*.key": "deny"}` to the agent (edits outside `--dir` stay refused by `external_directory`). The serve
+  card checks with a mock model that the path rules hold for `edit`; if they don't, `--allow-edits` is refused
+  for OpenCode.
 - The JSON output is one event per line, each with `sessionID`. The first event gives the session id for the
   conversation map; follow-ups pass `--session`. The answer is the text parts after the last tool event. A
-  non-zero exit or an `error` event is a failed run.
+  non-zero exit or an `error` event is a failed run. serve reads only `type`, `sessionID`, `part.type`,
+  `part.text` and `error`. Until the opt-in test against OpenCode pins the wording, a stderr line naming the
+  agent with "not found" or "fall back"/"falling back" counts as the fallback warning.
 
 ### 8.5 spew card capture
 
@@ -1011,9 +1034,11 @@ Server name `mesh` (it must not contain "spew", so spew's own hooks never mistak
   (`claude-code`, `codex-mcp-client`, `opencode`), else `other`. Clients setup doesn't wire, such as
   Cursor or Gemini CLI, add the server by hand with `SPEW_MESH_CLIENT` set; docs/agents.md has the snippets. They
   are `inbox` sessions (7.3).
-- The server answers `initialize` and `server/discover` at once, without waiting for the daemon. It connects to
-  the daemon (starting it if needed, 6.1) and opens or attaches to its session on the first tool call, using the
-  client's identity sources (8.2 to 8.4).
+- The server answers `initialize` and `server/discover` at once, without waiting for the daemon. Right after the
+  handshake it connects to the daemon in the background (starting it if needed, 6.1) and opens its session (6.4)
+  with what it knows at spawn time (`SPEW_MESH_CLIENT`, cwd, parent pid, `CLAUDE_CODE_SESSION_ID` or
+  `OPENCODE_PID`). Identity that arrives only with a call (Codex `_meta.sessionId` or `_meta.threadId`, OpenCode
+  `_mesh_session`) is bound at the first tool call, merging sessions as 6.4 says.
 - `ask` sends `notifications/progress` every 15 s when the call carries a progress token. Clients limit long
   calls in their own ways (8.2 to 8.4); the wait limits in 7.2 fit all three.
 - With rmcp 3.5.1, each tool handler takes `RequestContext<RoleServer>`: `context.client_info()` gives
@@ -1066,8 +1091,8 @@ setup never pre-approves `ask`, `tell` or `reply` in any client; `who` and `mess
 - Permissions: read-only by default. The agent can read and search inside `--cwd`, except secret files (`.env`
   files, keys, `.git/config`); it can't write files, reach the network, or read outside `--cwd`. Claude Code gets
   only its read and search tools under `--restricted`; Codex runs its shell commands in a sandbox that can read
-  only the repo; OpenCode gets only `read`, `glob` and `list` under a deny-all agent. `--allow-edits` also allows file edits inside `--cwd`. The exact flags per
-  client are in 8.2 to 8.4 and docs/serve.md.
+  only the repo; OpenCode gets only `read`, `glob` and `list` under a deny-all agent. `--allow-edits` also allows file edits inside `--cwd`, never under `.git/` or to secret
+  files. The exact flags per client are in 8.2 to 8.4 and docs/serve.md.
 - Who may ask: `[serve] from = "room"` (default: anyone admitted who shares the responder's room) or `"own"`
   (only your own devices). Others get `refused` with code `no-such-session`.
 - Cost limits: at most `[serve] max_runs_per_person_per_hour` (default 10) runs for any one asking person and
@@ -1125,11 +1150,11 @@ Home: `~/.spew/mesh` (override with `SPEW_MESH_DIR`). The home is mode 0700 and 
 
 ```text
 settings.toml
-identity/device.json
+identity/device.json  identity/device.lock
 store.sqlite3                (plus its -wal and -shm files)
 run/lock  run/socket  run/ipc.sock
 logs/mesh.log                (moved to mesh.log.1 when over 10 MB at daemon start)
-auth/spew.json
+auth/spew.json  auth/spew.lock   (the lock is held while tokens are read, refreshed and written)
 agents/manifest.json
 roster.toml                  (file roster, optional)
 ```
@@ -1162,7 +1187,7 @@ place = true                      # send the folder name to teammates (same rule
 
 [serve]
 timeout_seconds = 300
-max_turns = 20                    # Claude Code and OpenCode runs
+max_turns = 20                    # Claude Code runs (--max-turns)
 from = "room"                     # room | own: who may ask a responder
 max_runs_per_person_per_hour = 10
 max_runs_per_hour = 30
@@ -1178,7 +1203,8 @@ filter), `SPEW_MESH_CLIENT` (set in MCP configs by setup).
 A session's room: the `SPEW_PROJECT` variable in the agent's environment (as spew's own agent tools read it),
 else the `project` key of the repo's `.spew.json` (found by walking up from the working directory), else
 `[roster] default_room`, else none: visible to your own devices only, and marked "(private: no .spew.json)" in
-your own `who`.
+your own `who`. A `.spew.json` that can't be read or has no valid `project`, or an invalid `SPEW_PROJECT`, leaves
+the session private; it never falls through to `default_room`.
 
 ### 11.1 Store
 
@@ -1186,7 +1212,7 @@ SQLite (rusqlite, bundled) in WAL mode, migrated with `PRAGMA user_version` step
 test that upgrades from every earlier version. It holds: messages in both directions with their state history,
 outbox entries, the session registry (names, last seen), the serve conversation map, the
 remote presence cache, the roster cache, and dedupe keys. A daily sweep deletes messages and receipts older than
-30 days and dedupe keys older than 7 days.
+30 days, sessions that ended more than 30 days ago, and dedupe keys older than 7 days.
 
 ---
 
@@ -1240,8 +1266,14 @@ JSON. Errors: `{"error": {"code": "...", "message": "..."}}`.
   means "sign in again".
 - The token response's `scope` must be exactly `mesh` (as a set of space-separated values). Anything else,
   including a set that holds `mesh` and more, means a token that can do more than the mesh API needs: the client
-  revokes it at once, stores nothing, and says this spew doesn't support mesh sign-in yet. No `resource`
+  revokes it at once, stores no tokens, and says this spew doesn't support mesh sign-in yet. No `resource`
   parameter is sent.
+- The first token response must carry `scope` and `token_type: "Bearer"`. A refresh response may leave `scope`
+  out (unchanged); one that names any other scope is revoked and signs out.
+- The client id is saved right after registration, so an abandoned sign-in reuses it next time.
+- Login says this spew "doesn't support mesh sign-in yet" when discovery returns 404, `scopes_supported` lacks
+  `mesh`, `S256` isn't offered, or there is no `registration_endpoint` and no saved client id. Every endpoint in
+  the metadata must pass the same https rule as `[spew] url`.
 
 ### 14.2 Who am I
 
@@ -1254,20 +1286,24 @@ JSON. Errors: `{"error": {"code": "...", "message": "..."}}`.
    valid for 5 minutes and usable once.
 2. `POST /api/mesh/v1/devices` with `{ "public_key": "<endpoint id>", "name": "sam-mbp", "platform": "macos",
    "nonce": "...", "signature": "<base64url ed25519 signature>" }`. The signature covers the UTF-8 bytes of
-   `spew-mesh-device-v1\n<url>\n<public_key>\n<nonce>`. Returns the device `{ "name", "public_key",
+   `spew-mesh-device-v1\n<url>\n<public_key>\n<nonce>`, where `<url>` is `[spew] url` normalized (lowercase
+   scheme and host, default port dropped, no trailing slash: `https://mcp.spew.lol`) and `<public_key>` is the
+   lowercase hex endpoint id. Returns the device `{ "name", "public_key",
    "created_at" }`. Registering the same key again for the same user is idempotent; a key registered to another
    user is refused.
 3. `PATCH /api/mesh/v1/devices/self` with `{ "relay": "https://..." | null, "name"?: "..." }` updates the calling
    device. The daemon sends it when its home relay changes, at most once a minute.
 4. `DELETE /api/mesh/v1/devices/self` unregisters the calling device.
-5. `GET /api/mesh/v1/devices` lists the caller's own devices (`name`, `public_key`, `platform`, `created_at`,
-   `last_seen_at`, and `self: true` for the calling one).
+5. `GET /api/mesh/v1/devices` returns `{"devices": [...]}`, the caller's own devices (`name`, `public_key`,
+   `platform`, `relay`, `created_at`, `last_seen_at` in ms, and `self: true` for the calling one).
 6. `DELETE /api/mesh/v1/devices/<public_key>` revokes one of the caller's own devices, for a lost or stolen
    computer: spew deletes its grant and the peers `version` changes, so every roster drops it at its next refresh.
 
 Each device signs in on its own, so each has its own sign-in grant. spew binds a registered device to the grant
 that registered it; later calls with that grant's tokens (refresh keeps the grant) act for that device. A grant
-holds at most one device. `logout` calls `DELETE /api/mesh/v1/devices/self`, then revokes the refresh token at the `revocation_endpoint`.
+holds at most one device: registering a different key under a grant that already holds one is refused with 409
+and `{"error": {"code": "grant-has-device", "message": "..."}}`. Every sign-in (14.1) creates a new grant, so starting over after a lost
+identity (4.1) works. `logout` calls `DELETE /api/mesh/v1/devices/self`, then revokes the refresh token at the `revocation_endpoint`.
 
 ### 14.4 Peers
 
@@ -1277,6 +1313,8 @@ holds at most one device. `logout` calls `DELETE /api/mesh/v1/devices/self`, the
 {
   "version": "opaque",
   "ttl_secs": 60,
+  "me": { "username": "sam", "display": "Sam",
+          "devices": [ { "endpoint_id": "...", "name": "sam-mac", "relay": null } ] },
   "rooms": [
     { "id": "spew", "name": "spew", "kind": "project",
       "members": [
@@ -1287,6 +1325,8 @@ holds at most one device. `logout` calls `DELETE /api/mesh/v1/devices/self`, the
 }
 ```
 
+- `me` lists all of the caller's own registered, unrevoked devices, whatever projects were chosen at consent,
+  so a person's devices find each other with no shared project. They form the private room.
 - Lists only projects the device was allowed for at consent, only people who are members of them, and only their
   registered, unrevoked devices. No emails and no internal ids.
 - Removing a person from a project, revoking a device, or deleting a project changes `version`.

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::paths::{FILE_MODE, PathsError, mode_of, private_open_options, set_mode};
 use crate::wire::{ActivityState, MessageKind, Reach, SessionKind};
 
-/// How long messages and receipts are kept (11.1).
+/// How long messages and receipts are kept, and ended sessions after they end (11.1).
 pub const MESSAGE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How long dedupe keys are kept (11.1).
 pub const DEDUPE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -527,6 +527,8 @@ pub struct Swept {
     pub receipts: usize,
     /// Dedupe keys.
     pub dedupe: usize,
+    /// Sessions that ended, with the cards they held.
+    pub sessions: usize,
 }
 
 /// SHA-256 of a session token as lowercase hex, the only form of a token the store keeps.
@@ -1406,11 +1408,18 @@ impl Store {
         let dedupe = tx
             .execute("DELETE FROM dedupe WHERE at < ?1", params![dedupe_cutoff])
             .ctx("sweep dedupe keys")?;
+        let sessions = tx
+            .execute(
+                "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+                params![message_cutoff],
+            )
+            .ctx("sweep ended sessions")?;
         tx.commit().ctx("commit the sweep")?;
         Ok(Swept {
             messages,
             receipts,
             dedupe,
+            sessions,
         })
     }
 }
@@ -2003,6 +2012,14 @@ mod tests {
         let mut new_key = message(4, MessageState::Delivered);
         new_key.from.device = SAM_DEVICE.into();
         s.insert_received(&new_key, now - 6 * DAY).unwrap();
+        // Ended 31 days ago, ended 29 days ago, and live since long ago.
+        s.put_session(&session(10, "claude-old")).unwrap();
+        s.put_card(&ulid(10), "spew#1", "spew", now - 40 * DAY)
+            .unwrap();
+        s.end_session(&ulid(10), now - 31 * DAY).unwrap();
+        s.put_session(&session(11, "claude-recent")).unwrap();
+        s.end_session(&ulid(11), now - 29 * DAY).unwrap();
+        s.put_session(&session(12, "claude-live")).unwrap();
 
         let swept = s.sweep(now).unwrap();
         assert_eq!(
@@ -2010,9 +2027,14 @@ mod tests {
             Swept {
                 messages: 1,
                 receipts: 1,
-                dedupe: 1
+                dedupe: 1,
+                sessions: 1
             }
         );
+        assert!(s.session(&ulid(10)).unwrap().is_none());
+        assert!(s.cards(&ulid(10)).unwrap().is_empty());
+        assert!(s.session(&ulid(11)).unwrap().is_some());
+        assert!(s.session(&ulid(12)).unwrap().is_some());
         assert!(s.message_by_seq(old).unwrap().is_none());
         assert!(s.state_history(old).unwrap().is_empty());
         assert!(s.message_by_seq(recent).unwrap().is_some());

@@ -3,8 +3,9 @@
 
 use std::time::{Duration, Instant};
 
+use super::outbox::retry_delay_ms;
 use super::outbox::{Attempt, read_deliver_response};
-use super::{Core, Courier, RECEIPT_WAIT, refusal_reason, render, store_err};
+use super::{Core, Courier, RECEIPT_WAIT, refusal_reason, render, store_err, warn_store};
 use crate::address::{Address, is_card};
 use crate::control::protocol::{
     AnswerView, AskParams, ReplyParams, RpcError, SendResult, SendStatus, TellParams,
@@ -260,6 +261,11 @@ impl<L: Links> Courier<L> {
             }
             return Ok((msg, Sent::Delivered, None));
         };
+        // A reply goes to whoever wrote, without resolving an address; a device that has left every shared room
+        // can't take it, and queueing it would only let it expire a day later (4.3).
+        if !c.roster.admission().is_admitted(&device) {
+            return Ok((msg, Sent::Refused(RefusalCode::NoSuchSession), None));
+        }
         if !c.guard.allows(&msg.conversation, now) {
             return Ok((msg, Sent::Refused(RefusalCode::ConversationLimit), None));
         }
@@ -287,27 +293,30 @@ impl<L: Links> Courier<L> {
         };
         let payload = serde_json::to_string(&envelope)
             .map_err(|e| RpcError::unavailable(format!("could not encode the message: {e}")))?;
-        let message_seq = c.store.insert_message(&msg, now).map_err(store_err)?;
-        c.guard.record(&msg.conversation, now);
-        let entry_seq = c
+        // The message and its outbox entry are written together, so a queued message always has an entry that
+        // sends or expires it. The entry is due in 10 s, so a daemon that stops mid-attempt still retries (7.4).
+        let (message_seq, entry_seq) = c
             .store
-            .outbox_push(
+            .insert_queued(
+                &msg,
                 &NewOutbox {
                     device: &target.party.device,
                     kind: OutboxKind::Deliver,
-                    message_seq: Some(message_seq),
+                    message_seq: None,
                     payload: &payload,
-                    next_attempt_at: now,
+                    next_attempt_at: now + retry_delay_ms(1),
                     expires_at: now + msg.ttl_secs * 1000,
                 },
                 now,
             )
             .map_err(store_err)?;
-        // The first retry comes 10 s from now whether or not the attempt below happens (7.4).
-        c.store
-            .outbox_retry(entry_seq, now + super::outbox::retry_delay_ms(1))
-            .map_err(store_err)?;
+        c.guard.record(&msg.conversation, now);
         if !c.remote.is_online(&device) {
+            // An offline device counts as the first attempt failing, so the next retry follows it at 30 s.
+            warn_store(
+                c.store.outbox_retry(entry_seq, now + retry_delay_ms(1)),
+                "could not schedule the first retry",
+            );
             return Ok((
                 msg,
                 Sent::Queued(format!("{} is offline", target.party.device_name)),
@@ -326,7 +335,6 @@ impl<L: Links> Courier<L> {
     async fn first_attempt(
         &self,
         device: iroh::EndpointId,
-        target: &Target,
         entry_seq: i64,
         message_seq: i64,
         envelope: Envelope,
@@ -338,14 +346,12 @@ impl<L: Links> Courier<L> {
         let attempt = read_deliver_response(&id, response);
         let mut c = self.core();
         c.in_flight.remove(&entry_seq);
-        self.settle_deliver(&mut c, entry_seq, message_seq, 1, &attempt, true);
+        // Nothing failed before this attempt, so a failure here schedules the 10 s retry.
+        self.settle_deliver(&mut c, entry_seq, message_seq, 0, &attempt, true);
         match attempt {
             Attempt::Delivered => Sent::Delivered,
             Attempt::Refused(code) => Sent::Refused(code),
-            Attempt::Retry { reason, .. } => {
-                let _ = target;
-                Sent::Queued(format!("no receipt yet ({reason})"))
-            }
+            Attempt::Retry { reason, .. } => Sent::Queued(format!("no receipt yet ({reason})")),
         }
     }
 
@@ -367,7 +373,7 @@ impl<L: Links> Courier<L> {
         };
         let sent = match (attempt, target.device) {
             (Some((entry_seq, message_seq, envelope)), Some(device)) => {
-                self.first_attempt(device, &target, entry_seq, message_seq, envelope)
+                self.first_attempt(device, entry_seq, message_seq, envelope)
                     .await
             }
             _ => sent,
@@ -715,7 +721,7 @@ impl<L: Links> Courier<L> {
                 if self.queue_len(&c, &s) == 0 && s.state != ActivityState::Idle {
                     s.state = ActivityState::Idle;
                     s.state_since = now;
-                    let _ = c.store.put_session(&s);
+                    warn_store(c.store.put_session(&s), "could not mark a responder idle");
                     self.presence_changed();
                 }
             }

@@ -17,7 +17,8 @@ use crate::agents::hook::{HookCall, MeshEvent};
 use crate::control::protocol::RpcError;
 use crate::settings::{RoomSource, resolve_room};
 use crate::store::{SessionRecord, Store, StoreError, hash_token};
-use crate::wire::{ActivityState, Reach, SessionKind, place_from_cwd};
+use crate::text::sanitize_line;
+use crate::wire::{ActivityState, MAX_BRANCH, Reach, SessionKind, place_from_cwd};
 
 /// Rule 3: how long a session with no process waits for a new attach after its last connection closed (6.4).
 pub const DETACH_GRACE_MS: u64 = 10_000;
@@ -140,7 +141,12 @@ pub fn apply_cwd(
     let info = git::git_info(path);
     record.cwd = Some(cwd.to_string());
     record.repo = info.as_ref().and_then(|i| i.repo.clone());
-    record.branch = info.as_ref().and_then(|i| i.branch.clone());
+    // A branch name is whatever .git/HEAD says; it goes out in presence, so it gets the peer-text rules (5.6).
+    record.branch = info
+        .as_ref()
+        .and_then(|i| i.branch.as_deref())
+        .map(|b| sanitize_line(b, MAX_BRANCH))
+        .filter(|b| !b.is_empty());
     record.place = place_from_cwd(path);
     let choice = resolve_room(spew_project, path, default_room);
     if let RoomSource::Invalid(why) = &choice.source {
@@ -213,13 +219,14 @@ pub struct Registry {
 
 impl Registry {
     /// Loads the live sessions after a daemon start. Sessions that were reached through a connection get
-    /// [`RESTART_GRACE_MS`] to re-attach (6.4).
+    /// [`RESTART_GRACE_MS`] to re-attach (6.4); a hooked session counts when it also had one.
     pub fn restore(store: &Store, now: u64) -> Result<Registry, StoreError> {
         let mut reg = Registry::default();
+        let connected = store.had_connection()?;
         for s in store.live_sessions()? {
             reg.tokens.insert(s.token_hash.clone(), s.id.clone());
-            let had_connection =
-                s.client_pid.is_none() && matches!(s.reach, Reach::Inbox | Reach::Serve);
+            let had_connection = connected.contains(&s.id)
+                || (s.client_pid.is_none() && matches!(s.reach, Reach::Inbox | Reach::Serve));
             if had_connection && s.kind != SessionKind::Terminal {
                 reg.connected.insert(s.id.clone());
                 reg.detached_at
@@ -283,14 +290,19 @@ impl Registry {
         Ok(token)
     }
 
-    /// Records that connection `conn` uses session `id` (rule 3).
-    pub fn attach(&mut self, conn: u64, id: &str) {
+    /// Records that connection `conn` uses session `id` (rule 3), and in the store that it had a connection,
+    /// so rule 3 still holds after a restart.
+    pub fn attach(&mut self, store: &Store, conn: u64, id: &str) -> Result<(), StoreError> {
+        if !self.connected.contains(id) {
+            store.mark_had_connection(id)?;
+        }
         self.attached
             .entry(conn)
             .or_default()
             .insert(id.to_string());
         self.connected.insert(id.to_string());
         self.detached_at.remove(id);
+        Ok(())
     }
 
     fn is_attached(&self, id: &str) -> bool {
@@ -380,6 +392,11 @@ impl Registry {
             }
             None => (self.new_record(&live, req, ctx)?, true),
         };
+        // The terminal is re-opened by every CLI command and never ends; only the newest token stays good, so
+        // the old hashes don't pile up for the daemon's life.
+        if record.kind == SessionKind::Terminal {
+            self.tokens.retain(|_, sid| sid != &record.id);
+        }
         let token = self.issue_token(&mut record)?;
         record.last_seen_at = ctx.now;
         store.put_session(&record).map_err(store_err)?;
@@ -535,6 +552,7 @@ impl Registry {
             }
         }
         if self.connected.remove(&loser.id) {
+            store.mark_had_connection(&survivor.id).map_err(store_err)?;
             self.connected.insert(survivor.id.clone());
         }
         self.detached_at.remove(&loser.id);

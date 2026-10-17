@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use super::send::MAX_WAIT_SECS;
-use super::{Core, Courier, render, store_err};
+use super::{Core, Courier, render, store_err, warn_store};
 use crate::address::is_card;
 use crate::agents::cards::{self, ActivityUpdate};
 use crate::agents::hook::{HookAnswer, HookCall, MeshEvent};
@@ -21,6 +21,8 @@ use crate::wire::{ActivityState, MAX_ACTIVITY, MessageKind, Reach, SessionKind};
 
 /// The most cards one `session.update` may name.
 const MAX_CARD_CHANGES: usize = 50;
+/// The most text one `messages.fetch` returns; the rest stays unread and is counted in "N more".
+pub const FETCH_BUDGET: usize = 64 * 1024;
 
 fn check_cards(list: &[String]) -> Result<Vec<String>, RpcError> {
     if list.len() > MAX_CARD_CHANGES {
@@ -86,7 +88,9 @@ impl<L: Links> Courier<L> {
         let token = opened
             .token
             .ok_or_else(|| RpcError::unavailable("no token was issued for the session"))?;
-        c.reg.attach(conn.id(), &opened.session.id);
+        c.reg
+            .attach(&c.store, conn.id(), &opened.session.id)
+            .map_err(store_err)?;
         if let Some(limits) = &p.serve {
             // A re-open (after a lost connection) keeps the runs already counted this hour.
             c.gates
@@ -210,18 +214,31 @@ impl<L: Links> Courier<L> {
             .reg
             .ids_of(session)
             .iter()
-            .flat_map(|sid| c.store.messages_to(sid, states).unwrap_or_default())
+            .flat_map(|sid| {
+                warn_store(
+                    c.store.messages_to(sid, states),
+                    "could not read a session's mail",
+                )
+                .unwrap_or_default()
+            })
             .filter(|m| m.message.to.device == self.cfg.device.hex)
             .collect();
         out.sort_by_key(|m| m.seq);
         out
     }
 
-    // Asks a session was shown before and hasn't answered (7.3).
+    // Asks a session was shown before and hasn't answered (7.3), while the asker may still take an answer: once
+    // an ask's time has run out it stops coming back.
     fn unanswered_asks(&self, c: &Core, session: &str) -> Vec<StoredMessage> {
+        let now = self.now();
         self.messages_for(c, session, &[MessageState::Shown])
             .into_iter()
-            .filter(|m| m.message.kind == MessageKind::Ask)
+            .filter(|m| {
+                m.message.kind == MessageKind::Ask
+                    && now
+                        < m.created_at
+                            .saturating_add(m.message.ttl_secs.saturating_mul(1000))
+            })
             .collect()
     }
 
@@ -283,7 +300,8 @@ impl<L: Links> Courier<L> {
         if changed {
             self.presence_changed();
         }
-        if !call.show {
+        // A stop hook never blocks the agent, so it never carries messages (8.1).
+        if !call.show || call.event == MeshEvent::Stop {
             return Ok(answer);
         }
         let rendered = self.injection(c, &record.id);
@@ -442,25 +460,35 @@ impl<L: Links> Courier<L> {
         let unread = self.messages_for(c, &id, &[MessageState::Delivered]);
         let again = self.unanswered_asks(c, &id);
         let me = c.roster.me().username.clone();
-        let mut blocks = Vec::new();
-        let mut views = Vec::new();
-        for (m, is_again) in unread
+        let listed: Vec<(&StoredMessage, bool)> = unread
             .iter()
             .map(|m| (m, false))
             .chain(again.iter().map(|m| (m, true)))
-        {
-            blocks.push(render::block(m, &me, is_again));
-            views.push(render::view(m, is_again));
-        }
-        let text = render_batch(&blocks, None).text;
+            .collect();
+        let blocks: Vec<_> = listed
+            .iter()
+            .map(|(m, is_again)| render::block(m, &me, *is_again))
+            .collect();
+        let rendered = render_batch(&blocks, Some(FETCH_BUDGET));
+        let in_text = |m: &StoredMessage| {
+            rendered.shown.contains(&m.message.id) || rendered.cut.as_ref() == Some(&m.message.id)
+        };
+        let views = listed
+            .iter()
+            .filter(|(m, _)| in_text(m))
+            .map(|(m, is_again)| render::view(m, *is_again))
+            .collect();
         if !p.keep_unread {
-            for m in &unread {
+            for m in unread
+                .iter()
+                .filter(|m| rendered.shown.contains(&m.message.id))
+            {
                 self.mark_shown(c, m);
             }
         }
         Ok(Fetched {
             messages: views,
-            text,
+            text: rendered.text,
             unread: self.unread_count(c, &id),
         })
     }
@@ -498,7 +526,7 @@ impl<L: Links> Courier<L> {
         if let Ok(Some(mut s)) = c.store.session(&id)
             && set_state(&mut s, ActivityState::Busy, now)
         {
-            let _ = c.store.put_session(&s);
+            warn_store(c.store.put_session(&s), "could not mark a responder busy");
         }
         self.presence_changed();
         let me = c.roster.me().username.clone();

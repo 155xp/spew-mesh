@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-use super::{Core, Courier, render};
+use super::{Core, Courier, render, warn_store};
 use crate::address::is_ulid;
 use crate::link::{Links, Peer};
 use crate::responder::limits::{MAX_WAITING, Refusal};
@@ -238,28 +238,26 @@ impl<L: Links> Courier<L> {
         Ok(parent)
     }
 
-    // The room a received message came through: one this device shares with the sender, preferring the target
-    // session's room, else none (5.5).
+    // The room a received message came through: the target session's room when the sender shares it, else none
+    // (5.5). A reply reaching a private session names no room rather than an unrelated shared one.
     fn message_room(&self, c: &Core, peer: &Peer, target: &SessionRecord) -> Option<String> {
         let admitted = c.roster.admission().get(&peer.device)?;
-        let shared = |r: &str| r != PRIVATE_ROOM_ID && admitted.rooms.contains(r);
-        if let Some(room) = target.room.as_deref().filter(|r| shared(r)) {
-            return Some(room.to_string());
-        }
-        admitted
-            .rooms
-            .iter()
-            .find(|r| r.as_str() != PRIVATE_ROOM_ID)
-            .cloned()
+        target
+            .room
+            .as_deref()
+            .filter(|r| *r != PRIVATE_ROOM_ID && admitted.rooms.contains(*r))
+            .map(str::to_string)
     }
 
     // An answer to one of this device's asks was stored: the ask is answered, and when no `ask` call waits for
     // it any more the asking session gets a notice (7.6).
     pub(crate) fn answer_arrived(&self, c: &mut Core, ask: &StoredMessage, answer: &Message) {
         let now = self.now();
-        let _ = c
-            .store
-            .set_state(ask.seq, MessageState::Answered, None, now);
+        warn_store(
+            c.store
+                .set_state(ask.seq, MessageState::Answered, None, now),
+            "could not mark an ask answered",
+        );
         if c.waiting_asks.contains_key(&ask.message.id) {
             return;
         }
@@ -307,11 +305,16 @@ impl<L: Links> Courier<L> {
         if m.message.to.device != peer_hex || m.message.kind == MessageKind::Notice {
             return;
         }
-        let (state, code) = match u.state {
-            ReceiptState::Shown => (MessageState::Shown, None),
-            ReceiptState::Answered => (MessageState::Answered, None),
-            ReceiptState::Expired => (MessageState::Expired, None),
-            ReceiptState::Refused => (MessageState::Refused, u.code),
+        // Only an ask can be answered (7.1), and a refusal always says why; anything else is ignored.
+        let (state, code) = match (u.state, u.code) {
+            (ReceiptState::Shown, _) => (MessageState::Shown, None),
+            (ReceiptState::Answered, _) if m.message.kind == MessageKind::Ask => {
+                (MessageState::Answered, None)
+            }
+            (ReceiptState::Answered, _) => return,
+            (ReceiptState::Expired, _) => (MessageState::Expired, None),
+            (ReceiptState::Refused, Some(code)) => (MessageState::Refused, Some(code)),
+            (ReceiptState::Refused, None) => return,
         };
         let now = self.now();
         if !matches!(
@@ -323,12 +326,16 @@ impl<L: Links> Courier<L> {
         }
         // A receipt can overtake the deliver's own answer; the device has the message either way.
         if m.message.state == MessageState::Queued {
-            for entry in c.store.outbox_for(&peer_hex).unwrap_or_default() {
+            let queued = warn_store(c.store.outbox_for(&peer_hex), "could not read the outbox");
+            for entry in queued.unwrap_or_default() {
                 if entry.kind == OutboxKind::Deliver
                     && entry.message_seq == Some(m.seq)
                     && !c.in_flight.contains(&entry.seq)
                 {
-                    let _ = c.store.outbox_remove(entry.seq);
+                    warn_store(
+                        c.store.outbox_remove(entry.seq),
+                        "could not drop a delivered outbox entry",
+                    );
                 }
             }
         }

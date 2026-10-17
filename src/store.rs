@@ -148,8 +148,14 @@ CREATE TABLE roster_cache (
 );
 "#;
 
+// Whether a session was ever reached through a control connection, so rule 3 still applies to it after a
+// daemon restart (6.4).
+const V2: &str = r#"
+ALTER TABLE sessions ADD COLUMN had_connection INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// The migration steps; step `n` takes `user_version` from `n` to `n + 1`. Steps are only ever appended.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// The schema version this build writes.
 pub fn schema_version() -> u32 {
@@ -972,24 +978,52 @@ impl Store {
             .ctx("read a message history")
     }
 
+    fn insert_outbox_row(
+        conn: &Connection,
+        entry: &NewOutbox<'_>,
+        message_seq: Option<i64>,
+        now: u64,
+    ) -> rusqlite::Result<i64> {
+        conn.execute(
+            "INSERT INTO outbox (device, kind, message_seq, payload, next_attempt_at, expires_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                entry.device,
+                entry.kind,
+                message_seq,
+                entry.payload,
+                int(entry.next_attempt_at),
+                int(entry.expires_at),
+                int(now)
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// Queues a call for a device; returns the entry's row number.
     pub fn outbox_push(&self, entry: &NewOutbox<'_>, now: u64) -> Result<i64, StoreError> {
-        self.conn
-            .execute(
-                "INSERT INTO outbox (device, kind, message_seq, payload, next_attempt_at, expires_at, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    entry.device,
-                    entry.kind,
-                    entry.message_seq,
-                    entry.payload,
-                    int(entry.next_attempt_at),
-                    int(entry.expires_at),
-                    int(now)
-                ],
-            )
-            .ctx("queue an outbox entry")?;
-        Ok(self.conn.last_insert_rowid())
+        Store::insert_outbox_row(&self.conn, entry, entry.message_seq, now)
+            .ctx("queue an outbox entry")
+    }
+
+    /// Stores a message for another device and its outbox entry in one transaction, so a queued message always
+    /// has an entry that sends or expires it (7.4). The entry's `message_seq` is the new message's. Returns the
+    /// message's and the entry's row numbers.
+    pub fn insert_queued(
+        &self,
+        message: &Message,
+        entry: &NewOutbox<'_>,
+        now: u64,
+    ) -> Result<(i64, i64), StoreError> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .ctx("start a transaction")?;
+        let seq = Store::insert_message_row(&tx, message, now).ctx("store a message")?;
+        let entry_seq =
+            Store::insert_outbox_row(&tx, entry, Some(seq), now).ctx("queue an outbox entry")?;
+        tx.commit().ctx("commit a queued message")?;
+        Ok((seq, entry_seq))
     }
 
     /// Every entry for a device in queue order, for when its link comes up.
@@ -1161,6 +1195,30 @@ impl Store {
         let rows = stmt.query_map([], session_row).ctx("read sessions")?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .ctx("read sessions")
+    }
+
+    /// Records that a session was reached through a control connection (6.4 rule 3).
+    pub fn mark_had_connection(&self, id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET had_connection = 1 WHERE id = ?1 AND had_connection = 0",
+                params![id],
+            )
+            .ctx("mark a session connected")?;
+        Ok(())
+    }
+
+    /// The live sessions that were ever reached through a control connection.
+    pub fn had_connection(&self) -> Result<std::collections::HashSet<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE ended_at IS NULL AND had_connection = 1")
+            .ctx("read connected sessions")?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .ctx("read connected sessions")?;
+        rows.collect::<rusqlite::Result<_>>()
+            .ctx("read connected sessions")
     }
 
     /// Ends a session, which frees its name (6.4). Returns whether a live session ended.
@@ -1747,6 +1805,44 @@ mod tests {
             s.message_by_seq(seq).unwrap().unwrap().message.kind,
             MessageKind::Notice
         );
+    }
+
+    #[test]
+    fn a_queued_message_and_its_outbox_entry_are_written_together() {
+        let s = store();
+        let m = message(1, MessageState::Queued);
+        let entry = NewOutbox {
+            device: SAM_DEVICE,
+            kind: OutboxKind::Deliver,
+            message_seq: None,
+            payload: "{}",
+            next_attempt_at: 10,
+            expires_at: 1_000,
+        };
+        let (seq, entry_seq) = s.insert_queued(&m, &entry, 1).unwrap();
+        let queued = s.outbox_for(SAM_DEVICE).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].seq, entry_seq);
+        assert_eq!(queued[0].message_seq, Some(seq));
+        // A message that can't be stored leaves no outbox entry behind.
+        assert!(s.insert_queued(&m, &entry, 2).is_err());
+        assert_eq!(s.outbox_for(SAM_DEVICE).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sessions_remember_having_had_a_connection() {
+        let s = store();
+        let a = session(1, "claude-api");
+        let b = session(2, "codex-web");
+        s.put_session(&a).unwrap();
+        s.put_session(&b).unwrap();
+        s.mark_had_connection(&a.id).unwrap();
+        // Rewriting the record keeps the flag.
+        s.put_session(&a).unwrap();
+        let connected = s.had_connection().unwrap();
+        assert!(connected.contains(&a.id) && !connected.contains(&b.id));
+        s.end_session(&a.id, 20).unwrap();
+        assert!(s.had_connection().unwrap().is_empty());
     }
 
     #[test]

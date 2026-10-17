@@ -65,21 +65,6 @@ pub struct DaemonOptions {
     pub clock: Arc<dyn Clock>,
 }
 
-/// The `[serve]` settings as the responder's gates take them.
-pub fn serve_settings(s: &crate::settings::ServeSettings) -> crate::responder::ServeSettings {
-    crate::responder::ServeSettings {
-        timeout_seconds: s.timeout_seconds,
-        max_turns: s.max_turns,
-        from: match s.from {
-            crate::settings::ServeFrom::Room => crate::responder::ServeFrom::Room,
-            crate::settings::ServeFrom::Own => crate::responder::ServeFrom::Own,
-        },
-        max_runs_per_person_per_hour: s.max_runs_per_person_per_hour,
-        max_runs_per_hour: s.max_runs_per_hour,
-        max_budget_usd: s.max_budget_usd,
-    }
-}
-
 // Registering this device with spew again after the try at sign-in failed (14.3). Registering is idempotent, so
 // it is retried after each spew refresh until the roster lists this device.
 struct Registration {
@@ -243,7 +228,7 @@ where
         default_room: settings.roster.default_room.clone(),
         send_branch: settings.presence.branch,
         send_place: settings.presence.place,
-        serve: serve_settings(&settings.serve),
+        serve: settings.serve.clone(),
         clock: opts.clock.clone(),
         start_time: crate::sessions::process::start_time,
     };

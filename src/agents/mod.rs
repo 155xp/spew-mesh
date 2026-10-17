@@ -1,10 +1,13 @@
 //! Agent wiring: the MCP server, hook commands and setup for each client (8).
 
+pub mod cards;
 pub mod fsx;
+pub mod hook;
 pub mod json;
 pub mod manifest;
 pub mod plan;
 pub mod runner;
+pub mod skill;
 
 use std::fmt;
 

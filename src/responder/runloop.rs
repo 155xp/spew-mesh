@@ -492,7 +492,7 @@ fn already_replied(e: &ClientError) -> bool {
 /// `<home>/run/stopped`: while it exists, a reconnecting responder doesn't start a daemon (6.1). `daemon stop`
 /// writes it and a daemon that holds the lock removes it.
 pub fn stopped_file(home: &Home) -> PathBuf {
-    home.run_dir().join("stopped")
+    home.stopped_file()
 }
 
 // The first connect may start a daemon; a reconnect starts one only while `run/stopped` is absent, so a

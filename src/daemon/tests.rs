@@ -300,7 +300,7 @@ impl Harness {
             default_room: None,
             send_branch: true,
             send_place: true,
-            serve: serve_settings(&settings.serve),
+            serve: settings.serve.clone(),
             clock: clock.clone(),
             start_time: |_| None,
         };

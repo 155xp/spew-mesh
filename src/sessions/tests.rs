@@ -103,6 +103,22 @@ fn responders_and_the_terminal() {
     let t2 = reg.open(&s, &term, &ctx(5)).unwrap();
     assert_eq!(t1.session.name, TERMINAL_NAME);
     assert_eq!(t1.session.id, t2.session.id);
+    // Only the newest terminal token is good; the old ones don't pile up.
+    assert!(
+        reg.session_for_token(&s, t1.token.as_deref().unwrap())
+            .is_err()
+    );
+    assert!(
+        reg.session_for_token(&s, t2.token.as_deref().unwrap())
+            .is_ok()
+    );
+    assert_eq!(
+        reg.tokens
+            .values()
+            .filter(|id| **id == t1.session.id)
+            .count(),
+        1
+    );
 
     let mut bad = live("claude", &cwd);
     bad.kind = SessionKind::Terminal;
@@ -226,7 +242,7 @@ fn the_four_end_rules() {
     let p = reg.open(&s, &with_pid, &ctx(0)).unwrap();
     // Rule 3: a connection that closed.
     let c = reg.open(&s, &live("other", &cwd), &ctx(0)).unwrap();
-    reg.attach(5, &c.session.id);
+    reg.attach(&s, 5, &c.session.id).unwrap();
     // Rule 4: hooks only.
     let h = reg
         .for_hook(
@@ -255,7 +271,7 @@ fn the_four_end_rules() {
     let due = reg.due(&live_now, 2_000 + DETACH_GRACE_MS, false, &no_procs);
     assert_eq!(due, vec![(c.session.id.clone(), EndReason::Detached)]);
     // A new attach within the grace keeps it.
-    reg.attach(6, &c.session.id);
+    reg.attach(&s, 6, &c.session.id).unwrap();
     assert!(reg.due(&live_now, 60_000, false, &no_procs).is_empty());
 
     let due = reg.due(&live_now, SILENT_LIMIT_MS, false, &no_procs);
@@ -271,6 +287,26 @@ fn after_a_restart_connected_sessions_get_a_minute() {
     let mut term = live(TERMINAL_CLIENT, &cwd);
     term.kind = SessionKind::Terminal;
     reg.open(&s, &term, &ctx(0)).unwrap();
+    // A Codex session with hooks and an MCP server: hooked, no pid, but it had a connection.
+    let both = reg
+        .for_hook(
+            &s,
+            &hook(Client::Codex, MeshEvent::Start, "t", None, &cwd),
+            &ctx(0),
+        )
+        .unwrap()
+        .unwrap();
+    reg.attach(&s, 7, &both.session.id).unwrap();
+    // Hooks alone: rule 4 only.
+    let (_t2, other) = folder("web");
+    let hooks_only = reg
+        .for_hook(
+            &s,
+            &hook(Client::Codex, MeshEvent::Start, "u", None, &other),
+            &ctx(0),
+        )
+        .unwrap()
+        .unwrap();
     let restarted = Registry::restore(&s, 100_000).unwrap();
     let live_now = s.live_sessions().unwrap();
     assert!(
@@ -278,8 +314,15 @@ fn after_a_restart_connected_sessions_get_a_minute() {
             .due(&live_now, 100_000 + RESTART_GRACE_MS - 1, false, &no_procs)
             .is_empty()
     );
-    let due = restarted.due(&live_now, 100_000 + RESTART_GRACE_MS, false, &no_procs);
-    assert_eq!(due, vec![(inbox.session.id.clone(), EndReason::Detached)]);
+    let mut due = restarted.due(&live_now, 100_000 + RESTART_GRACE_MS, false, &no_procs);
+    due.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want = vec![
+        (inbox.session.id.clone(), EndReason::Detached),
+        (both.session.id.clone(), EndReason::Detached),
+    ];
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(due, want);
+    assert!(!due.iter().any(|(id, _)| *id == hooks_only.session.id));
     // Its token still works after the restart.
     assert!(
         restarted
@@ -317,4 +360,23 @@ fn tool_shows_and_unanswered_lines_are_rationed() {
     assert!(reg.mention_unanswered("s", &["a".into()]));
     assert!(!reg.mention_unanswered("s", &["a".into()]));
     assert!(reg.mention_unanswered("s", &["a".into(), "b".into()]));
+}
+
+#[test]
+fn branch_names_get_the_peer_text_rules() {
+    let s = store();
+    let mut reg = Registry::default();
+    let (tmp, cwd) = folder("api");
+    std::fs::create_dir_all(tmp.path().join("api/.git")).unwrap();
+    let long = "b".repeat(300);
+    std::fs::write(
+        tmp.path().join("api/.git/HEAD"),
+        format!("ref: refs/heads/fix\u{1b}[31m-{long}\n"),
+    )
+    .unwrap();
+    let a = reg.open(&s, &live("claude", &cwd), &ctx(1)).unwrap();
+    let branch = a.session.branch.unwrap();
+    assert!(branch.starts_with("fix"));
+    assert!(!branch.contains('\u{1b}'));
+    assert!(branch.chars().count() <= MAX_BRANCH);
 }

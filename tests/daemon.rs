@@ -14,11 +14,18 @@ use spew_mesh::control::protocol::{
 use spew_mesh::daemon::testnet::{MemLinks, MemNet};
 use spew_mesh::daemon::{self, Daemon, DaemonOptions};
 use spew_mesh::identity::DeviceIdentity;
+use spew_mesh::link::Links;
 use spew_mesh::paths::Home;
+use spew_mesh::roster::Admission;
+use spew_mesh::roster::file as roster_file;
 use spew_mesh::settings::Env;
+use spew_mesh::spew_api::Clock;
 use spew_mesh::spew_api::SystemClock;
 use spew_mesh::store::MessageState;
-use spew_mesh::wire::{MessageKind, SessionKind};
+use spew_mesh::wire::{
+    ActivityState, MessageKind, PresenceDevice, PresenceSession, PresenceSnapshot, Reach, Request,
+    Response, SessionKind,
+};
 
 use iroh::EndpointId;
 
@@ -616,6 +623,126 @@ async fn sessions_in_other_rooms_stay_out_of_reach() {
     sam.stop(&net).await;
     maya.stop(&net).await;
     lee.stop(&net).await;
+}
+
+// A presence session from lee's device, which shares only `ops` with maya.
+fn lee_session(id: &str, name: &str, room: &str, cards: &[&str]) -> PresenceSession {
+    PresenceSession {
+        session: id.into(),
+        name: name.into(),
+        client: "codex".into(),
+        kind: SessionKind::Live,
+        repo: None,
+        branch: None,
+        place: None,
+        room: Some(room.into()),
+        cards: cards.iter().map(|c| c.to_string()).collect(),
+        activity: None,
+        state: ActivityState::Idle,
+        since: 1,
+        reach: Reach::Hooked,
+        queue: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_teammate_cannot_claim_a_room_or_card_it_does_not_share() {
+    let net = MemNet::new();
+    let mut sam = Device::prepare(&SAM);
+    let mut maya = Device::prepare(&MAYA);
+    let lee = Device::prepare(&LEE);
+    let text = roster_text(
+        &[(&SAM, &sam), (&MAYA, &maya), (&LEE, &lee)],
+        &[("team", &["sam", "maya"]), ("ops", &["maya", "lee"])],
+    );
+    for (p, d) in [(&SAM, &sam), (&MAYA, &maya), (&LEE, &lee)] {
+        d.write_settings(p);
+        d.write_roster(&text);
+    }
+    sam.start(&net).await;
+    maya.start(&net).await;
+    // lee's device runs no daemon here: it is a peer that says whatever it likes.
+    let (lee_links, _inbound) = net.join(lee.id);
+    let now = SystemClock.now_ms();
+    let (me, roster) = roster_file::load(&lee.tmp.path().join("roster.toml"))
+        .unwrap()
+        .roster_for(Some("lee"), &lee.id, now)
+        .unwrap();
+    lee_links.set_admission(Admission::compute(&me, &lee.id, &roster));
+    assert!(net.is_up(&lee.id, &maya.id));
+
+    let web = open(&maya, &maya.folder("web", Some("team"))).await;
+    let api = open(&sam, &sam.folder("api", Some("team"))).await;
+    // A session it claims in `team` holding team#7, and one in `ops` that also claims team#7.
+    let snapshot = PresenceSnapshot {
+        seq: now,
+        device: PresenceDevice {
+            name: "lee-linux".into(),
+            platform: "linux".into(),
+            version: "0.1.0".into(),
+        },
+        sessions: vec![
+            lee_session(
+                "01J9ZK000000000000000000A1",
+                "codex-web-help",
+                "team",
+                &["team#7"],
+            ),
+            lee_session(
+                "01J9ZK000000000000000000A2",
+                "codex-deploy",
+                "ops",
+                &["team#7", "ops#3"],
+            ),
+        ],
+    };
+    let answer = lee_links
+        .call(maya.id, Request::Presence(snapshot))
+        .await
+        .unwrap();
+    assert_eq!(answer, Response::Ok);
+
+    let dir = web
+        .client
+        .directory(&DirectoryQuery {
+            token: Some(web.token.clone()),
+            filter: None,
+            include_offline: true,
+        })
+        .await
+        .unwrap();
+    let lees: Vec<_> = dir
+        .rooms
+        .iter()
+        .flat_map(|r| &r.people)
+        .filter(|p| p.person == "lee")
+        .flat_map(|p| &p.sessions)
+        .collect();
+    assert_eq!(lees.len(), 1, "{lees:?}");
+    assert_eq!(lees[0].name, "codex-deploy");
+    assert_eq!(lees[0].room.as_deref(), Some("ops"));
+    assert_eq!(lees[0].cards, ["ops#3"]);
+
+    // Neither the card nor the session in `team` reaches lee's device.
+    let ask = |to: &str| AskParams {
+        token: web.token.clone(),
+        to: to.into(),
+        text: "who has team#7?".into(),
+        card: None,
+        wait_seconds: Some(0),
+    };
+    for to in ["team#7", "lee/codex-web-help"] {
+        let err = web.client.ask(&ask(to)).await.unwrap_err();
+        assert_eq!(err.rpc().unwrap().reason, Reason::NotFound, "{to}");
+    }
+    // ops#3 is lee's to hold.
+    let held = web.client.ask(&ask("ops#3")).await.unwrap();
+    assert_eq!(held.to, "lee@lee-linux/codex-deploy");
+    drop(api);
+
+    sam.stop(&net).await;
+    maya.stop(&net).await;
+    net.leave(&lee.id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

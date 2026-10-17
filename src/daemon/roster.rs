@@ -275,6 +275,17 @@ impl RosterManager {
         })
     }
 
+    /// Whether the spew roster lists this device among my own; `None` before spew sent a roster.
+    pub fn spew_lists_this_device(&self) -> Option<bool> {
+        let peers = self.cache.as_ref()?.peers()?;
+        let hex = self.device.to_string();
+        Some(peers.me.as_ref().is_some_and(|me| {
+            me.devices
+                .iter()
+                .any(|d| d.endpoint_id.eq_ignore_ascii_case(&hex))
+        }))
+    }
+
     /// Forgets the spew cache, after a sign-out or a sign-in as someone else.
     pub fn reset_spew(&mut self) {
         self.cache = None;

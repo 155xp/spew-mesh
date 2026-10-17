@@ -1,5 +1,5 @@
 //! Where the control socket lives and how the daemon claims it (6.1): the socket path, the lock, stale socket
-//! removal, binding under umask 077, `run/socket`, uid checks, and starting a daemon from a client.
+//! removal, binding 0600 under a strict umask, `run/socket`, uid checks, and starting a daemon from a client.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, TryLockError};
@@ -10,8 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use crate::paths::{
-    FILE_MODE, Home, LOG_ROTATE_BYTES, ensure_private_dir, open_private_append,
-    private_open_options, rotate_log, set_mode, write_atomic,
+    Home, LOG_ROTATE_BYTES, ensure_private_dir, open_private_append, private_open_options,
+    rotate_log, write_atomic,
 };
 
 /// The socket path must be shorter than this many bytes to live in the home (6.1); Unix socket paths are
@@ -115,6 +115,24 @@ pub fn remove_stale_socket(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Removes the socket an earlier daemon of this home recorded in `run/socket`, when it is still there, is a
+/// socket and belongs to this user. Call it holding the lock, so no live daemon uses it; a daemon that crashed
+/// with a socket outside the home leaves nothing behind for long.
+pub fn remove_previous_socket(home: &Home) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(path) = read_socket_path(home) else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_socket() && meta.uid() == current_uid() => {
+            std::fs::remove_file(&path)
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// The socket path a running daemon recorded in `run/socket`.
 pub fn read_socket_path(home: &Home) -> Option<PathBuf> {
     let text = std::fs::read_to_string(home.socket_file()).ok()?;
@@ -138,17 +156,14 @@ fn set_umask(mask: libc::mode_t) -> libc::mode_t {
     unsafe { libc::umask(mask) }
 }
 
-/// Binds the control socket with umask 077, so it is 0600 from the start (6.1), and sets 0600 again after.
+/// Binds the control socket under umask 177, so it is created 0600 (6.1 asks for at least 077). No chmod
+/// follows: in a shared runtime folder a chmod by path could be raced onto another file.
 pub fn bind_private(path: &Path) -> io::Result<tokio::net::UnixListener> {
-    let listener = {
-        let _guard = UMASK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = set_umask(0o077);
-        let bound = tokio::net::UnixListener::bind(path);
-        set_umask(old);
-        bound?
-    };
-    set_mode(path, FILE_MODE)?;
-    Ok(listener)
+    let _guard = UMASK.lock().unwrap_or_else(|e| e.into_inner());
+    let old = set_umask(0o177);
+    let bound = tokio::net::UnixListener::bind(path);
+    set_umask(old);
+    bound
 }
 
 /// This process's effective user id.
@@ -312,6 +327,23 @@ mod tests {
         std::fs::write(&file, "keep").unwrap();
         assert!(remove_stale_socket(&file).is_err());
         assert!(file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_crashed_daemons_socket_is_removed_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("h")).unwrap();
+        home.ensure().unwrap();
+        remove_previous_socket(&home).unwrap();
+        let old = tmp.path().join("spew-mesh-old.sock");
+        drop(bind_private(&old).unwrap());
+        write_socket_path(&home, &old).unwrap();
+        remove_previous_socket(&home).unwrap();
+        assert!(!old.exists());
+        // A file that took the recorded path is left alone.
+        std::fs::write(&old, "keep").unwrap();
+        remove_previous_socket(&home).unwrap();
+        assert!(old.exists());
     }
 
     #[tokio::test]

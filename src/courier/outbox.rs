@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 
-use super::{Core, Courier, render};
+use super::{Core, Courier, render, warn_store};
 use crate::link::{CallError, Links};
 use crate::store::{MessageState, OutboxEntry, OutboxKind};
 use crate::text::NoticeEvent;
@@ -77,8 +77,8 @@ impl<L: Links> Courier<L> {
         }
     }
 
-    /// Records the outcome of a `deliver` attempt for an outbox entry. `in_send` is true while the send call
-    /// that queued it is still running, so a refusal needs no notice.
+    /// Records the outcome of a `deliver` attempt for an outbox entry that had failed `attempts` times before.
+    /// `in_send` is true while the send call that queued it is still running, so a refusal needs no notice.
     pub(crate) fn settle_deliver(
         &self,
         c: &mut Core,
@@ -91,10 +91,15 @@ impl<L: Links> Courier<L> {
         let now = self.now();
         match attempt {
             Attempt::Delivered => {
-                let _ = c
-                    .store
-                    .set_state(message_seq, MessageState::Delivered, None, now);
-                let _ = c.store.outbox_remove(entry_seq);
+                warn_store(
+                    c.store
+                        .set_state(message_seq, MessageState::Delivered, None, now),
+                    "could not mark a message delivered",
+                );
+                warn_store(
+                    c.store.outbox_remove(entry_seq),
+                    "could not drop a delivered outbox entry",
+                );
             }
             Attempt::Refused(code) => {
                 let moved = matches!(
@@ -102,7 +107,10 @@ impl<L: Links> Courier<L> {
                         .set_state(message_seq, MessageState::Refused, Some(code.as_str()), now),
                     Ok(true)
                 );
-                let _ = c.store.outbox_remove(entry_seq);
+                warn_store(
+                    c.store.outbox_remove(entry_seq),
+                    "could not drop a refused outbox entry",
+                );
                 if moved
                     && !in_send
                     && let Ok(Some(m)) = c.store.message_by_seq(message_seq)
@@ -116,9 +124,11 @@ impl<L: Links> Courier<L> {
                 }
             }
             Attempt::Retry { .. } => {
-                let _ = c
-                    .store
-                    .outbox_retry(entry_seq, now + retry_delay_ms(attempts + 1));
+                warn_store(
+                    c.store
+                        .outbox_retry(entry_seq, now + retry_delay_ms(attempts + 1)),
+                    "could not reschedule an outbox entry",
+                );
             }
         }
         if let Ok(Some(m)) = c.store.message_by_seq(message_seq) {
@@ -178,7 +188,7 @@ impl<L: Links> Courier<L> {
             } else {
                 c.store.outbox_due(&hex, now)
             };
-            let list: Vec<OutboxEntry> = list
+            let list: Vec<OutboxEntry> = warn_store(list, "could not read the outbox")
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|e| !c.in_flight.contains(&e.seq))
@@ -218,12 +228,17 @@ impl<L: Links> Courier<L> {
                 _ => match attempt {
                     Attempt::Retry { .. } => {
                         let now = self.now();
-                        let _ = c
-                            .store
-                            .outbox_retry(entry.seq, now + retry_delay_ms(entry.attempts + 1));
+                        warn_store(
+                            c.store
+                                .outbox_retry(entry.seq, now + retry_delay_ms(entry.attempts + 1)),
+                            "could not reschedule a receipt",
+                        );
                     }
                     _ => {
-                        let _ = c.store.outbox_remove(entry.seq);
+                        warn_store(
+                            c.store.outbox_remove(entry.seq),
+                            "could not drop a sent receipt",
+                        );
                     }
                 },
             }

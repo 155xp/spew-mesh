@@ -1097,7 +1097,8 @@ setup never pre-approves `ask`, `tell` or `reply` in any client; `who` and `mess
   only the repo; OpenCode gets only `read`, `glob` and `list` under a deny-all agent. `--allow-edits` also allows file edits inside `--cwd`, never under `.git/` or to secret
   files. The exact flags per client are in 8.2 to 8.4 and docs/serve.md.
 - Who may ask: `[serve] from = "room"` (default: anyone admitted who shares the responder's room) or `"own"`
-  (only your own devices). Others get `refused` with code `no-such-session`.
+  (only your own devices). Others get `refused` with code `no-such-session`, and presence sent to a teammate's
+  device leaves out a responder with `from = "own"`, so it can't be seen either.
 - Cost limits: at most `[serve] max_runs_per_person_per_hour` (default 10) runs for any one asking person and
   `max_runs_per_hour` (default 30) in all; over either, `refused` with code `busy`. Claude Code runs also stop at
   `[serve] max_budget_usd` (default 0.50) each. Asks from your own devices count only toward the total.
@@ -1109,6 +1110,8 @@ setup never pre-approves `ask`, `tell` or `reply` in any client; `who` and `mess
   the asker's wait ends. The run's raw output stays in the log, with its cost when the client reports one (Claude
   Code's `total_cost_usd`).
 - Presence shows the responder with `kind = "responder"`, `reach = "serve"`, and busy or idle.
+- serve connects like a CLI command the first time (it starts a missing daemon and replaces an older one, 6.1) and
+  like a long-lived client after that. Settings edits apply when serve restarts.
 
 ---
 
@@ -1215,7 +1218,8 @@ SQLite (rusqlite, bundled) in WAL mode, migrated with `PRAGMA user_version` step
 test that upgrades from every earlier version. It holds: messages in both directions with their state history,
 outbox entries, the session registry (names, last seen), the serve conversation map, the
 remote presence cache, the roster cache, and dedupe keys. A daily sweep deletes messages and receipts older than
-30 days, sessions that ended more than 30 days ago, and dedupe keys older than 7 days.
+30 days, sessions that ended more than 30 days ago, serve conversations unused for 30 days, and dedupe keys older than 7
+days.
 
 ---
 

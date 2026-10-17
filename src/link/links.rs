@@ -458,7 +458,11 @@ impl Shared {
             if hints_changed {
                 ps.hints
                     .send_modify(|generation| *generation = generation.wrapping_add(1));
-                ps.notify.notify_one();
+                // A dial in progress starts over on the new hints by itself; waking the dialer as well would
+                // cost a second attempt that skips a backoff step.
+                if ps.dial_lock.try_lock().is_ok() {
+                    ps.notify.notify_one();
+                }
             }
         }
         drop(st);

@@ -499,7 +499,7 @@ pub fn stopped_file(home: &Home) -> PathBuf {
 // `daemon stop` stays stopped and a crashed daemon comes back (6.1, 12).
 fn reconnect_options(cfg: &LoopConfig, reconnect: bool) -> ConnectOptions {
     let mut opts = cfg.connect.clone();
-    if reconnect && stopped_file(&cfg.home).exists() {
+    if reconnect && cfg.home.is_stopped() {
         opts.start = false;
     }
     opts

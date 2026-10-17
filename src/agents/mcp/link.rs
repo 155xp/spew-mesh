@@ -351,10 +351,7 @@ impl DaemonLink {
     // Whether `run/stopped` is there. Anything but a clear "not found" counts as there, so a reconnect never
     // undoes a stop it can't see.
     fn stopped(&self) -> bool {
-        match std::fs::symlink_metadata(self.home.stopped_file()) {
-            Ok(_) => true,
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        }
+        self.home.is_stopped()
     }
 
     // Opens (or re-attaches) every session on a new connection and returns its generation.

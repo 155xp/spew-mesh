@@ -473,8 +473,10 @@ async fn roster_task<L: DaemonLinks>(
             && let Some(cached) = mgr.refresh_spew(now).await
         {
             courier.save_roster_cache(&cached);
-            // A device registered just now is in the next roster; fetch it at once.
-            if registration.retry(&mgr).await
+            // A device registered just now is in the next roster; fetch it at once. A refresh a stranger caused
+            // doesn't retry registration, so nobody outside the roster can make this device call spew more often.
+            if !early
+                && registration.retry(&mgr).await
                 && let Some(cached) = mgr.refresh_spew(courier.now()).await
             {
                 courier.save_roster_cache(&cached);

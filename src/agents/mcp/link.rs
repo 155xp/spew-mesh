@@ -281,6 +281,7 @@ impl DaemonLink {
             kind: SessionKind::Live,
             name: None,
             spew_project: f.spew_project.clone(),
+            serve: None,
         }
     }
 

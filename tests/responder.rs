@@ -386,7 +386,7 @@ async fn claude_forgets_a_session_it_no_longer_has() {
     assert_eq!(fake.argv(2)[3], "--resume");
     assert!(
         r.conversations()
-            .get(&ConversationKey::of(&q))
+            .get(&ConversationKey::of(ServeClient::Claude, &q))
             .unwrap()
             .is_none()
     );
@@ -591,10 +591,10 @@ async fn codex_new_thread_replaces_the_mapping() {
     r.answer(&question(Q2, C1, "two")).await.unwrap();
     let stored = r
         .conversations()
-        .get(&ConversationKey::of(&q))
+        .get(&ConversationKey::of(ServeClient::Codex, &q))
         .unwrap()
         .unwrap();
-    assert_eq!(stored.session_id, THREAD2);
+    assert_eq!(stored, THREAD2);
     r.answer(&question(Q3, C1, "three")).await.unwrap();
     let argv = fake.argv(6);
     assert_eq!(argv[argv.len() - 2], THREAD2);

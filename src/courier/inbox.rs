@@ -64,6 +64,13 @@ impl<L: Links> Courier<L> {
             SessionKind::Responder => Reach::Serve,
             _ => Reach::Inbox,
         };
+        // mesh#10: a responder's own `[serve]` limits, applied at deliver time (9, 5.5 step 6).
+        if let Some(limits) = &p.serve {
+            if p.kind != SessionKind::Responder {
+                return Err(RpcError::invalid("only a responder sends serve limits"));
+            }
+            limits.validate().map_err(RpcError::invalid)?;
+        }
         let req = OpenRequest {
             client: p.client,
             client_session: p.client_session,
@@ -84,6 +91,13 @@ impl<L: Links> Courier<L> {
         c.reg
             .attach(&c.store, conn.id(), &opened.session.id)
             .map_err(store_err)?;
+        if let Some(limits) = &p.serve {
+            // A re-open (after a lost connection) keeps the runs already counted this hour.
+            c.gates
+                .entry(opened.session.id.clone())
+                .and_modify(|g| g.update(limits))
+                .or_insert_with(|| crate::responder::limits::Gate::new(limits));
+        }
         for gone in &opened.merged {
             self.waits.wake(gone);
         }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::codex::{self, ModelChoice, ResumeStyle};
 use super::env::HostEnv;
 use super::limits::Clock;
-use super::memory::{ConversationKey, ConversationStore, StoredSession};
+use super::memory::{ConversationKey, ConversationStore};
 use super::process::{Exit, ProcessRunner, RunOutput, RunSpec};
 use super::prompt::{self, PromptContext};
 use super::{
@@ -18,7 +18,7 @@ use super::{
 };
 
 /// The largest answer a reply can carry (7.1); longer answers are cut at a line break.
-pub const MAX_ANSWER_BYTES: usize = 32 * 1024;
+pub const MAX_ANSWER_BYTES: usize = crate::wire::MAX_BODY;
 
 const CUT_NOTE: &str = "\n(cut: the answer was longer than 32 KiB)";
 const CANARY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -111,11 +111,10 @@ where
 
     /// Runs one question. A failure's [`RunFailure::reply_text`] is what goes back to the asker.
     pub async fn answer(&mut self, q: &Question) -> Result<Answer, RunFailure> {
-        let key = ConversationKey::of(q);
         let client = self.cfg.client;
+        let key = ConversationKey::of(client, q);
         let known = match self.conversations.get(&key) {
-            Ok(Some(stored)) if stored.client == client => Some(stored.session_id),
-            Ok(_) => None,
+            Ok(known) => known,
             Err(e) => {
                 tracing::warn!(error = %e, "can't read the serve conversation map; starting a new conversation");
                 None
@@ -184,8 +183,9 @@ where
             Ok(r) => r.session_id.as_deref(),
             Err(f) => f.session_id.as_deref(),
         };
+        let now = self.clock.now_ms();
         if forget {
-            if let Err(e) = self.conversations.remove(key) {
+            if let Err(e) = self.conversations.forget(key, now) {
                 tracing::warn!(error = %e, "can't update the serve conversation map");
             }
             return;
@@ -197,12 +197,7 @@ where
             // Codex starts a new thread when it can't find the old one; the conversation starts over.
             tracing::info!(client = %self.cfg.client, "the follow-up ran in a new session; the conversation starts over");
         }
-        let stored = StoredSession {
-            client: self.cfg.client,
-            session_id: id.to_string(),
-            last_used_ms: self.clock.now_ms(),
-        };
-        if let Err(e) = self.conversations.put(key.clone(), stored) {
+        if let Err(e) = self.conversations.put(key, id, now) {
             tracing::warn!(error = %e, "can't update the serve conversation map");
         }
     }
@@ -555,14 +550,14 @@ mod tests {
     struct CellStore(std::cell::Cell<u8>);
 
     impl ConversationStore for CellStore {
-        fn get(&self, _: &ConversationKey) -> anyhow::Result<Option<StoredSession>> {
+        fn get(&self, _: &ConversationKey) -> anyhow::Result<Option<String>> {
             self.0.set(self.0.get().wrapping_add(1));
             Ok(None)
         }
-        fn put(&mut self, _: ConversationKey, _: StoredSession) -> anyhow::Result<()> {
+        fn put(&mut self, _: &ConversationKey, _: &str, _: u64) -> anyhow::Result<()> {
             Ok(())
         }
-        fn remove(&mut self, _: &ConversationKey) -> anyhow::Result<()> {
+        fn forget(&mut self, _: &ConversationKey, _: u64) -> anyhow::Result<()> {
             Ok(())
         }
     }

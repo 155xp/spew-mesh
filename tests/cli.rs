@@ -110,6 +110,7 @@ async fn agent_session(home: &Path, cwd: &Path) -> (Client, String) {
             kind: SessionKind::Live,
             name: None,
             spew_project: None,
+            serve: None,
         })
         .await
         .unwrap();
@@ -271,12 +272,9 @@ fn setup_slugs_the_device_name_it_is_given() {
 }
 
 #[test]
-fn the_commands_other_cards_build_say_so() {
+fn a_hook_with_no_payload_prints_nothing() {
     let mesh = Mesh::new();
-    let serve = mesh.run(&["serve", "codex", "--name", "web-help"]);
-    assert_eq!(code(&serve), 1);
-    assert!(stderr(&serve).contains("not built yet"));
-    // A hook with no payload prints nothing and exits 0 (mesh#8 tests hooks in tests/agents_hooks.rs).
+    // Hooks are tested in tests/agents_hooks.rs; here only the exit code and the silence.
     let hook = mesh.run(&["hook", "claude", "SessionStart"]);
     assert_eq!(code(&hook), 0);
     assert!(hook.stdout.is_empty() && hook.stderr.is_empty());

@@ -273,15 +273,13 @@ fn setup_slugs_the_device_name_it_is_given() {
 #[test]
 fn the_commands_other_cards_build_say_so() {
     let mesh = Mesh::new();
-    for args in [
-        &["mcp-server"][..],
-        &["hook", "claude", "SessionStart"][..],
-        &["serve", "codex", "--name", "web-help"][..],
-    ] {
-        let out = mesh.run(args);
-        assert_eq!(code(&out), 1, "{args:?}");
-        assert!(stderr(&out).contains("not built yet"), "{args:?}");
-    }
+    let serve = mesh.run(&["serve", "codex", "--name", "web-help"]);
+    assert_eq!(code(&serve), 1);
+    assert!(stderr(&serve).contains("not built yet"));
+    // A hook with no payload prints nothing and exits 0 (mesh#8 tests hooks in tests/agents_hooks.rs).
+    let hook = mesh.run(&["hook", "claude", "SessionStart"]);
+    assert_eq!(code(&hook), 0);
+    assert!(hook.stdout.is_empty() && hook.stderr.is_empty());
     let bad = mesh.run(&["ask"]);
     assert_eq!(code(&bad), 2);
 }

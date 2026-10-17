@@ -190,7 +190,8 @@ where
             }
             return;
         }
-        let Some(id) = reported else {
+        // A run that reports no id still used the conversation; writing the known id again marks it used (11.1).
+        let Some(id) = reported.or(known) else {
             return;
         };
         if known.is_some_and(|k| k != id) {

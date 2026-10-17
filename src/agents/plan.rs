@@ -249,6 +249,7 @@ pub fn apply(
 /// Fills in what the write did (backup, created file and folders) on the entries an outcome produced.
 pub fn finish_entries(entries: &mut [Entry], written: &Written) {
     for e in entries {
+        e.target = written.target.clone();
         if written.backup.is_some() {
             e.backup = written.backup.clone();
         }
@@ -277,6 +278,7 @@ fn entry_for(
         created_file: false,
         created_dirs: Vec::new(),
         backup: None,
+        target: None,
     }
 }
 

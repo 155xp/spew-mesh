@@ -40,7 +40,12 @@ pub struct Entry {
     /// A stable name for the change, such as `claude.hook.SessionStart`.
     pub id: String,
     pub client: Client,
+    /// The path setup looked at.
     pub file: PathBuf,
+    /// The file `file` linked to when setup edited it (a dotfiles setup, 8); uninstall reverts that file and
+    /// leaves the link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PathBuf>,
     pub op: Op,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<String>,
@@ -156,6 +161,7 @@ mod tests {
             created_file: false,
             created_dirs: vec![],
             backup: None,
+            target: None,
         }
     }
 

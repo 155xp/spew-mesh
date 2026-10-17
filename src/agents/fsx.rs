@@ -79,9 +79,27 @@ pub fn read_stamped(path: &Path) -> Result<(Option<String>, Stamp)> {
     bail!("{} keeps changing while it is read", path.display())
 }
 
+/// The file an edit of `path` changes: the file a link at `path` points to (a dotfiles setup, 8), else `path`.
+/// A link to a file that can't be reached is an error, so setup never replaces a link with a file.
+pub fn edit_target(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path).with_context(|| {
+            format!(
+                "{} is a link to a file that can't be reached; left it alone",
+                path.display()
+            )
+        }),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(e) => Err(e).with_context(|| format!("checking {}", path.display())),
+    }
+}
+
 /// What an applied edit did to the file system, for the manifest.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Written {
+    /// The file that was edited when the path is a link to it (8); `None` when the path itself was edited.
+    pub target: Option<PathBuf>,
     /// The backup holding the file as it was before setup's first edit, when the file existed.
     pub backup: Option<PathBuf>,
     /// The file didn't exist and was created.
@@ -96,43 +114,82 @@ pub type BeforeRename<'a> = &'a mut dyn FnMut(&Path, u32);
 /// Turns a file's current text (`None` when missing) into its new text (`None` for no change) plus a value.
 pub type Editor<'a, T> = &'a mut dyn FnMut(Option<&str>) -> Result<(Option<String>, T)>;
 
-/// Applies `editor` to the file and replaces it atomically, re-reading and re-applying when another writer
-/// changed it in the meantime (up to [`MAX_RETRIES`] times). The editor gets the current text (`None` when the file
-/// is missing) and returns the new text (`None` for no change) plus whatever it wants to hand back; the value from
-/// the attempt that was written is returned.
+/// Called right before the rename with the editor's value and what the edit is about to do. An error stops the
+/// edit with the file unchanged; setup records its manifest here, so a change is never on disk unrecorded.
+pub type Commit<'a, T> = &'a mut dyn FnMut(&T, &Written) -> Result<()>;
+
+/// Applies `editor` to the file (to its target when it is a link) and replaces it atomically, re-reading and
+/// re-applying when another writer changed it in the meantime (up to [`MAX_RETRIES`] times). The editor gets the
+/// current text (`None` when the file is missing) and returns the new text (`None` for no change) plus whatever it
+/// wants to hand back; the value from the attempt that was written is returned. `commit` runs right before the
+/// rename; when the edit doesn't happen, folders made for it and a backup made by it are removed again.
 pub fn edit_file<T>(
     path: &Path,
     make_backup: bool,
     editor: Editor<T>,
+    commit: Commit<T>,
     before_rename: BeforeRename,
+) -> Result<(T, Option<Written>)> {
+    let mut made_dirs = Vec::new();
+    let res = edit_attempts(
+        path,
+        make_backup,
+        editor,
+        commit,
+        before_rename,
+        &mut made_dirs,
+    );
+    if !matches!(res, Ok((_, Some(_)))) {
+        remove_empty_dirs(&made_dirs);
+    }
+    res
+}
+
+fn edit_attempts<T>(
+    path: &Path,
+    make_backup: bool,
+    editor: Editor<T>,
+    commit: Commit<T>,
+    before_rename: BeforeRename,
+    made_dirs: &mut Vec<PathBuf>,
 ) -> Result<(T, Option<Written>)> {
     let mut attempt = 0;
     loop {
-        let (current, stamp) = read_stamped(path)?;
-        let (new_text, extra) = editor(current.as_deref())?;
+        let target = edit_target(path)?;
+        let (current, stamp) = read_stamped(&target)?;
+        let (new_text, value) = editor(current.as_deref())?;
         let Some(new_text) = new_text else {
-            return Ok((extra, None));
+            return Ok((value, None));
         };
-        let mut written = Written::default();
+        let mut written = Written {
+            target: (target != path).then(|| target.clone()),
+            ..Written::default()
+        };
         if !stamp.exists {
-            written.created_dirs = ensure_dirs(path)?;
+            made_dirs.extend(ensure_dirs(&target)?);
             written.created_file = true;
-        } else if make_backup {
-            written.backup = Some(ensure_backup(
-                path,
-                current.as_deref().unwrap_or("").as_bytes(),
-            )?);
+            written.created_dirs = made_dirs.clone();
         }
-        let mode = if stamp.exists { stamp.mode } else { 0o600 };
-        match replace_if_unchanged(
+        let job = Replace {
             path,
-            new_text.as_bytes(),
-            mode,
-            &stamp,
+            target: &target,
+            bytes: new_text.as_bytes(),
+            mode: if stamp.exists { stamp.mode } else { 0o600 },
+            stamp: &stamp,
+            original: current
+                .as_deref()
+                .filter(|_| make_backup)
+                .map(str::as_bytes),
+        };
+        let done = replace_if_unchanged(
+            &job,
+            &mut written,
+            &mut |w| commit(&value, w),
             attempt,
             before_rename,
-        )? {
-            true => return Ok((extra, Some(written))),
+        )?;
+        match done {
+            true => return Ok((value, Some(written))),
             false if attempt < MAX_RETRIES => attempt += 1,
             false => bail!(
                 "{} kept changing while setup edited it (another program writes it); left it alone",
@@ -142,27 +199,40 @@ pub fn edit_file<T>(
     }
 }
 
-/// Writes `bytes` to a 0600 temp file next to `path`, gives it `mode`, fsyncs it and renames it over `path`, but
-/// only when `path` still matches `stamp`. Returns false (and leaves `path` alone) when it doesn't.
-fn replace_if_unchanged(
-    path: &Path,
-    bytes: &[u8],
+/// One replacement: the new bytes for `target` (which is `path`, or the file a link at `path` points to).
+struct Replace<'a> {
+    path: &'a Path,
+    target: &'a Path,
+    bytes: &'a [u8],
     mode: u32,
-    stamp: &Stamp,
+    stamp: &'a Stamp,
+    /// The text being replaced, when it is backed up before setup's first edit of the file.
+    original: Option<&'a [u8]>,
+}
+
+/// Writes the new bytes to a 0600 temp file next to the target, gives it the mode, fsyncs it and renames it over
+/// the target, but only when the target still matches the stamp (and the link still points to it). Returns false,
+/// leaving the target alone, when it doesn't. The backup is written only once the check has passed, so it holds
+/// exactly the text this edit replaces; one this call made is removed again when the rename doesn't happen.
+fn replace_if_unchanged(
+    job: &Replace,
+    written: &mut Written,
+    commit: &mut dyn FnMut(&Written) -> Result<()>,
     attempt: u32,
     before_rename: BeforeRename,
 ) -> Result<bool> {
-    let dir = parent_of(path)?;
+    let (path, target) = (job.path, job.target);
+    let dir = parent_of(target)?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".spew-mesh-")
         .suffix(".tmp")
         .permissions(Permissions::from_mode(0o600))
         .tempfile_in(dir)
         .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
-    tmp.write_all(bytes)
+    tmp.write_all(job.bytes)
         .with_context(|| format!("writing a temporary file for {}", path.display()))?;
     tmp.as_file()
-        .set_permissions(Permissions::from_mode(mode))
+        .set_permissions(Permissions::from_mode(job.mode))
         .with_context(|| {
             format!(
                 "setting the mode of the temporary file for {}",
@@ -173,28 +243,76 @@ fn replace_if_unchanged(
         .sync_all()
         .with_context(|| format!("syncing the temporary file for {}", path.display()))?;
     before_rename(path, attempt);
-    let now = Stamp::of(path).with_context(|| format!("checking {}", path.display()))?;
-    if &now != stamp {
+    let unchanged = || -> Result<bool> {
+        let now = Stamp::of(target).with_context(|| format!("checking {}", target.display()))?;
+        Ok(now == *job.stamp && edit_target(path)? == target)
+    };
+    if !unchanged()? {
         return Ok(false);
     }
-    tmp.persist(path)
-        .map_err(|e| e.error)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    sync_dir(dir);
-    Ok(true)
+    let mut fresh = None;
+    if let Some(original) = job.original {
+        let backup = ensure_backup(target, original)?;
+        if backup.created {
+            fresh = Some(backup.path.clone());
+        }
+        written.backup = Some(backup.path);
+    }
+    let finish = || -> Result<bool> {
+        commit(written)?;
+        // Checked again: the backup and the commit took a moment.
+        if !unchanged()? {
+            return Ok(false);
+        }
+        tmp.persist(target)
+            .map_err(|e| e.error)
+            .with_context(|| format!("replacing {}", target.display()))?;
+        Ok(true)
+    };
+    let done = finish();
+    if !matches!(done, Ok(true))
+        && let Some(b) = &fresh
+    {
+        let _ = fs::remove_file(b);
+    }
+    if matches!(done, Ok(true)) {
+        sync_dir(dir);
+    }
+    done
 }
 
-/// Saves the one-time backup of `path` before another program (an agent's own CLI) edits it. `None` when the
-/// file doesn't exist.
-pub fn backup_once(path: &Path) -> Result<Option<PathBuf>> {
-    match read_stamped(path)? {
-        (Some(text), _) => Ok(Some(ensure_backup(path, text.as_bytes())?)),
+/// A one-time backup, and whether this call wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Backup {
+    pub path: PathBuf,
+    pub created: bool,
+}
+
+impl Backup {
+    /// Removes the backup when this call wrote it (the edit it was for didn't happen).
+    pub fn discard(&self) {
+        if self.created {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Saves the one-time backup of `path` before another program (an agent's own CLI) edits it, next to the file a
+/// link at `path` points to. `None` when the file doesn't exist.
+pub fn backup_once(path: &Path) -> Result<Option<Backup>> {
+    let target = edit_target(path)?;
+    match read_stamped(&target)? {
+        (Some(text), _) => Ok(Some(ensure_backup(&target, text.as_bytes())?)),
         (None, _) => Ok(None),
     }
 }
 
-/// Deletes `path` when its text is still `expected` (a file setup created and nothing else changed since).
+/// Deletes `path` when its text is still `expected` (a file setup created and nothing else changed since). A link
+/// is never deleted, nor the file it points to: setup didn't make it.
 pub fn remove_if_unchanged(path: &Path, expected: &str) -> Result<bool> {
+    if is_link(path) {
+        return Ok(false);
+    }
     let (text, stamp) = read_stamped(path)?;
     if text.as_deref() != Some(expected) {
         return Ok(false);
@@ -209,11 +327,19 @@ pub fn remove_if_unchanged(path: &Path, expected: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether `path` itself is a symbolic link.
+pub fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
 /// Writes the one-time backup of `path` holding `original`, unless a backup is already there.
-fn ensure_backup(path: &Path, original: &[u8]) -> Result<PathBuf> {
+fn ensure_backup(path: &Path, original: &[u8]) -> Result<Backup> {
     let backup = backup_path(path);
     if fs::symlink_metadata(&backup).is_ok() {
-        return Ok(backup);
+        return Ok(Backup {
+            path: backup,
+            created: false,
+        });
     }
     let dir = parent_of(path)?;
     let mut tmp = tempfile::Builder::new()
@@ -228,13 +354,16 @@ fn ensure_backup(path: &Path, original: &[u8]) -> Result<PathBuf> {
         .sync_all()
         .with_context(|| format!("syncing the backup of {}", path.display()))?;
     // persist_noclobber: never replace a backup another run made in the meantime.
-    match tmp.persist_noclobber(&backup) {
-        Ok(_) => {}
-        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {}
+    let created = match tmp.persist_noclobber(&backup) {
+        Ok(_) => true,
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => false,
         Err(e) => return Err(e.error).with_context(|| format!("saving {}", backup.display())),
-    }
+    };
     sync_dir(dir);
-    Ok(backup)
+    Ok(Backup {
+        path: backup,
+        created,
+    })
 }
 
 /// `<file>.spew-mesh-backup`.
@@ -369,6 +498,15 @@ mod tests {
         );
     }
 
+    /// A commit that records nothing.
+    fn no_commit<T>(_: &T, _: &Written) -> Result<()> {
+        Ok(())
+    }
+
+    fn set(text: &str) -> impl FnMut(Option<&str>) -> Result<(Option<String>, ())> + '_ {
+        move |_| Ok((Some(text.to_string()), ()))
+    }
+
     #[test]
     fn edit_keeps_mode_and_backs_up_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -376,14 +514,10 @@ mod tests {
         fs::write(&file, "one").unwrap();
         fs::set_permissions(&file, Permissions::from_mode(0o644)).unwrap();
 
-        let (_, w) = edit_file(
-            &file,
-            true,
-            &mut |_| Ok((Some("two".to_string()), ())),
-            &mut |_, _| {},
-        )
-        .unwrap();
+        let (_, w) =
+            edit_file(&file, true, &mut set("two"), &mut no_commit, &mut |_, _| {}).unwrap();
         let w = w.unwrap();
+        assert_eq!(w.target, None);
         assert_eq!(fs::read_to_string(&file).unwrap(), "two");
         assert_eq!(mode_of(&file), 0o644);
         let backup = w.backup.unwrap();
@@ -394,7 +528,8 @@ mod tests {
         edit_file(
             &file,
             true,
-            &mut |_| Ok((Some("three".to_string()), ())),
+            &mut set("three"),
+            &mut no_commit,
             &mut |_, _| {},
         )
         .unwrap();
@@ -406,6 +541,101 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_file_is_edited_at_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let target = dotfiles.join("settings.json");
+        fs::write(&target, "one").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o640)).unwrap();
+        let link = home.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &link).unwrap();
+
+        let mut seen = Vec::new();
+        let (_, w) = edit_file(
+            &link,
+            true,
+            &mut set("two"),
+            &mut |_: &(), w: &Written| {
+                seen.push(w.clone());
+                Ok(())
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        let w = w.unwrap();
+        let canonical = fs::canonicalize(&target).unwrap();
+        assert_eq!(w.target, Some(canonical.clone()));
+        assert_eq!(seen, vec![w.clone()], "committed once, with the same facts");
+        assert!(is_link(&link), "the link survives");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "two");
+        assert_eq!(mode_of(&target), 0o640);
+        assert_eq!(w.backup, Some(backup_path(&canonical)));
+        assert_eq!(fs::read_to_string(backup_path(&target)).unwrap(), "one");
+        let in_home: Vec<_> = fs::read_dir(&home).unwrap().collect();
+        assert_eq!(in_home.len(), 1, "no temp file or backup next to the link");
+
+        let b = backup_once(&link).unwrap().unwrap();
+        assert_eq!(b.path, backup_path(&canonical));
+        assert!(!b.created, "already there");
+
+        fs::write(&target, "two").unwrap();
+        assert!(!remove_if_unchanged(&link, "two").unwrap());
+        assert!(
+            is_link(&link) && target.exists(),
+            "neither link nor target is deleted"
+        );
+
+        let dangling = home.join("config.toml");
+        std::os::unix::fs::symlink("../dotfiles/missing.toml", &dangling).unwrap();
+        let err = edit_file(
+            &dangling,
+            true,
+            &mut set("x"),
+            &mut no_commit,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("can't be reached"), "{err}");
+        assert!(is_link(&dangling) && !dotfiles.join("missing.toml").exists());
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_the_file_and_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hooks.json");
+        fs::write(&file, "one").unwrap();
+        let err = edit_file(
+            &file,
+            true,
+            &mut set("two"),
+            &mut |_: &(), _: &Written| bail!("the manifest can't be saved"),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("manifest"), "{err}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one");
+        let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "no backup or temp file left");
+
+        let made = dir.path().join("new/dir/SKILL.md");
+        edit_file(
+            &made,
+            true,
+            &mut set("x"),
+            &mut |_: &(), _: &Written| bail!("no"),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            !dir.path().join("new").exists(),
+            "folders made for it go too"
+        );
+    }
+
+    #[test]
     fn new_files_are_private_and_their_folders_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a/b/SKILL.md");
@@ -413,6 +643,7 @@ mod tests {
             &file,
             true,
             &mut |cur| Ok((cur.is_none().then(|| "x".into()), ())),
+            &mut no_commit,
             &mut |_, _| {},
         )
         .unwrap();
@@ -440,12 +671,13 @@ mod tests {
         let mut reads = Vec::new();
         let (_, w) = edit_file(
             &file,
-            false,
+            true,
             &mut |cur| {
                 let cur = cur.unwrap_or("").to_string();
                 reads.push(cur.clone());
                 Ok((Some(format!("{cur}ours\n")), ()))
             },
+            &mut no_commit,
             &mut |p, attempt| {
                 if attempt == 0 {
                     fs::write(p, "a\ntheirs\n").unwrap();
@@ -456,6 +688,11 @@ mod tests {
         assert!(w.is_some());
         assert_eq!(reads, vec!["a\n".to_string(), "a\ntheirs\n".to_string()]);
         assert_eq!(fs::read_to_string(&file).unwrap(), "a\ntheirs\nours\n");
+        assert_eq!(
+            fs::read_to_string(backup_path(&file)).unwrap(),
+            "a\ntheirs\n",
+            "the backup holds the text the edit replaced"
+        );
     }
 
     #[test]
@@ -464,10 +701,15 @@ mod tests {
         let file = dir.path().join("config.txt");
         fs::write(&file, "start").unwrap();
         let mut n = 0;
+        let mut commits = 0;
         let err = edit_file(
             &file,
-            false,
-            &mut |_| Ok((Some("ours".into()), ())),
+            true,
+            &mut set("ours"),
+            &mut |_: &(), _: &Written| {
+                commits += 1;
+                Ok(())
+            },
             &mut |p, _| {
                 n += 1;
                 fs::write(p, "theirs".repeat(n)).unwrap();
@@ -475,10 +717,18 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(n, 4, "the first try and three retries");
+        assert_eq!(
+            commits, 0,
+            "nothing is recorded for an edit that never happens"
+        );
         assert!(err.to_string().contains("kept changing"), "{err}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "theirs".repeat(4));
         let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-        assert_eq!(leftovers.len(), 1, "no temporary files left behind");
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "no temporary file or backup left behind"
+        );
     }
 
     #[test]
@@ -487,7 +737,14 @@ mod tests {
         let file = dir.path().join("x.json");
         fs::write(&file, "{}").unwrap();
         let before = Stamp::of(&file).unwrap();
-        let (_, w) = edit_file(&file, true, &mut |_| Ok((None, ())), &mut |_, _| {}).unwrap();
+        let (_, w) = edit_file(
+            &file,
+            true,
+            &mut |_| Ok((None, ())),
+            &mut no_commit,
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert!(w.is_none());
         assert_eq!(Stamp::of(&file).unwrap(), before);
         assert!(!backup_path(&file).exists());

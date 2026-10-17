@@ -285,12 +285,31 @@ mod tests {
     use super::*;
     use crate::agents::runner::testing::fake_command;
     use std::fs;
+    use std::path::Path;
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
-    fn node() -> Option<PathBuf> {
-        std::env::split_paths(&std::env::var_os("PATH")?)
+    /// The `node` on PATH; without one, the plugin tests say they were skipped.
+    fn node(test: &str) -> Option<PathBuf> {
+        let found = std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join("node"))
-            .find(|p| p.is_file())
+            .find(|p| p.is_file());
+        if found.is_none() {
+            eprintln!("{test}: skipped, node isn't on PATH");
+        }
+        found
+    }
+
+    /// The log's lines once it has `n` of them, waiting at most 10 s (fire-and-forget hooks finish on their own).
+    fn wait_for_lines(log: &Path, n: usize) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = fs::read_to_string(log).unwrap_or_default();
+            if text.lines().count() >= n || Instant::now() >= deadline {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -319,7 +338,9 @@ mod tests {
 
     #[test]
     fn the_plugin_passes_node_check() {
-        let Some(node) = node() else { return };
+        let Some(node) = node("the_plugin_passes_node_check") else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let w = Wiring::new(PathBuf::from("/opt/spew"), None).unwrap();
         let file = dir.path().join("spew-mesh.mjs");
@@ -339,7 +360,9 @@ mod tests {
     /// Drives the plugin's hooks in node with a fake `spew` that logs each call and answers with context.
     #[test]
     fn the_plugin_runs_hooks_and_appends_context() {
-        let Some(node) = node() else { return };
+        let Some(node) = node("the_plugin_runs_hooks_and_appends_context") else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls.log");
         fake_command(
@@ -375,7 +398,6 @@ const after = { title: "", output: "claimed spew#4", metadata: {} };
 await p["tool.execute.after"]({ tool: "spew_claim", sessionID: "ses_root", callID: "c2" }, after);
 await p.event({ event: { type: "session.idle", properties: { sessionID: "ses_kid" } } });
 await p.event({ event: { type: "session.idle", properties: { sessionID: "ses_root" } } });
-await new Promise((r) => setTimeout(r, 500));
 console.log(JSON.stringify({ parts: msg.parts, kid: kidMsg.parts.length, args: ask.args, after: after.output }));
 "#,
         )
@@ -401,7 +423,7 @@ console.log(JSON.stringify({ parts: msg.parts, kid: kidMsg.parts.length, args: a
         );
         assert_eq!(v["after"], "claimed spew#4\n\nMESH tool.execute.after");
 
-        let calls = fs::read_to_string(&log).unwrap();
+        let calls = wait_for_lines(&log, 4);
         let events: Vec<&str> = calls
             .lines()
             .map(|l| l.split(' ').next().unwrap())

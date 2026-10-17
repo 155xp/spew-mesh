@@ -2,6 +2,7 @@
 //! `claude`, `codex` and `opencode` commands. Nothing here touches the real home or real agent configs.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -602,6 +603,10 @@ fn setup_gives_up_on_a_file_that_keeps_changing() {
         CLAUDE_SETTINGS.replace("opus", "oooo"),
         "never overwritten"
     );
+    assert!(
+        !backup_path(&settings).exists(),
+        "no backup of an edit that never happened"
+    );
     let manifest = Manifest::load(&manifest_path(&w.mesh)).unwrap();
     assert!(manifest.entries.iter().all(|e| e.file != settings));
     assert!(
@@ -960,5 +965,132 @@ fn a_codex_hook_command_survives_the_shell_with_a_quote_in_the_path() {
     assert_eq!(
         w.read(&log),
         format!("mesh|--home|{}|hook|codex|Stop|", home.display())
+    );
+}
+
+#[test]
+fn linked_configs_are_edited_at_their_target_and_the_links_survive() {
+    let w = World::standard();
+    let dotfiles = w.home.join("dotfiles");
+    let settings = w.paths.claude_dir.join("settings.json");
+    let config = w.paths.codex_dir.join("config.toml");
+    let links = [
+        (
+            settings.clone(),
+            dotfiles.join("claude-settings.json"),
+            CLAUDE_SETTINGS,
+        ),
+        (
+            config.clone(),
+            dotfiles.join("codex-config.toml"),
+            CODEX_CONFIG,
+        ),
+    ];
+    for (link, target, text) in &links {
+        w.write(target, text);
+        fs::remove_file(link).unwrap();
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    let before = contents(&w.home_snapshot());
+
+    let report = w.run();
+    assert_eq!(report.problems, 0, "{:#?}", report.lines);
+    for (link, target, _) in &links {
+        assert_eq!(&fs::read_link(link).unwrap(), target, "still the same link");
+        assert!(
+            !backup_path(link).exists(),
+            "nothing written next to the link"
+        );
+        assert!(
+            backup_path(target).exists(),
+            "the backup is next to the target"
+        );
+        assert_eq!(mode(target), 0o644);
+    }
+    assert_eq!(hooks_of(&w.json(&settings), "Stop").len(), 2);
+    assert!(w.read(&config).contains("[mcp_servers.mesh]"));
+    let manifest = Manifest::load(&manifest_path(&w.mesh)).unwrap();
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|e| e.id == "codex.mcp")
+        .unwrap();
+    assert_eq!(entry.file, config, "the path setup looked at");
+    assert_eq!(
+        entry.target,
+        Some(fs::canonicalize(&links[1].1).unwrap()),
+        "and the file it edited"
+    );
+
+    let snapshot = w.snapshot();
+    let again = w.run();
+    assert_eq!(w.snapshot(), snapshot, "a second run changes nothing");
+    assert_eq!(again.problems, 0, "{:#?}", again.lines);
+
+    let report = w.setup().uninstall().unwrap();
+    assert_eq!(report.problems, 0, "{:#?}", report.lines);
+    assert!(
+        report.lines.iter().any(|l| l.contains("(linked to ")),
+        "{:#?}",
+        report.lines
+    );
+    for (link, target, _) in &links {
+        assert_eq!(
+            &fs::read_link(link).unwrap(),
+            target,
+            "uninstall keeps the link"
+        );
+    }
+    assert_eq!(
+        contents(&w.home_snapshot()),
+        before,
+        "the targets are restored byte for byte, their backups gone"
+    );
+}
+
+#[test]
+fn opencode_gets_its_own_skill_when_claude_code_keeps_its_config_elsewhere() {
+    let mut w = World::new(&[("opencode", "1.19.3")]);
+    let claude_dir = w.home.join("work/claude");
+    let env = |k: &str| (k == "CLAUDE_CONFIG_DIR").then(|| OsString::from(&claude_dir));
+    w.paths = ClientPaths::from_env(&w.home, &env).unwrap();
+    assert!(!w.paths.claude_dir_is_default);
+    fs::create_dir_all(&claude_dir).unwrap();
+    let report = w.run();
+    assert_eq!(report.wired, vec![Client::Claude, Client::Opencode]);
+    assert_eq!(
+        w.read(&claude_dir.join("skills/spew-mesh/SKILL.md")),
+        SKILL_MD
+    );
+    assert_eq!(
+        w.read(&w.paths.opencode_dir.join("skills/spew-mesh/SKILL.md")),
+        SKILL_MD,
+        "OpenCode reads Claude Code's skills only from ~/.claude"
+    );
+    w.setup().uninstall().unwrap();
+    assert!(!w.paths.opencode_dir.join("skills").exists());
+}
+
+#[test]
+fn nothing_changes_when_the_manifest_cannot_be_saved() {
+    let w = World::standard();
+    let before = contents(&w.home_snapshot());
+    let m = manifest_path(&w.mesh);
+    let report = w
+        .setup()
+        .setup_with(&Options::default(), &mut |_, _| {
+            // A folder where the manifest goes: saving it fails.
+            fs::create_dir_all(&m).unwrap();
+        })
+        .unwrap();
+    assert!(
+        report.lines.iter().any(|l| l.contains("recording it in")),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(
+        contents(&w.home_snapshot()),
+        before,
+        "no config changed, and no backup, file or folder is left"
     );
 }

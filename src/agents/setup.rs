@@ -8,12 +8,12 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::Client;
 use super::claude::{self, MCP_ID};
 use super::codex::{self, TRUST_LINE};
-use super::fsx::{self, BeforeRename, read_stamped, sh_quote};
+use super::fsx::{self, BeforeRename, Written, read_stamped, sh_quote};
 use super::json::{Json, Parsed, parse_config};
 use super::manifest::{Entry, Manifest, Op};
 use super::opencode;
@@ -92,6 +92,8 @@ pub struct ClientPaths {
     pub codex_dir: PathBuf,
     /// `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`.
     pub opencode_dir: PathBuf,
+    /// `claude_dir` is `~/.claude`, the only place OpenCode reads Claude Code's skills from (8.4).
+    pub claude_dir_is_default: bool,
 }
 
 impl ClientPaths {
@@ -114,6 +116,7 @@ impl ClientPaths {
             Some(d) => (d.clone(), d.join(".claude.json")),
             None => (user_home.join(".claude"), user_home.join(".claude.json")),
         };
+        let claude_dir_is_default = claude_dir == user_home.join(".claude");
         let codex_dir = absolute("CODEX_HOME")?.unwrap_or_else(|| user_home.join(".codex"));
         // The XDG spec says to ignore a relative value.
         let config = set("XDG_CONFIG_HOME")
@@ -124,6 +127,7 @@ impl ClientPaths {
             claude_json,
             codex_dir,
             opencode_dir: config.join("opencode"),
+            claude_dir_is_default,
         })
     }
 
@@ -283,8 +287,8 @@ impl Setup<'_> {
                     Step::File(opencode::config_plan(w, p)),
                     Step::File(opencode::plugin_plan(w, p)),
                 ];
-                // OpenCode also reads Claude Code's skills folder (8.4).
-                if !claude_skill {
+                // OpenCode also reads Claude Code's skills, but only from ~/.claude (8.4).
+                if !(claude_skill && p.claude_dir_is_default) {
                     v.push(Step::File(opencode::skill_plan(p)));
                 }
                 v
@@ -319,28 +323,41 @@ impl Setup<'_> {
             return;
         }
         let snapshot = manifest.clone();
+        let mut recorded = false;
         let res = fsx::edit_file(
             &plan.file,
             true,
             &mut |cur| plan::apply(plan, &snapshot, cur),
+            // Recorded right before the rename, so a change is never on disk without its entry. When the rename
+            // then doesn't happen, the entry's value is simply absent, which uninstall skips.
+            &mut |out: &plan::Outcome, written: &Written| {
+                let mut next = snapshot.clone();
+                let mut entries = out.entries.clone();
+                plan::finish_entries(&mut entries, written);
+                for e in entries {
+                    next.upsert(e);
+                }
+                next.save(&self.manifest_path)
+                    .with_context(|| format!("recording it in {}", self.manifest_path.display()))?;
+                recorded = true;
+                *manifest = next;
+                Ok(())
+            },
             before_rename,
         );
         match res {
-            Err(e) => report.problem(format!("  couldn't change {shown}: {e:#}")),
-            Ok((mut out, written)) => {
-                if let Some(written) = written {
-                    plan::finish_entries(&mut out.entries, &written);
+            Err(e) => {
+                if recorded {
+                    // Best effort: drop the entries of the edit that didn't happen.
+                    *manifest = snapshot.clone();
+                    let _ = manifest.save(&self.manifest_path);
+                }
+                report.problem(format!("  couldn't change {shown}: {e:#}"));
+            }
+            Ok((out, written)) => {
+                if written.is_some() {
                     let what: Vec<String> = out.changes.iter().map(|c| c.past()).collect();
                     report.line(format!("  changed {shown}: {}", what.join(", ")));
-                    for e in out.entries {
-                        manifest.upsert(e);
-                    }
-                    if let Err(e) = manifest.save(&self.manifest_path) {
-                        report.problem(format!(
-                            "  couldn't record the change to {shown} in {}: {e:#}",
-                            self.manifest_path.display()
-                        ));
-                    }
                 }
                 for n in out.notes {
                     report.problem(format!("  {n}"));
@@ -400,27 +417,73 @@ impl Setup<'_> {
             Ok(b) => b,
             Err(e) => return report.problem(format!("  couldn't back up {shown}: {e:#}")),
         };
+        let entry = |value: &Json| Entry {
+            id: MCP_ID.to_string(),
+            client: Client::Claude,
+            file: file.clone(),
+            target: fsx::edit_target(file).ok().filter(|t| t != file),
+            op: Op::ClaudeCli,
+            path: path.clone(),
+            value: value.to_value(),
+            created: Vec::new(),
+            created_file: false,
+            created_dirs: Vec::new(),
+            backup: backup.as_ref().map(|b| b.path.clone()),
+        };
+        // Recorded before the CLI runs, as with file edits, then updated with what the CLI stored.
+        let snapshot = manifest.clone();
+        manifest.upsert(entry(&def));
+        if let Err(e) = manifest.save(&self.manifest_path) {
+            *manifest = snapshot;
+            backup.iter().for_each(fsx::Backup::discard);
+            return report.problem(format!(
+                "  couldn't record the change in {}, so setup didn't run claude mcp add-json: {e:#}",
+                self.manifest_path.display()
+            ));
+        }
+        let failed = |manifest: &mut Manifest, report: &mut Report, what: String| {
+            *manifest = snapshot.clone();
+            let _ = manifest.save(&self.manifest_path);
+            backup.iter().for_each(fsx::Backup::discard);
+            report.problem(what);
+        };
         if update {
             match self.runner.run(claude_cmd, &claude::cli_remove_args()) {
                 Ok(out) if out.success() => {}
                 Ok(out) => {
-                    return report.problem(format!(
-                        "  claude mcp remove failed: {}",
-                        out.first_error_line()
-                    ));
+                    let why = out.first_error_line();
+                    return failed(
+                        manifest,
+                        report,
+                        format!("  claude mcp remove failed: {why}"),
+                    );
                 }
-                Err(e) => return report.problem(format!("  claude mcp remove failed: {e:#}")),
+                Err(e) => {
+                    return failed(
+                        manifest,
+                        report,
+                        format!("  claude mcp remove failed: {e:#}"),
+                    );
+                }
             }
         }
         match self.runner.run(claude_cmd, &add) {
             Ok(out) if out.success() => {}
             Ok(out) => {
-                return report.problem(format!(
-                    "  claude mcp add-json failed: {}",
-                    out.first_error_line()
-                ));
+                let why = out.first_error_line();
+                return failed(
+                    manifest,
+                    report,
+                    format!("  claude mcp add-json failed: {why}"),
+                );
             }
-            Err(e) => return report.problem(format!("  claude mcp add-json failed: {e:#}")),
+            Err(e) => {
+                return failed(
+                    manifest,
+                    report,
+                    format!("  claude mcp add-json failed: {e:#}"),
+                );
+            }
         }
         // Record what Claude Code actually stored, so uninstall compares against that.
         let stored = read_stamped(file)
@@ -434,26 +497,20 @@ impl Setup<'_> {
         report.line(format!(
             "  ran claude mcp add-json: {verb} the mesh MCP server in {shown}"
         ));
-        if stored.is_none() {
-            report.problem(format!("  claude mcp add-json succeeded, but {shown} doesn't show the server; doctor checks it"));
-        }
-        manifest.upsert(Entry {
-            id: MCP_ID.to_string(),
-            client: Client::Claude,
-            file: file.clone(),
-            op: Op::ClaudeCli,
-            path,
-            value: stored.unwrap_or(def).to_value(),
-            created: Vec::new(),
-            created_file: false,
-            created_dirs: Vec::new(),
-            backup,
-        });
-        if let Err(e) = manifest.save(&self.manifest_path) {
-            report.problem(format!(
-                "  couldn't record the change in {}: {e:#}",
-                self.manifest_path.display()
-            ));
+        match stored {
+            None => report.problem(format!(
+                "  claude mcp add-json succeeded, but {shown} doesn't show the server; doctor checks it"
+            )),
+            Some(v) if v != def => {
+                manifest.upsert(entry(&v));
+                if let Err(e) = manifest.save(&self.manifest_path) {
+                    report.problem(format!(
+                        "  couldn't record the change in {}: {e:#}",
+                        self.manifest_path.display()
+                    ));
+                }
+            }
+            Some(_) => {}
         }
     }
 
@@ -471,10 +528,12 @@ impl Setup<'_> {
             report.line("No agent changes to revert.");
             return Ok(report);
         }
+        // A linked file is reverted at the target setup edited, which leaves the link in place (8).
+        let edited = |e: &Entry| e.target.clone().unwrap_or_else(|| e.file.clone());
         let mut files: Vec<PathBuf> = Vec::new();
         for e in &manifest.entries {
-            if !files.contains(&e.file) {
-                files.push(e.file.clone());
+            if !files.contains(&edited(e)) {
+                files.push(edited(e));
             }
         }
         let mut keep: Vec<Entry> = Vec::new();
@@ -483,7 +542,7 @@ impl Setup<'_> {
             let entries: Vec<Entry> = manifest
                 .entries
                 .iter()
-                .filter(|e| e.file == file)
+                .filter(|e| edited(e) == file)
                 .cloned()
                 .collect();
             let mut rest = Vec::new();
@@ -538,7 +597,10 @@ impl Setup<'_> {
         dirs: &mut Vec<PathBuf>,
         report: &mut Report,
     ) -> Result<usize, ()> {
-        let shown = file.display();
+        let shown = match &entries[0].target {
+            Some(t) => format!("{} (linked to {})", entries[0].file.display(), t.display()),
+            None => file.display().to_string(),
+        };
         let format = match entries[0].op {
             Op::TomlSet => Format::Toml,
             Op::File => Format::Text,
@@ -549,6 +611,7 @@ impl Setup<'_> {
             file,
             false,
             &mut |cur| Ok(plan::revert(format, &refs, cur)),
+            &mut |_, _| Ok(()),
             before_rename,
         );
         let (rev, written) = match res {
@@ -559,7 +622,11 @@ impl Setup<'_> {
             }
         };
         let mut removed = false;
-        if rev.delete {
+        if rev.delete && fsx::is_link(file) {
+            report.problem(format!(
+                "left {shown} alone: it is a link now, so uninstall deletes neither it nor the file it points to"
+            ));
+        } else if rev.delete {
             // Re-read: delete only what is still exactly the reverted (or setup-written) text.
             if let Ok((Some(text), _)) = read_stamped(file)
                 && plan::revert(format, &refs, Some(&text)).1.delete

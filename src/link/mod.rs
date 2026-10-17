@@ -138,6 +138,7 @@ mod config;
 mod endpoint;
 mod limits;
 mod links;
+mod stream;
 #[cfg(test)]
 mod tests;
 

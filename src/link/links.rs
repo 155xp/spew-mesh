@@ -17,7 +17,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
-use serde_json::Value;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -25,6 +24,7 @@ use tracing::{debug, info, warn};
 use super::config::{LinkConfig, Timing};
 use super::endpoint::{self, Gate, close, hint_addr};
 use super::limits::{Backoff, Gap, RateWindow};
+use super::stream::CallHead;
 use super::{
     CallError, Inbound, LinkEvent, LinkInfo, LinkProblem, LinkStatus, Links, Peer, RelayInfo,
 };
@@ -1085,6 +1085,21 @@ impl Shared {
             close(conn, CloseCode::NotAdmitted);
             return None;
         };
+        // Read once, so a call racing the acceptor's hello can't skip the rate check below and still be served.
+        let ready = hello_done.load(Ordering::Acquire);
+        // Calls are counted before their bodies are parsed (5.5 step 2): only `t` and `id` are read first, so a
+        // call over the limit never has its JSON built.
+        let head = CallHead::read(payload);
+        if ready {
+            match self.check_rate(&device, &head) {
+                Ok(None) => {}
+                Ok(Some(early)) => return Some(early),
+                Err(NotAdmitted) => {
+                    close(conn, CloseCode::NotAdmitted);
+                    return None;
+                }
+            }
+        }
         let call = match parse_incoming(payload) {
             Ok(call) => call,
             Err(error) => {
@@ -1092,22 +1107,22 @@ impl Shared {
                 return Some(error.response());
             }
         };
+        // The head picked the limit, so a frame whose full parse names another call is refused, never served. The
+        // two read repeated keys alike; this only guards against them drifting apart.
+        if head.kind != Some(call.kind()) {
+            return Some(Response::Error {
+                code: ErrorCode::Malformed,
+            });
+        }
         if let Incoming::Hello(theirs) = call {
             return self.server_hello(conn, id, hello_done, theirs);
         }
-        if !hello_done.load(Ordering::Acquire) {
+        if !ready {
             return Some(Response::Error {
                 code: ErrorCode::HelloRequired,
             });
         }
-        match self.check_rate(&device, &call) {
-            Ok(None) => Some(self.inbound.handle(peer, call).await),
-            Ok(Some(early)) => Some(early),
-            Err(NotAdmitted) => {
-                close(conn, CloseCode::NotAdmitted);
-                None
-            }
-        }
+        Some(self.inbound.handle(peer, call).await)
     }
 
     /// The other side of `hello` (5.4): answer with ours; with no common version, let the dialer see ours and
@@ -1151,20 +1166,22 @@ impl Shared {
         }
     }
 
-    /// The per-peer limits (5.5 step 2, 5.6), checked before the body is parsed. `Ok(Some(_))` answers the call
-    /// here; `Err` means the device was removed meanwhile.
+    /// The per-peer limits (5.5 step 2, 5.6), checked on the call's head before the body is parsed.
+    /// `Ok(Some(_))` answers the call here; `Err` means the device was removed meanwhile.
     fn check_rate(
         &self,
         device: &EndpointId,
-        call: &Incoming,
+        head: &CallHead,
     ) -> Result<Option<Response>, NotAdmitted> {
         let now = Instant::now();
         let mut st = self.lock();
         let ps = st.peers.get_mut(device).ok_or(NotAdmitted)?;
-        Ok(match call {
-            Incoming::Deliver(body) if !ps.deliver.allow(now) => Some(rate_limited(body)),
+        Ok(match head.kind {
+            Some(CallKind::Deliver) if !ps.deliver.allow(now) => {
+                Some(rate_limited(head.id.as_deref()))
+            }
             // Dropped, but answered `ok` so the sender doesn't retry it.
-            Incoming::Presence(_) if !ps.presence.allow(now) => Some(Response::Ok),
+            Some(CallKind::Presence) if !ps.presence.allow(now) => Some(Response::Ok),
             _ => None,
         })
     }
@@ -1258,14 +1275,10 @@ fn version_detail(ours: &Hello, theirs: &Hello) -> String {
     )
 }
 
-/// The receipt for a `deliver` over the rate limit (5.5 step 2). Its id is read without parsing the rest of the
-/// body; a call without a valid id can't be answered with a receipt and gets `malformed`.
-fn rate_limited(body: &Value) -> Response {
-    match body
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| is_ulid(id))
-    {
+/// The receipt for a `deliver` over the rate limit (5.5 step 2), with the id from the call's head; a call without
+/// a valid id can't be answered with a receipt and gets `malformed`.
+fn rate_limited(id: Option<&str>) -> Response {
+    match id.filter(|id| is_ulid(id)) {
         Some(id) => Response::Receipt(DeliverReceipt {
             id: id.to_string(),
             state: DeliverState::Refused,

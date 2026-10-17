@@ -414,8 +414,8 @@ retries (the message stays queued); `invalid`, `no-such-session`, `session-ended
 - The daemon listens on a Unix domain socket. It uses `<home>/run/ipc.sock` when that full path is shorter than
   100 bytes. Otherwise it uses `spew-mesh-<10 random base32 characters>.sock` in the first of
   `$XDG_RUNTIME_DIR`, `$TMPDIR` or `/tmp` that exists.
-- Start order: take the lock (below); remove a stale socket file; bind with umask 077, so the socket is 0600 from
-  the start; write the chosen path to `<home>/run/socket` (mode 0600); then accept. A daemon that can't take
+- Start order: take the lock (below); remove a stale socket file; bind with umask 177, so the socket is 0600 from
+  the start (a socket takes 0777 minus the umask); write the chosen path to `<home>/run/socket` (mode 0600); then accept. A daemon that can't take
   the lock exits without touching `run/socket` or any socket file.
 - Clients read `<home>/run/socket` and connect. Both ends check the other's uid with the socket's peer
   credentials: the daemon drops connections from other users, and a client refuses a socket owned by another
@@ -434,7 +434,10 @@ retries (the message stays queued); `invalid`, `no-such-session`, `session-ended
   sends `daemon.shutdown` and starts a new one (an older client never does, so two versions can't take turns);
   hooks never do. `doctor` reports a mismatch.
 - Long-lived clients (MCP servers, responders) reconnect after a lost connection, starting at 500 ms and doubling
-  to 20 s with jitter, and re-open their sessions.
+  to 20 s with jitter, and re-open their sessions. They start a missing daemon only while `<home>/run/stopped` is
+  absent. `daemon stop` and `uninstall` write that file before stopping the daemon, and a daemon removes it once
+  it holds the lock. So a stopped daemon stays stopped until a CLI command, a `start` or `prompt` hook or an MCP
+  tool call starts it, and a crashed daemon comes back on its own.
 
 ### 6.2 Protocol
 
@@ -555,7 +558,7 @@ A stored message stays unread until the agent has been shown it and that was ack
   other mesh tool result ends with one line: "spew mesh: N messages waiting; the messages tool shows them."
 - In every session, the `messages` tool returns unread messages first, then the asks it was shown before and
   hasn't answered, each block marked `again` in its header (7.8), so an agent whose context was compacted can
-  still answer them.
+  still answer them. An ask stops coming back once its ttl has run out.
 - **serve** responders: handed over by `responder.take`, acknowledged when taken.
 
 When a message is acknowledged, the receiving device sends a `receipt` with state `shown`; when the session
@@ -1219,7 +1222,8 @@ remote presence cache, the roster cache, and dedupe keys. A daily sweep deletes 
 ## 12. Daemon lifetime
 
 v0.1 installs no background service. The daemon starts on demand (6.1) and runs until `daemon stop`, `uninstall`
-or the computer restarts; after a restart, the first agent session or CLI command starts it again. A LaunchAgent
+or the computer restarts; after a restart, the first agent session or CLI command starts it again. Reconnecting
+MCP servers and responders don't undo a `daemon stop` (6.1). A LaunchAgent
 and a systemd user unit are a later version.
 
 ---

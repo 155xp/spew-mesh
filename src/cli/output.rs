@@ -27,7 +27,7 @@ fn state_name(state: ActivityState) -> &'static str {
     match state {
         ActivityState::Busy => "busy",
         ActivityState::Idle => "idle",
-        ActivityState::Unknown => "active",
+        ActivityState::Unknown => "unknown",
     }
 }
 
@@ -293,6 +293,12 @@ pub fn devices(list: &[DeviceInfo], now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_state_says_so() {
+        assert_eq!(state_name(ActivityState::Unknown), "unknown");
+        assert_eq!(state_name(ActivityState::Busy), "busy");
+    }
 
     #[test]
     fn ages_are_short() {

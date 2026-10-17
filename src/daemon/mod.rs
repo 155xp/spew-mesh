@@ -9,6 +9,7 @@ pub mod roster;
 pub mod testnet;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -19,8 +20,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::control::place::{
-    DaemonLock, bind_private, choose_socket_path, read_socket_path, remove_stale_socket, take_lock,
-    write_socket_path,
+    DaemonLock, bind_private, choose_socket_path, read_socket_path, remove_previous_socket,
+    remove_stale_socket, take_lock, write_socket_path,
 };
 use crate::control::protocol::{
     self, DeviceList, DeviceStatus, Empty, LoginResult, LoginUrl, LogoutResult, Reason,
@@ -76,6 +77,45 @@ pub fn serve_settings(s: &crate::settings::ServeSettings) -> crate::responder::S
         max_runs_per_person_per_hour: s.max_runs_per_person_per_hour,
         max_runs_per_hour: s.max_runs_per_hour,
         max_budget_usd: s.max_budget_usd,
+    }
+}
+
+// Registering this device with spew again after the try at sign-in failed (14.3). Registering is idempotent, so
+// it is retried after each spew refresh until the roster lists this device.
+struct Registration {
+    key: iroh::SecretKey,
+    name: String,
+    platform: String,
+    pending: Arc<AtomicBool>,
+}
+
+impl Registration {
+    // Tries once when a retry is pending; true when this device was registered just now.
+    async fn retry(&self, mgr: &RosterManager) -> bool {
+        if !self.pending.load(Ordering::Relaxed) {
+            return false;
+        }
+        if mgr.spew_lists_this_device() == Some(true) {
+            self.pending.store(false, Ordering::Relaxed);
+            return false;
+        }
+        let Some(api) = mgr.api() else {
+            return false;
+        };
+        match api
+            .register_device(&self.key, &self.name, &self.platform)
+            .await
+        {
+            Ok(_) => {
+                self.pending.store(false, Ordering::Relaxed);
+                tracing::info!("registered this device with spew");
+                true
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "device registration still fails; trying again at the next refresh");
+                false
+            }
+        }
     }
 }
 
@@ -184,6 +224,10 @@ where
     );
     let active = ActiveRoster::new(chosen.me, device, chosen.roster);
 
+    // A socket an earlier daemon left outside the home would otherwise stay there for good.
+    if let Err(e) = remove_previous_socket(&home) {
+        tracing::warn!(error = %e, "could not remove the previous daemon's socket");
+    }
     let socket =
         choose_socket_path(&home, &opts.runtime_dirs).context("can't choose a socket path")?;
     remove_stale_socket(&socket).with_context(|| format!("can't clear {}", socket.display()))?;
@@ -210,10 +254,20 @@ where
 
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (roster_tx, roster_rx) = mpsc::channel(8);
+    let registration = Registration {
+        key: identity.secret_key().clone(),
+        name: identity.name().to_string(),
+        platform: platform().to_string(),
+        // Starts pending so a registration that failed before a restart is tried again; the first
+        // refresh clears it when spew already lists this device.
+        pending: Arc::new(AtomicBool::new(true)),
+    };
+    let registration_pending = registration.pending.clone();
     let control = Arc::new(Control {
         courier: courier.clone(),
         api,
         identity,
+        registration_pending,
         roster: roster_tx,
         shutdown: shutdown.clone(),
         base: StatusBase {
@@ -227,7 +281,7 @@ where
         tokio::spawn(link_task(courier.clone(), link_events)),
         tokio::spawn(outbox_task(courier.clone())),
         tokio::spawn(presence_task(courier.clone())),
-        tokio::spawn(roster_task(courier.clone(), mgr, roster_rx)),
+        tokio::spawn(roster_task(courier.clone(), mgr, registration, roster_rx)),
         tokio::spawn(serve(listener, control, shutdown_rx)),
     ];
     tracing::info!(socket = %socket.display(), "listening");
@@ -331,6 +385,7 @@ async fn presence_task<L: Links>(courier: Arc<Courier<L>>) {
 async fn roster_task<L: Links>(
     courier: Arc<Courier<L>>,
     mut mgr: RosterManager,
+    registration: Registration,
     mut commands: mpsc::Receiver<RosterCmd>,
 ) {
     let mut every = tokio::time::interval(Duration::from_secs(POLL_SECONDS));
@@ -354,6 +409,12 @@ async fn roster_task<L: Links>(
             && let Some(cached) = mgr.refresh_spew(now).await
         {
             courier.save_roster_cache(&cached);
+            // A device registered just now is in the next roster; fetch it at once.
+            if registration.retry(&mgr).await
+                && let Some(cached) = mgr.refresh_spew(courier.now()).await
+            {
+                courier.save_roster_cache(&cached);
+            }
         }
         // A roster file is re-read only when it changed; a spew roster's view moves with time.
         let file_changed = mgr.file_changed();
@@ -379,6 +440,7 @@ struct Control<L: Links> {
     courier: Arc<Courier<L>>,
     api: Result<SpewApi, String>,
     identity: DeviceIdentity,
+    registration_pending: Arc<AtomicBool>,
     roster: mpsc::Sender<RosterCmd>,
     shutdown: watch::Sender<bool>,
     base: StatusBase,
@@ -463,13 +525,17 @@ impl<L: Links> Control<L> {
         {
             Ok(_) => (true, None),
             Err(e) => {
-                tracing::warn!(error = %e, "device registration failed");
+                tracing::warn!(error = %e, "device registration failed; retrying at each roster refresh");
                 (
                     false,
-                    Some(format!("this device isn't registered yet: {e}")),
+                    Some(format!(
+                        "this device isn't registered yet ({e}); the daemon keeps trying"
+                    )),
                 )
             }
         };
+        self.registration_pending
+            .store(!registered, Ordering::Relaxed);
         if let Err(e) = self.roster(RosterCmd::SignInChanged).await {
             tracing::info!(error = %e.message, "roster not refreshed after sign-in");
         }

@@ -1,12 +1,21 @@
 //! Agent wiring: the MCP server, hook commands and setup for each client (8).
+//!
+//! Part 1 (this code): setup, uninstall and doctor for Claude Code, Codex and OpenCode, hook payload parsing and
+//! output, card capture (8.5) and the skill text. The daemon side of hooks plugs in through [`hook::HookDaemon`].
 
 pub mod cards;
+pub mod claude;
+pub mod codex;
 pub mod fsx;
 pub mod hook;
 pub mod json;
 pub mod manifest;
+pub mod opencode;
 pub mod plan;
 pub mod runner;
+pub mod setup;
+#[cfg(test)]
+mod setup_tests;
 pub mod skill;
 
 use std::fmt;

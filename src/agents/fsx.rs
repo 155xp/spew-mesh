@@ -267,12 +267,14 @@ pub fn ensure_dirs(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(missing)
 }
 
-/// Removes the given folders, innermost first, while they are empty.
+/// Removes those of the given folders that are empty, deepest first, so nested ones go before their parents.
 pub fn remove_empty_dirs(dirs: &[PathBuf]) {
-    for d in dirs.iter().rev() {
-        if fs::remove_dir(d).is_err() {
-            break;
-        }
+    let mut sorted: Vec<&PathBuf> = dirs.iter().collect();
+    sorted.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    sorted.dedup();
+    for d in sorted {
+        // Fails, as wanted, when the folder isn't empty or is already gone.
+        let _ = fs::remove_dir(d);
     }
 }
 

@@ -248,6 +248,7 @@ impl Links for MemLinks {
                 device: d.to_string(),
                 path: "direct".into(),
                 rtt_ms: Some(1),
+                ..LinkInfo::default()
             })
             .collect();
         links.sort_by(|a, b| a.device.cmp(&b.device));
@@ -256,6 +257,7 @@ impl Links for MemLinks {
             endpoint_id: admits_others.then(|| self.me.to_string()),
             relay: None,
             links,
+            ..LinkStatus::default()
         }
     }
 }

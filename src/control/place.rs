@@ -288,11 +288,19 @@ pub fn spawn_daemon(home: &Home, exe: &Path) -> io::Result<()> {
 #[allow(unsafe_code)]
 fn new_session(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: the closure runs between fork and exec and calls only setsid, which is async-signal-safe.
+    // SAFETY: getdtablesize has no preconditions. The closure runs between fork and exec and calls only setsid
+    // and fcntl, which are async-signal-safe.
+    let top = unsafe { libc::getdtablesize() }.clamp(3, 65_536);
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
+            }
+            // The daemon outlives whoever started it, so it must not keep their descriptors: a hook's inherited
+            // pipe end would hold some other process's stdin open for days. Marked rather than closed, because
+            // std's pipe for reporting a failed exec is among them.
+            for fd in 3..top {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
             Ok(())
         });
@@ -349,6 +357,34 @@ mod tests {
         drop(lock);
         assert!(lock_is_free(&home));
         assert!(take_lock(&home, 7).unwrap().is_some());
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_new_session_keeps_no_inherited_descriptors() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: `theirs` is a live socket; clearing close-on-exec makes it inheritable, like a leaked pipe end.
+        assert_eq!(
+            unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let mut command = Command::new("sleep");
+        command
+            .arg("10")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        new_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        drop(theirs);
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let got = ours.read(&mut [0u8; 1]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(got.unwrap(), 0, "the child kept the other end open");
     }
 
     #[tokio::test]

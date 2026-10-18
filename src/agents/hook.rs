@@ -507,6 +507,7 @@ fn read_within<R: Read + Send + 'static>(r: R, limit: Duration, cap: usize) -> O
 fn read_payload<R: Read>(mut r: R, cap: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 64 << 10];
+    let mut scan = ObjectScan::default();
     loop {
         let n = match r.read(&mut chunk) {
             Ok(0) => return Ok(buf),
@@ -514,26 +515,75 @@ fn read_payload<R: Read>(mut r: R, cap: usize) -> std::io::Result<Vec<u8>> {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        let from = buf.len();
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > cap {
             return Ok(buf);
         }
-        // Only a chunk ending in `}` can complete the object, so a big payload isn't re-parsed per chunk.
-        if buf.trim_ascii_end().last() != Some(&b'}') {
-            continue;
-        }
-        let mut values =
-            serde_json::Deserializer::from_slice(&buf).into_iter::<serde::de::IgnoredAny>();
-        match values.next() {
-            Some(Ok(_)) => {
-                let end = values.byte_offset();
-                buf.truncate(end);
+        match scan.feed(&buf[from..]) {
+            Scanned::More => {}
+            Scanned::End(at) => {
+                buf.truncate(from + at + 1);
                 return Ok(buf);
             }
-            Some(Err(e)) if e.is_eof() => {}
-            // Not JSON: let the parser say so.
-            _ => return Ok(buf),
+            // Not an object: let the parser say so.
+            Scanned::NotObject => return Ok(buf),
         }
+    }
+}
+
+/// Finds where the first JSON object ends, one chunk at a time, without parsing it; [`parse`] checks it.
+#[derive(Default)]
+struct ObjectScan {
+    started: bool,
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+
+enum Scanned {
+    More,
+    /// The object's closing brace is at this index of the chunk.
+    End(usize),
+    NotObject,
+}
+
+impl ObjectScan {
+    fn feed(&mut self, bytes: &[u8]) -> Scanned {
+        for (i, &b) in bytes.iter().enumerate() {
+            if !self.started {
+                match b {
+                    b' ' | b'\t' | b'\n' | b'\r' => continue,
+                    b'{' => {
+                        self.started = true;
+                        self.depth = 1;
+                        continue;
+                    }
+                    _ => return Scanned::NotObject,
+                }
+            }
+            if self.in_string {
+                match b {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => self.in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        return Scanned::End(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Scanned::More
     }
 }
 
@@ -959,6 +1009,25 @@ mod tests {
         assert_eq!(read(b"{\"a\":\"}\"} {\"b\":1}"), b"{\"a\":\"}\"}");
         assert_eq!(read(b"{\"a\":{\"b\":1}"), b"{\"a\":{\"b\":1}");
         assert_eq!(read(b"not json}"), b"not json}");
+        assert_eq!(
+            read(b" \n{\"a\":\"\\\"}\\\\\",\"b\":[1,{}]}x"),
+            b" \n{\"a\":\"\\\"}\\\\\",\"b\":[1,{}]}"
+        );
+        // Split anywhere, the object still ends in the same place.
+        let whole = b"{\"a\":\"x}\\\"y\",\"b\":{\"c\":[\"]\"]}} {\"z\":1}";
+        let end = whole.iter().position(|&b| b == b' ').unwrap();
+        for split in 0..whole.len() {
+            let mut scan = ObjectScan::default();
+            let found = match scan.feed(&whole[..split]) {
+                Scanned::End(i) => Some(i),
+                Scanned::More => match scan.feed(&whole[split..]) {
+                    Scanned::End(i) => Some(split + i),
+                    _ => None,
+                },
+                Scanned::NotObject => None,
+            };
+            assert_eq!(found, Some(end - 1), "split at {split}");
+        }
         assert_eq!(read(b""), b"");
         let big = format!("{{\"pad\":\"{}\"}}", "}".repeat(200_000));
         assert_eq!(read(big.as_bytes()), big.as_bytes());

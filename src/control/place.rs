@@ -370,6 +370,9 @@ mod tests {
             unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0) },
             0
         );
+        // Set while both ends are open: macOS refuses socket options once the peer is gone.
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let mut command = Command::new("sleep");
         command
             .arg("10")
@@ -379,8 +382,6 @@ mod tests {
         new_session(&mut command);
         let mut child = command.spawn().unwrap();
         drop(theirs);
-        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
         let got = ours.read(&mut [0u8; 1]);
         child.kill().unwrap();
         child.wait().unwrap();

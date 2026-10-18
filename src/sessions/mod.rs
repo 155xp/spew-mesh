@@ -717,11 +717,13 @@ impl Registry {
 // The server's folder comes from its own working directory and the hook's from the client's payload, so
 // one can name a symlink (macOS's /var is /private/var) where the other names the real folder.
 fn same_folder(a: &str, b: &str) -> bool {
-    a == b
-        || matches!(
-            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-            (Ok(x), Ok(y)) if x == y
-        )
+    if a == b {
+        return true;
+    }
+    let (a, b) = (Path::new(a), Path::new(b));
+    a.is_absolute()
+        && b.is_absolute()
+        && matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 fn same_process(s: &SessionRecord, pid: u32, ctx: &Context<'_>) -> bool {

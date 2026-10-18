@@ -489,17 +489,51 @@ fn run_inner<R: Read + Send + 'static>(
     Some(())
 }
 
-/// Reads all of `r` within `limit`, or gives up. A reader still blocked is left behind; the hook exits soon after.
+/// Reads the payload from `r` within `limit`, or gives up. A reader still blocked is left behind; the hook exits
+/// soon after.
 fn read_within<R: Read + Send + 'static>(r: R, limit: Duration, cap: usize) -> Option<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = Vec::new();
-        let res = r.take(cap as u64 + 1).read_to_end(&mut buf);
-        let _ = tx.send(res.map(|_| buf));
+        let _ = tx.send(read_payload(r, cap));
     });
     match rx.recv_timeout(limit) {
         Ok(Ok(buf)) if buf.len() <= cap => Some(buf),
         _ => None,
+    }
+}
+
+// Reads up to the end of the first JSON object instead of waiting for end of file: a write end of the pipe that
+// leaked into another process (a fork racing the pipe's close-on-exec on macOS) keeps stdin open forever.
+fn read_payload<R: Read>(mut r: R, cap: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 << 10];
+    loop {
+        let n = match r.read(&mut chunk) {
+            Ok(0) => return Ok(buf),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > cap {
+            return Ok(buf);
+        }
+        // Only a chunk ending in `}` can complete the object, so a big payload isn't re-parsed per chunk.
+        if buf.trim_ascii_end().last() != Some(&b'}') {
+            continue;
+        }
+        let mut values =
+            serde_json::Deserializer::from_slice(&buf).into_iter::<serde::de::IgnoredAny>();
+        match values.next() {
+            Some(Ok(_)) => {
+                let end = values.byte_offset();
+                buf.truncate(end);
+                return Ok(buf);
+            }
+            Some(Err(e)) if e.is_eof() => {}
+            // Not JSON: let the parser say so.
+            _ => return Ok(buf),
+        }
     }
 }
 
@@ -903,6 +937,33 @@ mod tests {
         );
         assert_eq!(d.events.len(), 1);
         assert!(d.acks.is_empty());
+    }
+
+    #[test]
+    fn a_payload_is_read_without_waiting_for_stdin_to_close() {
+        // The write end stays open, as when another process holds a copy of it.
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(CX_END.as_bytes()).unwrap();
+        let mut d = FakeDaemon::default();
+        let mut out = Vec::new();
+        run_hook("codex", "SessionEnd", reader, &mut out, &no_env, &mut d);
+        assert_eq!(d.sent.len(), 1);
+        assert_eq!(d.sent[0].event, MeshEvent::End);
+        drop(writer);
+    }
+
+    #[test]
+    fn payloads_end_at_the_first_object_and_bad_input_is_left_to_the_parser() {
+        let read =
+            |bytes: &[u8]| read_payload(io::Cursor::new(bytes.to_vec()), MAX_PAYLOAD).unwrap();
+        assert_eq!(read(b"{\"a\":\"}\"} {\"b\":1}"), b"{\"a\":\"}\"}");
+        assert_eq!(read(b"{\"a\":{\"b\":1}"), b"{\"a\":{\"b\":1}");
+        assert_eq!(read(b"not json}"), b"not json}");
+        assert_eq!(read(b""), b"");
+        let big = format!("{{\"pad\":\"{}\"}}", "}".repeat(200_000));
+        assert_eq!(read(big.as_bytes()), big.as_bytes());
+        let over = read_payload(io::Cursor::new(vec![b' '; 100]), 10).unwrap();
+        assert!(over.len() > 10);
     }
 
     #[test]

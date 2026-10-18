@@ -200,6 +200,7 @@ pub fn same_user(stream: &tokio::net::UnixStream) -> io::Result<bool> {
 // hook that sent its end event and exited before the accept was refused. getpeereid reads the credentials the
 // kernel saved at connect.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn peer_uid(stream: &tokio::net::UnixStream) -> io::Result<u32> {
     use std::os::fd::AsRawFd;
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);

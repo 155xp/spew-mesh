@@ -190,6 +190,26 @@ fn codex_threads_join_the_lone_server_session_or_merge_later() {
 }
 
 #[test]
+fn a_codex_thread_joins_its_server_through_a_symlinked_folder() {
+    let s = store();
+    let mut reg = Registry::default();
+    let (t, cwd) = folder("api");
+    let link = t.path().join("api-link");
+    std::os::unix::fs::symlink(&cwd, &link).unwrap();
+    let server = reg.open(&s, &live("codex", &cwd), &ctx(1)).unwrap();
+    let ev = hook(
+        Client::Codex,
+        MeshEvent::Start,
+        "thread-1",
+        None,
+        link.to_str().unwrap(),
+    );
+    let joined = reg.for_hook(&s, &ev, &ctx(2)).unwrap().unwrap();
+    assert_eq!(joined.session.id, server.session.id);
+    assert!(!joined.created);
+}
+
+#[test]
 fn a_merge_keeps_the_newer_sessions_token_working() {
     let s = store();
     let mut reg = Registry::default();

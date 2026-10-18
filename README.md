@@ -17,10 +17,16 @@ With Rust 1.91 or newer and a C compiler (for the bundled SQLite and the crypto 
 cargo install --locked spew-mesh
 ```
 
+Until 0.1.0 is on crates.io, install from this repo:
+
+```sh
+cargo install --locked --git https://github.com/155xp/spew-mesh
+```
+
 This installs one binary, `spew`. Every command lives under `spew mesh`.
 
-Or download a release binary for macOS (Apple silicon or Intel) or Linux (x86_64 or arm64) from the GitHub
-releases page. Each archive holds `spew`, this README and the license files. `SHA256SUMS` lists the checksum of
+Or download a release binary for macOS (Apple silicon or Intel) or Linux (x86_64 or arm64) from the
+[releases page](https://github.com/155xp/spew-mesh/releases). Each archive holds `spew`, this README and the license files. `SHA256SUMS` lists the checksum of
 every archive:
 
 ```sh

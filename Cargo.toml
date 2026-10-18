@@ -6,6 +6,7 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "Lets the coding agents on your computers and your team's ask each other questions, peer to peer."
 readme = "README.md"
+repository = "https://github.com/155xp/spew-mesh"
 keywords = ["agents", "mcp", "p2p", "iroh", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 

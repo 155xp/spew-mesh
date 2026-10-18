@@ -193,7 +193,27 @@ pub fn current_uid() -> u32 {
 
 /// Whether the other end of a connection runs as this user (6.1).
 pub fn same_user(stream: &tokio::net::UnixStream) -> io::Result<bool> {
-    Ok(stream.peer_cred()?.uid() == current_uid())
+    Ok(peer_uid(stream)? == current_uid())
+}
+
+// tokio's peer_cred also asks for the peer's pid, which macOS answers only while the peer is connected, so a
+// hook that sent its end event and exited before the accept was refused. getpeereid reads the credentials the
+// kernel saved at connect.
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &tokio::net::UnixStream) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
+    // SAFETY: the fd is a live socket owned by `stream`, and both out-pointers are valid for writes.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0 {
+        Ok(uid)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peer_uid(stream: &tokio::net::UnixStream) -> io::Result<u32> {
+    Ok(stream.peer_cred()?.uid())
 }
 
 /// Whether a variable may pass into the daemon's environment (6.1): never an agent's tokens.
@@ -328,6 +348,20 @@ mod tests {
         drop(lock);
         assert!(lock_is_free(&home));
         assert!(take_lock(&home, 7).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_already_left_is_still_known_as_this_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ipc.sock");
+        let listener = bind_private(&path).unwrap();
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"{}\n")
+            .await
+            .unwrap();
+        drop(client);
+        let (server, _) = listener.accept().await.unwrap();
+        assert!(same_user(&server).unwrap());
     }
 
     #[tokio::test]

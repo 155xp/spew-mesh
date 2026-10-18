@@ -364,28 +364,36 @@ mod tests {
     fn a_new_session_keeps_no_inherited_descriptors() {
         use std::io::Read;
         use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        // SAFETY: `theirs` is a live socket; clearing close-on-exec makes it inheritable, like a leaked pipe end.
-        assert_eq!(
-            unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_SETFD, 0) },
-            0
-        );
         // Set while both ends are open: macOS refuses socket options once the peer is gone.
         ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
+        let fd = theirs.as_raw_fd();
         let mut command = Command::new("sleep");
         command
             .arg("10")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // SAFETY: runs between fork and exec and calls only fcntl. Clearing close-on-exec in the child alone
+        // makes `theirs` inheritable there, like a leaked pipe end, without exposing it to other tests' forks.
+        unsafe {
+            command.pre_exec(move || {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+                Ok(())
+            });
+        }
         new_session(&mut command);
         let mut child = command.spawn().unwrap();
         drop(theirs);
         let got = ours.read(&mut [0u8; 1]);
         child.kill().unwrap();
         child.wait().unwrap();
-        assert_eq!(got.unwrap(), 0, "the child kept the other end open");
+        assert!(
+            matches!(got, Ok(0)),
+            "the child kept the other end open: {got:?}"
+        );
     }
 
     #[tokio::test]

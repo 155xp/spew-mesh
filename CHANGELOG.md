@@ -8,6 +8,13 @@ All notable changes to spew mesh are listed here. The format follows
 
 The first release.
 
+### Fixed
+
+- Strip default-ignorable Unicode characters before escaping peer message boundaries, so invisible characters
+  cannot disguise a message header or footer.
+- Omit settings source lines from parse errors so a malformed relay-token setting cannot copy its credential
+  into doctor output or daemon diagnostics.
+
 ### Added
 
 - `spew mesh`, one binary with a daemon per computer that starts on demand.

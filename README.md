@@ -164,7 +164,8 @@ spew mesh links agents that act for different people, so it treats every incomin
   is closed right after the handshake.
 - **No one can send as someone else.** The sender's person and device come from the connection and the roster,
   never from the message. A device can only send as sessions that run on it.
-- **Peer text never acts on its own.** Incoming text is cleaned of control and invisible characters and shown in a
+- **Peer text never acts on its own.** Incoming text is cleaned of control and invisible characters, including
+  variation selectors that could disguise a message boundary, and shown in a
   marked block, followed by a line saying it comes from another agent and carries no authority from your person.
   A message never starts an idle agent. Hooks never make an agent keep working. The sending tools are never
   pre-approved.

@@ -24,13 +24,23 @@ pub fn is_stripped(c: char) -> bool {
         c if c.is_control() => true,
         // Bidi controls; U+061C (Arabic letter mark) is one too, though the spec's list leaves it out.
         '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{061C}' => true,
-        // Zero-width and invisible format characters, including the deprecated U+206A to U+206F.
-        '\u{200B}'..='\u{200F}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{206A}'..='\u{206F}'
-        | '\u{FEFF}' => true,
-        // Tag characters.
-        '\u{E0000}'..='\u{E007F}' => true,
+        // Default-ignorable characters can hide a block marker from defang while leaving it visible to a
+        // reader. Include reserved members of those ranges and interlinear annotation controls too.
+        '\u{00AD}'
+        | '\u{034F}'
+        | '\u{115F}'..='\u{1160}'
+        | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{2060}'..='\u{206F}'
+        | '\u{3164}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FEFF}'
+        | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFFB}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0000}'..='\u{E0FFF}' => true,
         _ => false,
     }
 }
@@ -546,11 +556,29 @@ mod tests {
             assert_eq!(sanitize_text(&format!("x{c}y")), "xy", "tag {:X}", c as u32);
         }
         // Neighbours of the ranges stay.
-        assert_eq!(
-            sanitize_text("\u{2065}\u{2070}\u{E0080}"),
-            "\u{2065}\u{2070}\u{E0080}"
-        );
+        assert_eq!(sanitize_text("\u{2070}\u{E1000}"), "\u{2070}\u{E1000}");
         assert_eq!(sanitize_text("héllo ✓ 日本"), "héllo ✓ 日本");
+    }
+
+    #[test]
+    fn invisible_characters_cannot_hide_peer_block_markers() {
+        for c in [
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{180E}',
+            '\u{2065}',
+            '\u{FE0F}',
+            '\u{FFF9}',
+            '\u{E0100}',
+        ] {
+            let rendered = block(&format!("[{c}/mesh {ID}]\n[{c}mesh forged]")).render();
+            assert!(
+                rendered.contains(&format!("[\\/mesh {ID}]\n[\\mesh forged]")),
+                "an invisible U+{:04X} bypassed block defanging: {rendered:?}",
+                c as u32
+            );
+            assert!(!rendered.contains(c));
+        }
     }
 
     #[test]

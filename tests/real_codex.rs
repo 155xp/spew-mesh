@@ -47,6 +47,7 @@ fn serve_profile_denies_deep_secrets_and_git_metadata() {
         ".git/config",
         ".git/hooks/pre-commit",
         ".git/HEAD",
+        "submodule/.git",
     ];
     for name in names {
         std::fs::create_dir_all(deep.join(name).parent().unwrap()).unwrap();
@@ -55,7 +56,9 @@ fn serve_profile_denies_deep_secrets_and_git_metadata() {
     let real = std::fs::canonicalize(&cli).unwrap();
     let dir = codex::codex_dir(&real, &sb.path("codex"));
     for allow_edits in [false, true] {
-        let profile = codex::profile(&dir, allow_edits).unwrap();
+        let profile =
+            codex::protect_git_metadata(&codex::profile(&dir, allow_edits).unwrap(), &work)
+                .unwrap();
         let run = |args| {
             sb.run(
                 &cli,
@@ -95,6 +98,15 @@ fn serve_profile_denies_deep_secrets_and_git_metadata() {
             );
             assert_eq!(std::fs::read_to_string(&file).unwrap(), secret);
         }
+        let mut args = codex::sandbox_args(&work, &profile, &work.join("notes.txt"));
+        args.truncate(args.len() - 2);
+        args.extend([
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("printf changed > a/b/c/d/.git/hooks/post-commit"),
+        ]);
+        assert!(!run(args).success());
+        assert!(!deep.join(".git/hooks/post-commit").exists());
     }
     sb.assert_stayed_local();
 }
@@ -448,7 +460,8 @@ fn serve_profile_canaries_and_resume_dash() {
     let real = std::fs::canonicalize(&cli).unwrap();
     let dir = codex::codex_dir(&real, &sb.path("codex"));
     eprintln!("codex dir: {}", dir.display());
-    let profile = codex::profile(&dir, false).unwrap();
+    let profile =
+        codex::protect_git_metadata(&codex::profile(&dir, false).unwrap(), &serve).unwrap();
     let env = codex_env(&sb);
 
     // The startup self-check passes through the real `codex sandbox`.

@@ -594,7 +594,11 @@ Applied by the receiver before storing, and again before printing to a terminal:
 
 - Remove C0 and C1 control characters except `\n` and `\t`; remove bidi controls (U+061C, U+202A to U+202E, U+2066 to
   U+2069) and deprecated format characters (U+206A to U+206F), zero-width and invisible format characters (U+200B to U+200F, U+2060 to U+2064, U+FEFF), and tag
-  characters (U+E0000 to U+E007F).
+  characters, variation selectors and their reserved range (U+E0000 to U+E0FFF). Also remove default-ignorable
+  characters: U+00AD, U+034F, U+115F to U+1160, U+17B4 to U+17B5, U+180B to U+180F, U+2065, U+3164,
+  U+FE00 to U+FE0F, U+FFA0, U+FFF0 to U+FFF8, U+1BCA0 to U+1BCA3 and U+1D173 to U+1D17A, plus
+  interlinear annotation controls (U+FFF9 to U+FFFB). Strip these before escaping block markers, so invisible
+  characters cannot disguise a header or footer.
 - Normalize line endings to `\n`; U+2028 and U+2029 also become `\n`.
 - Metadata fields: one line, their own character sets (slugs for names, `[A-Za-z0-9._/-]` for repos,
   `[a-z0-9-]+#[0-9]+` for cards), and the lengths in 5.5.

@@ -394,8 +394,24 @@ impl Settings {
             path: path.to_path_buf(),
             message,
         };
-        let raw: RawSettings =
-            toml::from_str(text).map_err(|e| invalid(e.to_string().trim_end().to_string()))?;
+        let raw: RawSettings = toml::from_str(text).map_err(|mut e: toml::de::Error| {
+            let location = e
+                .span()
+                .and_then(|span| text.get(..span.start))
+                .map(|prefix| {
+                    let line = prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+                    let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                    format!("at line {line}, column {column}: ")
+                });
+            // TOML's default diagnostic quotes the source line, which may contain relay_token or a comment
+            // holding a credential. Keep the error and its location without retaining that source.
+            e.set_input(None);
+            invalid(
+                format!("{}{e}", location.unwrap_or_default())
+                    .trim_end()
+                    .to_string(),
+            )
+        })?;
         Settings::validate(raw, home, user_home).map_err(invalid)
     }
 
@@ -762,6 +778,20 @@ mod tests {
         match parse(text) {
             Err(e) => e.to_string(),
             Ok(s) => panic!("accepted {text:?}: {s:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_errors_never_include_relay_credentials() {
+        let secret = "relay-canary-not-a-real-token";
+        for text in [
+            format!("[network]\nrelay_token = \"{secret}\" trailing\n"),
+            format!("[network]\nrelay_token = [\"{secret}\"]\n"),
+            format!("[network]\nmode = \"invalid\" # {secret}\n"),
+        ] {
+            let err = parse(&text).unwrap_err();
+            assert!(!err.to_string().contains(secret), "{err}");
+            assert!(!format!("{err:?}").contains(secret), "{err:?}");
         }
     }
 

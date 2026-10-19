@@ -36,8 +36,7 @@ pub const WORKSPACE_DENY: &[&str] = &[
     "**/*.key",
     "**/id_rsa*",
     "**/id_ed25519*",
-    ".git/config",
-    ".git/hooks",
+    "**/.git",
 ];
 
 /// The permission profile, with `<codex dir>` filled in. `--allow-edits` makes the workspace writable;
@@ -717,7 +716,7 @@ mod tests {
              \"/opt/codex/lib/node_modules/@openai/codex\"=\"read\", \
              \":workspace_roots\"={\".\"=\"read\", \"**/.env\"=\"deny\", \"**/*.env\"=\"deny\", \
              \"**/.env.*\"=\"deny\", \"**/*.pem\"=\"deny\", \"**/*.key\"=\"deny\", \"**/id_rsa*\"=\"deny\", \
-             \"**/id_ed25519*\"=\"deny\", \".git/config\"=\"deny\", \".git/hooks\"=\"deny\"}}, \
+             \"**/id_ed25519*\"=\"deny\", \"**/.git\"=\"deny\"}}, \
              network={enabled=false}}"
         );
     }

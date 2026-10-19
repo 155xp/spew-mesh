@@ -10,6 +10,8 @@ The first release.
 
 ### Fixed
 
+- Deny nested Git metadata in Codex serve, preventing reads of repository credentials and writes to nested
+  repositories' hooks or refs when edits are allowed.
 - Expand Codex serve's secret-file deny rules at every directory depth, and check a deeply nested `.env` at
   startup so a depth-limited sandbox cannot silently expose secrets to a peer's question.
 - Strip default-ignorable Unicode characters before escaping peer message boundaries, so invisible characters

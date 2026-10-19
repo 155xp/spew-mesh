@@ -511,13 +511,13 @@ async fn codex_checks_the_sandbox_then_runs_and_resumes() {
          base_url = \"https://llm.example.com/v1\"\nenv_key = \"ACME_API_KEY\"\nwire_api = \"responses\"\n",
     )
     .unwrap();
-    // Calls 1 to 3 are the sandbox self-check.
-    fake.set("runfile", 4, "The answer, from the run file.\n");
-    fake.set("stdout", 4, &codex_events(THREAD, "last message"));
-    fake.set("stdout", 5, &codex_events(THREAD, "Follow-up answer."));
+    // Calls 1 to 4 are the sandbox self-check.
+    fake.set("runfile", 5, "The answer, from the run file.\n");
+    fake.set("stdout", 5, &codex_events(THREAD, "last message"));
+    fake.set("stdout", 6, &codex_events(THREAD, "Follow-up answer."));
 
     let mut r = fake.start(fake.config(ServeClient::Codex)).await.unwrap();
-    assert_eq!(fake.calls(), 3);
+    assert_eq!(fake.calls(), 4);
 
     let profile = codex::profile(&fake.bin, false).unwrap();
     let inside = fake.argv(1);
@@ -531,6 +531,16 @@ async fn codex_checks_the_sandbox_then_runs_and_resumes() {
     let env_canary = PathBuf::from(fake.argv(3).last().unwrap());
     assert!(env_canary.starts_with(&fake.cwd));
     assert_eq!(env_canary.file_name().unwrap(), ".env");
+    let deep_canary = PathBuf::from(fake.argv(4).last().unwrap());
+    assert!(deep_canary.starts_with(env_canary.parent().unwrap()));
+    assert!(
+        deep_canary
+            .strip_prefix(&fake.cwd)
+            .unwrap()
+            .components()
+            .count()
+            > 4
+    );
     // The probe files are gone.
     assert_eq!(
         std::fs::read_dir(&fake.cwd).unwrap().count(),
@@ -543,12 +553,12 @@ async fn codex_checks_the_sandbox_then_runs_and_resumes() {
     assert_eq!(a.text, "The answer, from the run file.");
     assert_eq!(a.cost_usd, None);
 
-    let argv = fake.argv(4);
+    let argv = fake.argv(5);
     let run_file = PathBuf::from(&argv[argv.len() - 2]);
     assert!(run_file.starts_with(&fake.run_dir));
     assert!(!run_file.exists(), "the run file is deleted after reading");
     assert_eq!(
-        fake.get("runmode", 4).trim(),
+        fake.get("runmode", 5).trim(),
         "-rw-------",
         "the run file exists, owner-only, before Codex writes it"
     );
@@ -575,12 +585,12 @@ async fn codex_checks_the_sandbox_then_runs_and_resumes() {
     );
     assert_eq!(argv.last().map(String::as_str), Some("-"));
 
-    let env = fake.env(4);
+    let env = fake.env(5);
     for gone in ["CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_TOOL_CALL_ID"] {
         assert!(!env.contains_key(gone), "{gone} reached the run");
     }
     assert_eq!(env.get("OPENAI_API_KEY").map(String::as_str), Some("kept"));
-    assert!(fake.get("stdin", 4).contains("Where is the config loaded?"));
+    assert!(fake.get("stdin", 5).contains("Where is the config loaded?"));
 
     // The follow-up resumes the thread; every flag comes before `resume`.
     let a = r
@@ -588,53 +598,53 @@ async fn codex_checks_the_sandbox_then_runs_and_resumes() {
         .await
         .unwrap();
     assert_eq!(a.text, "Follow-up answer.");
-    let argv = fake.argv(5);
+    let argv = fake.argv(6);
     let n = argv.len();
     assert_eq!(argv[n - 3..], ["resume", THREAD, "-"]);
     assert_eq!(argv[n - 5], "-o");
-    assert!(fake.get("stdin", 5).contains("And the defaults?"));
+    assert!(fake.get("stdin", 6).contains("And the defaults?"));
 }
 
 #[tokio::test]
 async fn codex_falls_back_when_resume_rejects_the_dash() {
     let fake = Fake::new("codex");
-    fake.set("stdout", 4, &codex_events(THREAD, "first"));
-    fake.set("stderr", 5, "error: unexpected argument '-' found\n");
-    fake.set("exit", 5, "2");
-    fake.set("stdout", 6, &codex_events(THREAD, "second"));
-    fake.set("stdout", 7, &codex_events(THREAD, "third"));
+    fake.set("stdout", 5, &codex_events(THREAD, "first"));
+    fake.set("stderr", 6, "error: unexpected argument '-' found\n");
+    fake.set("exit", 6, "2");
+    fake.set("stdout", 7, &codex_events(THREAD, "second"));
+    fake.set("stdout", 8, &codex_events(THREAD, "third"));
     let mut r = fake.start(fake.config(ServeClient::Codex)).await.unwrap();
     r.answer(&question(Q1, C1, "one")).await.unwrap();
 
     let a = r.answer(&question(Q2, C1, "two")).await.unwrap();
     assert_eq!(a.text, "second");
-    let n = fake.argv(5).len();
-    assert_eq!(fake.argv(5)[n - 3..], ["resume", THREAD, "-"]);
+    let n = fake.argv(6).len();
+    assert_eq!(fake.argv(6)[n - 3..], ["resume", THREAD, "-"]);
     assert_eq!(
-        fake.argv(6)[n - 3..],
+        fake.argv(7)[n - 3..],
         ["resume", THREAD, codex::RESUME_PROMPT]
     );
-    assert!(fake.get("stdin", 6).contains("two"));
+    assert!(fake.get("stdin", 7).contains("two"));
 
     // The fallback sticks.
     r.answer(&question(Q3, C1, "three")).await.unwrap();
     assert_eq!(
-        fake.argv(7).last().map(String::as_str),
+        fake.argv(8).last().map(String::as_str),
         Some(codex::RESUME_PROMPT)
     );
-    assert_eq!(fake.calls(), 7);
+    assert_eq!(fake.calls(), 8);
 }
 
 #[tokio::test]
 async fn codex_new_thread_replaces_the_mapping() {
     let fake = Fake::new("codex");
-    fake.set("stdout", 4, &codex_events(THREAD, "first"));
+    fake.set("stdout", 5, &codex_events(THREAD, "first"));
     fake.set(
         "stdout",
-        5,
+        6,
         &codex_events(THREAD2, "second, in a new thread"),
     );
-    fake.set("stdout", 6, &codex_events(THREAD2, "third"));
+    fake.set("stdout", 7, &codex_events(THREAD2, "third"));
     let mut r = fake.start(fake.config(ServeClient::Codex)).await.unwrap();
     let q = question(Q1, C1, "one");
     r.answer(&q).await.unwrap();
@@ -646,7 +656,7 @@ async fn codex_new_thread_replaces_the_mapping() {
         .unwrap();
     assert_eq!(stored, THREAD2);
     r.answer(&question(Q3, C1, "three")).await.unwrap();
-    let argv = fake.argv(6);
+    let argv = fake.argv(7);
     assert_eq!(argv[argv.len() - 2], THREAD2);
 }
 
@@ -655,15 +665,15 @@ async fn codex_failed_runs() {
     let fake = Fake::new("codex");
     fake.set(
         "stdout",
-        4,
+        5,
         &format!(
             "{}{}\n",
             codex_events(THREAD, "partial"),
             r#"{"type":"turn.failed","error":{"message":"stream disconnected"}}"#
         ),
     );
-    fake.set("exit", 4, "1");
     fake.set("exit", 5, "1");
+    fake.set("exit", 6, "1");
     let mut r = fake.start(fake.config(ServeClient::Codex)).await.unwrap();
     let f = r.answer(&question(Q1, C1, "one")).await.unwrap_err();
     assert_eq!(
@@ -758,7 +768,7 @@ async fn codex_refuses_a_provider_with_inline_headers() {
 #[tokio::test]
 async fn codex_allow_edits_makes_the_workspace_writable() {
     let fake = Fake::new("codex");
-    fake.set("stdout", 4, &codex_events(THREAD, "edited"));
+    fake.set("stdout", 5, &codex_events(THREAD, "edited"));
     let mut cfg = fake.config(ServeClient::Codex);
     cfg.allow_edits = true;
     let mut r = fake.start(cfg).await.unwrap();
@@ -769,7 +779,7 @@ async fn codex_allow_edits_makes_the_workspace_writable() {
     );
     r.answer(&question(Q1, C1, "edit")).await.unwrap();
     assert!(
-        fake.argv(4)
+        fake.argv(5)
             .contains(&format!("permissions.spew-mesh-serve={write_profile}"))
     );
 }

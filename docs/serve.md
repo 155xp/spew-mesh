@@ -143,7 +143,7 @@ workspace, and turns the network off:
 
 ```text
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
- glob_scan_max_depth=3, ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
+ ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
  "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
  ".git/config"="deny", ".git/hooks"="deny"}}, network={enabled=false}}
 ```
@@ -158,8 +158,9 @@ workspace, and turns the network off:
   reads its key from an environment variable (`env_key`).
 - serve refuses to start when the repo's Codex config (`<repo root>/.codex/config.toml`, and the one in `--cwd`)
   sets `sandbox_mode`, `mcp_servers`, `hooks`, `notify` or `features`.
+- Secret-file globs expand without a depth cap, so deeply nested secrets stay denied too.
 - At start, serve checks the profile with `codex sandbox`: reading a file inside `--cwd` must work, and reading a
-  file outside it, or a `.env` file inside it, must fail. If Codex doesn't enforce the profile on this computer,
+  file outside it, or shallow and deeply nested `.env` files inside it, must fail. If Codex doesn't enforce the profile on this computer,
   serve refuses to start.
 - `--allow-edits` makes the workspace writable (`"."="write"`). The deny entries stay.
 - The answer is the run file Codex writes with `-o` (under `~/.spew/mesh/run/serve/`, deleted after reading),

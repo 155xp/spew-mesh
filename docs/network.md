@@ -4,6 +4,7 @@ This page covers how spew mesh daemons find and reach each other, who may connec
 settings live in `~/.spew/mesh/settings.toml` (or `$SPEW_MESH_DIR/settings.toml`). The file is optional; without
 it every setting has its default. A file that doesn't parse, an unknown key, or a value out of range stops the
 daemon with an error naming it, and `spew mesh doctor` shows the same error.
+Parse errors include the location and reason without quoting the settings file, which may hold a relay token.
 
 ## No network until it is needed
 

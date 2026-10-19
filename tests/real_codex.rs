@@ -32,6 +32,12 @@ fn serve_profile_denies_deep_secrets_with_and_without_edits() {
     };
     let sb = Sandbox::new(&cli, |_: &Request| say("unused"));
     let work = sb.work("serve");
+    std::fs::create_dir_all(work.join(".git/hooks")).unwrap();
+    std::fs::write(
+        work.join(".git/config"),
+        "[core]\nrepositoryformatversion = 0\n",
+    )
+    .unwrap();
     let deep = work.join("a/b/c/d");
     std::fs::create_dir_all(&deep).unwrap();
     let control = token("CONTROL");

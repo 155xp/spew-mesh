@@ -268,6 +268,8 @@ where
         let Some(setup) = self.codex.clone() else {
             return Err(RunFailure::new("the Codex responder wasn't prepared"));
         };
+        let profile = codex::protect_git_metadata(&setup.profile, &self.cfg.cwd)
+            .map_err(|e| RunFailure::new(e.to_string()))?;
         let thread = known.filter(|id| is_safe_id(id));
         let run_file = RunFile::create(&self.cfg.run_dir)
             .map_err(|e| RunFailure::new(format!("can't create the Codex run file: {e}")))?;
@@ -275,7 +277,7 @@ where
         loop {
             let args = codex::exec_args(&codex::ExecArgs {
                 cwd: &self.cfg.cwd,
-                profile: &setup.profile,
+                profile: &profile,
                 model: &setup.model,
                 run_file: run_file.path(),
                 resume: thread.map(|id| (id, style)),
@@ -426,6 +428,7 @@ async fn prepare_codex<R: ProcessRunner>(
     let real = std::fs::canonicalize(program)
         .map_err(|e| ServeError::io(format!("can't resolve {}", program.display()), e))?;
     let profile = codex::profile(&codex::codex_dir(&real, &home), cfg.allow_edits)?;
+    let protected = codex::protect_git_metadata(&profile, &cfg.cwd)?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -438,7 +441,7 @@ async fn prepare_codex<R: ProcessRunner>(
         &codex::Canary {
             program,
             cwd: &cfg.cwd,
-            profile: &profile,
+            profile: &protected,
             env,
             outside_dir: &cfg.run_dir,
             timeout: CANARY_TIMEOUT,

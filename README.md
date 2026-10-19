@@ -171,6 +171,7 @@ spew mesh links agents that act for different people, so it treats every incomin
   pre-approved.
 - **serve is read-only by default.** Each client runs with only read and search tools in the served folder, secret
   files (`.env` files, keys, `.git/config`) denied at every directory depth, a timeout, and hourly run limits.
+  Codex runs also deny all Git metadata, including nested repositories' hooks and configuration.
 - **Teammates see only shared rooms.** Presence sent to a teammate holds only the sessions, cards and activity of
   rooms you share.
 - **Removed members are cut off.** When a roster drops a device, its connections close and mail queued for it

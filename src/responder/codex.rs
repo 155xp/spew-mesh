@@ -36,8 +36,6 @@ pub const WORKSPACE_DENY: &[&str] = &[
     "**/*.key",
     "**/id_rsa*",
     "**/id_ed25519*",
-    "**/.git",
-    "**/.git/**",
 ];
 
 /// The base permission profile, with `<codex dir>` filled in. Apply [`protect_git_metadata`] before a run:
@@ -758,7 +756,7 @@ mod tests {
              \"/opt/codex/lib/node_modules/@openai/codex\"=\"read\", \
              \":workspace_roots\"={\".\"=\"read\", \"**/.env\"=\"deny\", \"**/*.env\"=\"deny\", \
              \"**/.env.*\"=\"deny\", \"**/*.pem\"=\"deny\", \"**/*.key\"=\"deny\", \"**/id_rsa*\"=\"deny\", \
-             \"**/id_ed25519*\"=\"deny\", \"**/.git\"=\"deny\", \"**/.git/**\"=\"deny\"}}, \
+             \"**/id_ed25519*\"=\"deny\"}}, \
              network={enabled=false}}"
         );
     }

@@ -145,7 +145,7 @@ workspace, and turns the network off:
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
  ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
  "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
- "**/.git"="deny", "**/.git/**"="deny", ".git"="deny"}}, network={enabled=false}}
+ ".git"="deny"}}, network={enabled=false}}
 ```
 
 - `--ignore-user-config` keeps your `config.toml` out of the run: its MCP servers (mesh included), hooks and

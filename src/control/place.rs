@@ -164,11 +164,10 @@ pub fn write_socket_path(home: &Home, socket: &Path) -> io::Result<()> {
     write_atomic(&home.socket_file(), &text).map_err(io::Error::other)
 }
 
-/// Binds the control socket so it is 0600 before any other account can reach it (6.1 asks for at least 077). It
-/// is bound in a new 0700 folder beside `path`, set to 0600 there and renamed into place. The process umask is
-/// left alone because every thread shares it, and a chmod at `path` itself could be raced onto another file in a
-/// shared runtime folder. Something already at `path` is an error, as it is for a plain bind; clear a stale
-/// socket first.
+/// Binds the control socket so it is 0600 before any other account can reach it (6.1). It is bound in a new 0700
+/// folder beside `path`, set to 0600 there and renamed into place. The process umask is left alone because every
+/// thread shares it, and a chmod at `path` itself could be raced onto another file in a shared runtime folder.
+/// Something already at `path` is an error, as it is for a plain bind; clear a stale socket first.
 pub fn bind_private(path: &Path) -> io::Result<tokio::net::UnixListener> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {
@@ -205,7 +204,9 @@ fn staging_dir(parent: &Path) -> io::Result<PathBuf> {
     for _ in 0..8 {
         let dir = parent.join(format!(".{}", random_base32(6)?));
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => return Ok(dir),
+            // The umask can take owner bits off a new folder. The folder was just made by this process, and no
+            // other account can replace it, even in a sticky shared folder, so setting its mode by name is safe.
+            Ok(()) => return crate::paths::set_mode(&dir, 0o700).map(|()| dir),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }

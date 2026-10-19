@@ -1424,7 +1424,7 @@ checked on crates.io on 2026-10-17; newer compatible releases are fine:
 | `reqwest` 0.13 with `default-features = false, features = ["json", "rustls-no-provider"]` | spew API client, matching iroh's own reqwest so no second TLS provider is built |
 | `rustls` 0.23 with `ring` | the process-wide crypto provider |
 | `ulid`, `sha2`, `base64`, `getrandom` | ids, PKCE, tokens |
-| `libc` | process start times, uids and peer credentials, setsid, descriptor flags |
+| `libc` | process start times, uids and peer credentials, setsid, killpg, descriptor flags, errno codes |
 | `anyhow`, `thiserror`, `tracing`, `tracing-subscriber` | errors and logs |
 
 `main` installs `rustls::crypto::ring::default_provider()` once at process start, before any reqwest client

@@ -869,7 +869,7 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
  ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
  "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
- ".git/config"="deny", ".git/hooks"="deny"}}, network={enabled=false}}
+ "**/.git"="deny"}}, network={enabled=false}}
 ```
 
 - The prompt goes on stdin (`-` as the prompt). Every flag goes before `resume`; Codex rejects `-C` after it.
@@ -883,6 +883,8 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
   the binary's own folder. A local or `--prefix` npm install puts the platform package next to the wrapper
   instead of inside it, so serve finds it the way Node's module lookup does.
 - Expand secret-file deny globs without a depth cap, so nested files receive the same protection.
+- Deny every `.git` entry at any depth, including metadata folders and submodules' pointer files. Codex runs
+  cannot inspect Git metadata or change nested repositories' configuration, refs or hooks.
 - At start, `serve codex` checks the profile with `codex sandbox -C <cwd> -c 'permissions.spew-mesh-serve=<profile>'
   -P spew-mesh-serve -- cat <file>`: reading a file in `--cwd` must work, and reading a canary file serve writes
   outside `--cwd`, or shallow and deeply nested `.env` canaries inside it, must fail. If any check fails (for example on a platform where the profile isn't enforced),

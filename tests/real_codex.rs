@@ -23,9 +23,9 @@ use spew_mesh::wire::Reach;
 const LIMIT: Duration = Duration::from_secs(180);
 
 #[test]
-fn serve_profile_denies_deep_secrets_with_and_without_edits() {
+fn serve_profile_denies_deep_secrets_and_git_metadata() {
     let Some(cli) = real_cli_support::cli(
-        "serve_profile_denies_deep_secrets_with_and_without_edits",
+        "serve_profile_denies_deep_secrets_and_git_metadata",
         "codex",
     ) else {
         return;
@@ -44,8 +44,12 @@ fn serve_profile_denies_deep_secrets_with_and_without_edits() {
         "server.pem",
         "deploy.key",
         "id_ed25519",
+        ".git/config",
+        ".git/hooks/pre-commit",
+        ".git/HEAD",
     ];
     for name in names {
+        std::fs::create_dir_all(deep.join(name).parent().unwrap()).unwrap();
         std::fs::write(deep.join(name), &secret).unwrap();
     }
     let real = std::fs::canonicalize(&cli).unwrap();
@@ -416,6 +420,7 @@ fn serve_profile_canaries_and_resume_dash() {
         ".git/config",
         "a/b/c/d/.env",
         "a/b/c/d/deploy.key",
+        "a/b/c/d/.git/config",
     ];
     let secrets: Vec<String> = secret_files
         .iter()

@@ -869,7 +869,7 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
  ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
  "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
- "**/.git"="deny", "**/.git/**"="deny", ".git"="deny"}}, network={enabled=false}}
+ ".git"="deny"}}, network={enabled=false}}
 ```
 
 - The prompt goes on stdin (`-` as the prompt). Every flag goes before `resume`; Codex rejects `-C` after it.

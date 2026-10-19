@@ -867,7 +867,7 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
 
 ```text
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
- glob_scan_max_depth=3, ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
+ ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
  "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
  ".git/config"="deny", ".git/hooks"="deny"}}, network={enabled=false}}
 ```
@@ -882,9 +882,10 @@ codex exec --json --skip-git-repo-check -C <cwd> --ignore-user-config --disable 
   platform package); else when it is under `$CODEX_HOME/packages/standalone/current`, use that folder; else use
   the binary's own folder. A local or `--prefix` npm install puts the platform package next to the wrapper
   instead of inside it, so serve finds it the way Node's module lookup does.
+- Expand secret-file deny globs without a depth cap, so nested files receive the same protection.
 - At start, `serve codex` checks the profile with `codex sandbox -C <cwd> -c 'permissions.spew-mesh-serve=<profile>'
   -P spew-mesh-serve -- cat <file>`: reading a file in `--cwd` must work, and reading a canary file serve writes
-  outside `--cwd`, or a `.env` canary inside it, must fail. If either check fails (for example on a platform where the profile isn't enforced),
+  outside `--cwd`, or shallow and deeply nested `.env` canaries inside it, must fail. If any check fails (for example on a platform where the profile isn't enforced),
   it refuses to serve, and `doctor` shows the error.
 - `--ignore-user-config` is required. Codex silently ignores permission profiles when any loaded config sets
   `sandbox_mode`, and the flag also keeps the person's MCP servers (mesh included) and `notify` out. It also drops

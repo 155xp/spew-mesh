@@ -10,6 +10,8 @@ The first release.
 
 ### Fixed
 
+- Expand Codex serve's secret-file deny rules at every directory depth, and check a deeply nested `.env` at
+  startup so a depth-limited sandbox cannot silently expose secrets to a peer's question.
 - Strip default-ignorable Unicode characters before escaping peer message boundaries, so invisible characters
   cannot disguise a message header or footer.
 - Omit settings source lines from parse errors so a malformed relay-token setting cannot copy its credential

@@ -56,7 +56,7 @@ pub fn profile(codex_dir: &Path, allow_edits: bool) -> Result<String, ServeError
         .collect();
     Ok(format!(
         "{{extends=\":read-only\", filesystem={{\":root\"=\"deny\", \":minimal\"=\"read\", {dir}=\"read\", \
-         glob_scan_max_depth=3, \":workspace_roots\"={{\".\"=\"{workspace}\"{deny}}}}}, network={{enabled=false}}}}",
+         \":workspace_roots\"={{\".\"=\"{workspace}\"{deny}}}}}, network={{enabled=false}}}}",
         dir = toml_string(dir),
     ))
 }
@@ -573,7 +573,7 @@ pub struct Canary<'a> {
 }
 
 /// The startup self-check (8.3): through `codex sandbox` with the serve profile, reading a file inside
-/// `--cwd` must work, and reading a canary file outside it or a `.env` canary inside it must not.
+/// `--cwd` must work, and reading a canary file outside it or shallow and deep `.env` canaries inside it must not.
 pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Result<(), ServeError> {
     if c.outside_dir.starts_with(c.cwd) {
         return Err(ServeError::Canary(format!(
@@ -603,6 +603,11 @@ pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Resul
             e,
         )
     })?;
+    // A shallow probe misses a depth-limited expansion of the secret-file globs.
+    let deep_dir = env_dir.path().join("nested/one/two");
+    std::fs::create_dir_all(&deep_dir)
+        .and_then(|()| std::fs::write(deep_dir.join(".env"), &env_token))
+        .map_err(|e| ServeError::io("can't write a nested canary file", e))?;
     let read = |file: &Path| RunSpec {
         program: c.program.to_path_buf(),
         args: sandbox_args(c.cwd, c.profile, file),
@@ -656,6 +661,14 @@ pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Resul
                 .into(),
         ));
     }
+    let out = run(&deep_dir.join(".env")).await?;
+    if leaked(&out, &env_token) {
+        return Err(ServeError::Canary(
+            "a sandboxed command read a deeply nested .env file inside --cwd, so Codex doesn't enforce the \
+             serve profile's deny rules at every depth here"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -701,7 +714,7 @@ mod tests {
         assert_eq!(
             profile(Path::new(DIR), false).unwrap(),
             "{extends=\":read-only\", filesystem={\":root\"=\"deny\", \":minimal\"=\"read\", \
-             \"/opt/codex/lib/node_modules/@openai/codex\"=\"read\", glob_scan_max_depth=3, \
+             \"/opt/codex/lib/node_modules/@openai/codex\"=\"read\", \
              \":workspace_roots\"={\".\"=\"read\", \"**/.env\"=\"deny\", \"**/*.env\"=\"deny\", \
              \"**/.env.*\"=\"deny\", \"**/*.pem\"=\"deny\", \"**/*.key\"=\"deny\", \"**/id_rsa*\"=\"deny\", \
              \"**/id_ed25519*\"=\"deny\", \".git/config\"=\"deny\", \".git/hooks\"=\"deny\"}}, \
@@ -1272,13 +1285,16 @@ query_params = { api-version = "2026-01-01" }
         let prof = profile(Path::new(DIR), false).unwrap();
         canary_check(&runner, &canary(&d, &prof)).await.unwrap();
         let calls = runner.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert_eq!(calls[0].args[0], "sandbox");
         assert!(PathBuf::from(calls[0].args.last().unwrap()).starts_with(&d.cwd));
         assert!(PathBuf::from(calls[1].args.last().unwrap()).starts_with(&d.outside));
         let env = PathBuf::from(calls[2].args.last().unwrap());
         assert!(env.starts_with(&d.cwd));
         assert_eq!(env.file_name().unwrap(), ".env");
+        let deep_env = PathBuf::from(calls[3].args.last().unwrap());
+        assert!(deep_env.starts_with(env.parent().unwrap()));
+        assert!(deep_env.strip_prefix(&d.cwd).unwrap().components().count() > 4);
         drop(calls);
         // Both probe files are gone afterwards.
         assert_eq!(std::fs::read_dir(&d.cwd).unwrap().count(), 0);
@@ -1317,6 +1333,31 @@ query_params = { api-version = "2026-01-01" }
         assert!(err.to_string().contains(".env file inside --cwd"), "{err}");
         assert_eq!(runner.calls.lock().unwrap().len(), 3);
         assert_eq!(std::fs::read_dir(&d.cwd).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn canary_fails_when_only_deep_secret_reads_work() {
+        let d = canary_dirs();
+        let cwd = d.cwd.clone();
+        let runner = FakeSandbox {
+            answer: move |f: &Path| {
+                if !f.starts_with(&cwd)
+                    || (f.file_name().is_some_and(|name| name == ".env")
+                        && f.strip_prefix(&cwd).unwrap().components().count() <= 3)
+                {
+                    denied(f)
+                } else {
+                    cat(f)
+                }
+            },
+            calls: Mutex::new(vec![]),
+        };
+        let prof = profile(Path::new(DIR), false).unwrap();
+        let err = canary_check(&runner, &canary(&d, &prof)).await.unwrap_err();
+        assert!(err.to_string().contains("deeply nested .env"), "{err}");
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+        assert_eq!(std::fs::read_dir(&d.cwd).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&d.outside).unwrap().count(), 0);
     }
 
     #[tokio::test]

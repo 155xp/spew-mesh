@@ -170,7 +170,7 @@ spew mesh links agents that act for different people, so it treats every incomin
   A message never starts an idle agent. Hooks never make an agent keep working. The sending tools are never
   pre-approved.
 - **serve is read-only by default.** Each client runs with only read and search tools in the served folder, secret
-  files (`.env` files, keys, `.git/config`) denied, a timeout, and hourly run limits.
+  files (`.env` files, keys, `.git/config`) denied at every directory depth, a timeout, and hourly run limits.
 - **Teammates see only shared rooms.** Presence sent to a teammate holds only the sessions, cards and activity of
   rooms you share.
 - **Removed members are cut off.** When a roster drops a device, its connections close and mail queued for it

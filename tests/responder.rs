@@ -519,7 +519,8 @@ async fn codex_checks_the_sandbox_then_runs_and_resumes() {
     let mut r = fake.start(fake.config(ServeClient::Codex)).await.unwrap();
     assert_eq!(fake.calls(), 4);
 
-    let profile = codex::profile(&fake.bin, false).unwrap();
+    let profile =
+        codex::protect_git_metadata(&codex::profile(&fake.bin, false).unwrap(), &fake.cwd).unwrap();
     let inside = fake.argv(1);
     assert_eq!(
         inside[..inside.len() - 1],
@@ -766,13 +767,34 @@ async fn codex_refuses_a_provider_with_inline_headers() {
 }
 
 #[tokio::test]
+async fn codex_protects_git_metadata_added_after_startup() {
+    let fake = Fake::new("codex");
+    fake.set("stdout", 5, &codex_events(THREAD, "answer"));
+    let mut cfg = fake.config(ServeClient::Codex);
+    cfg.allow_edits = true;
+    let mut responder = fake.start(cfg).await.unwrap();
+    std::fs::create_dir_all(fake.cwd.join("nested/.git/hooks")).unwrap();
+    responder
+        .answer(&question(Q1, C1, "question"))
+        .await
+        .unwrap();
+    let profile =
+        codex::protect_git_metadata(&codex::profile(&fake.bin, true).unwrap(), &fake.cwd).unwrap();
+    assert!(
+        fake.argv(5)
+            .contains(&format!("permissions.spew-mesh-serve={profile}"))
+    );
+}
+
+#[tokio::test]
 async fn codex_allow_edits_makes_the_workspace_writable() {
     let fake = Fake::new("codex");
     fake.set("stdout", 5, &codex_events(THREAD, "edited"));
     let mut cfg = fake.config(ServeClient::Codex);
     cfg.allow_edits = true;
     let mut r = fake.start(cfg).await.unwrap();
-    let write_profile = codex::profile(&fake.bin, true).unwrap();
+    let write_profile =
+        codex::protect_git_metadata(&codex::profile(&fake.bin, true).unwrap(), &fake.cwd).unwrap();
     assert_eq!(
         fake.argv(1)[4],
         format!("permissions.spew-mesh-serve={write_profile}")

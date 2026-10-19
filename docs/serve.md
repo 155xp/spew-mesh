@@ -145,7 +145,7 @@ workspace, and turns the network off:
 {extends=":read-only", filesystem={":root"="deny", ":minimal"="read", "<codex dir>"="read",
  ":workspace_roots"={"."="read", "**/.env"="deny", "**/*.env"="deny",
  "**/.env.*"="deny", "**/*.pem"="deny", "**/*.key"="deny", "**/id_rsa*"="deny", "**/id_ed25519*"="deny",
- "**/.git"="deny"}}, network={enabled=false}}
+ "**/.git"="deny", "**/.git/**"="deny", ".git"="deny"}}, network={enabled=false}}
 ```
 
 - `--ignore-user-config` keeps your `config.toml` out of the run: its MCP servers (mesh included), hooks and
@@ -160,7 +160,9 @@ workspace, and turns the network off:
   sets `sandbox_mode`, `mcp_servers`, `hooks`, `notify` or `features`.
 - Secret-file globs expand without a depth cap, so deeply nested secrets stay denied too.
 - All `.git` entries are denied, including nested repositories' metadata and submodules' `.git` pointer files.
-  A Codex run cannot inspect Git metadata or change a nested repository's configuration, refs or hooks.
+  Each existing Git entry also gets an exact deny before every run, so new files cannot be created under a
+  protected metadata folder. The profile above shows a root `.git`; nested Git entries add their own paths.
+  A Codex run cannot inspect that Git metadata or change its configuration, refs or hooks.
 - At start, serve checks the profile with `codex sandbox`: reading a file inside `--cwd` must work, and reading a
   file outside it, or shallow and deeply nested `.env` files inside it, must fail. If Codex doesn't enforce the profile on this computer,
   serve refuses to start.

@@ -37,10 +37,11 @@ pub const WORKSPACE_DENY: &[&str] = &[
     "**/id_rsa*",
     "**/id_ed25519*",
     "**/.git",
+    "**/.git/**",
 ];
 
-/// The permission profile, with `<codex dir>` filled in. `--allow-edits` makes the workspace writable;
-/// the deny entries stay.
+/// The base permission profile, with `<codex dir>` filled in. Apply [`protect_git_metadata`] before a run:
+/// Codex expands deny globs to files, so protecting whole Git folders also needs exact directory entries.
 pub fn profile(codex_dir: &Path, allow_edits: bool) -> Result<String, ServeError> {
     let dir = codex_dir.to_str().ok_or_else(|| {
         ServeError::Invalid(format!(
@@ -58,6 +59,47 @@ pub fn profile(codex_dir: &Path, allow_edits: bool) -> Result<String, ServeError
          \":workspace_roots\"={{\".\"=\"{workspace}\"{deny}}}}}, network={{enabled=false}}}}",
         dir = toml_string(dir),
     ))
+}
+
+/// Denies existing Git metadata folders and pointer files at every depth. Refreshed before each run so newly
+/// added nested repositories are protected too. Symlinked folders are not traversed outside the workspace.
+pub fn protect_git_metadata(base: &str, cwd: &Path) -> Result<String, ServeError> {
+    let invalid = || ServeError::Invalid("invalid Codex permission profile".into());
+    let mut profile: Value = base.parse().map_err(|_| invalid())?;
+    let roots = profile
+        .as_inline_table_mut()
+        .and_then(|t| t.get_mut("filesystem"))
+        .and_then(Value::as_inline_table_mut)
+        .and_then(|t| t.get_mut(":workspace_roots"))
+        .and_then(Value::as_inline_table_mut)
+        .ok_or_else(invalid)?;
+    let mut pending = vec![cwd.to_path_buf()];
+    let mut entries = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let inspect = |e| {
+            ServeError::io(
+                format!("can't inspect {} for Git metadata", dir.display()),
+                e,
+            )
+        };
+        for entry in std::fs::read_dir(&dir).map_err(&inspect)? {
+            let entry = entry.map_err(&inspect)?;
+            if entry.file_name() == ".git" {
+                entries.push(entry.path());
+            } else if entry.file_type().map_err(&inspect)?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    entries.sort();
+    for entry in entries {
+        let relative = entry.strip_prefix(cwd).map_err(|_| invalid())?;
+        let key = relative.to_str().ok_or_else(|| {
+            ServeError::Invalid("a Git metadata path inside --cwd is not UTF-8".into())
+        })?;
+        roots.insert(key, Value::from("deny"));
+    }
+    Ok(profile.to_string())
 }
 
 /// A TOML basic string.
@@ -716,7 +758,7 @@ mod tests {
              \"/opt/codex/lib/node_modules/@openai/codex\"=\"read\", \
              \":workspace_roots\"={\".\"=\"read\", \"**/.env\"=\"deny\", \"**/*.env\"=\"deny\", \
              \"**/.env.*\"=\"deny\", \"**/*.pem\"=\"deny\", \"**/*.key\"=\"deny\", \"**/id_rsa*\"=\"deny\", \
-             \"**/id_ed25519*\"=\"deny\", \"**/.git\"=\"deny\"}}, \
+             \"**/id_ed25519*\"=\"deny\", \"**/.git\"=\"deny\", \"**/.git/**\"=\"deny\"}}, \
              network={enabled=false}}"
         );
     }
@@ -740,6 +782,33 @@ mod tests {
             assert_eq!(roots.get(entry).unwrap().as_str(), Some("deny"), "{entry}");
         }
         assert_eq!(roots.len(), 1 + WORKSPACE_DENY.len());
+    }
+
+    #[test]
+    fn git_directories_and_pointer_files_get_exact_denies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        let nested = "nested/quoted\"name/.git";
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::create_dir_all(cwd.join(nested)).unwrap();
+        std::fs::create_dir_all(cwd.join("submodule")).unwrap();
+        std::fs::write(cwd.join("submodule/.git"), "gitdir: /outside").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+        let base = profile(Path::new(DIR), true).unwrap();
+        let protected: Value = protect_git_metadata(&base, &cwd).unwrap().parse().unwrap();
+        let roots = protected.as_inline_table().unwrap()["filesystem"]
+            .as_inline_table()
+            .unwrap()[":workspace_roots"]
+            .as_inline_table()
+            .unwrap();
+        for key in [".git", nested, "submodule/.git"] {
+            assert_eq!(roots.get(key).and_then(Value::as_str), Some("deny"));
+        }
+        assert!(!roots.contains_key("link/.git"));
+        assert_eq!(roots.get(".").and_then(Value::as_str), Some("write"));
+        assert!(protect_git_metadata(&base, &tmp.path().join("missing")).is_err());
     }
 
     #[test]

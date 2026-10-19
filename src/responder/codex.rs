@@ -80,11 +80,11 @@ pub fn protect_git_metadata(base: &str, cwd: &Path) -> Result<String, ServeError
                 e,
             )
         };
-        for entry in std::fs::read_dir(&dir).map_err(&inspect)? {
-            let entry = entry.map_err(&inspect)?;
+        for entry in std::fs::read_dir(&dir).map_err(inspect)? {
+            let entry = entry.map_err(inspect)?;
             if entry.file_name() == ".git" {
                 entries.push(entry.path());
-            } else if entry.file_type().map_err(&inspect)?.is_dir() {
+            } else if entry.file_type().map_err(inspect)?.is_dir() {
                 pending.push(entry.path());
             }
         }

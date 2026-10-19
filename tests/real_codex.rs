@@ -22,6 +22,85 @@ use spew_mesh::wire::Reach;
 
 const LIMIT: Duration = Duration::from_secs(180);
 
+#[test]
+fn serve_profile_denies_deep_secrets_with_and_without_edits() {
+    let Some(cli) = real_cli_support::cli(
+        "serve_profile_denies_deep_secrets_with_and_without_edits",
+        "codex",
+    ) else {
+        return;
+    };
+    let sb = Sandbox::new(&cli, |_: &Request| say("unused"));
+    let work = sb.work("serve");
+    std::fs::create_dir_all(work.join(".git/hooks")).unwrap();
+    std::fs::write(
+        work.join(".git/config"),
+        "[core]\nrepositoryformatversion = 0\n",
+    )
+    .unwrap();
+    let deep = work.join("a/b/c/d");
+    std::fs::create_dir_all(&deep).unwrap();
+    let control = token("CONTROL");
+    std::fs::write(work.join("notes.txt"), &control).unwrap();
+    let secret = token("SECRET");
+    let names = [
+        ".env",
+        ".env.production",
+        "prod.env",
+        "server.pem",
+        "deploy.key",
+        "id_ed25519",
+    ];
+    for name in names {
+        std::fs::write(deep.join(name), &secret).unwrap();
+    }
+    let real = std::fs::canonicalize(&cli).unwrap();
+    let dir = codex::codex_dir(&real, &sb.path("codex"));
+    for allow_edits in [false, true] {
+        let profile = codex::profile(&dir, allow_edits).unwrap();
+        let run = |args| {
+            sb.run(
+                &cli,
+                args,
+                &work,
+                codex_env(&sb),
+                "",
+                Duration::from_secs(30),
+            )
+        };
+        let out = run(codex::sandbox_args(
+            &work,
+            &profile,
+            &work.join("notes.txt"),
+        ));
+        assert!(
+            out.success() && out.stdout_text().contains(&control),
+            "{out:?}"
+        );
+        for name in names {
+            let file = deep.join(name);
+            let out = run(codex::sandbox_args(&work, &profile, &file));
+            assert!(!out.success(), "read {name} with allow_edits={allow_edits}");
+            assert!(!out.stdout_text().contains(&secret), "{out:?}");
+            assert!(!out.stderr_text().contains(&secret), "{out:?}");
+            let mut args = codex::sandbox_args(&work, &profile, &file);
+            args.truncate(args.len() - 2);
+            args.extend([
+                OsString::from("sh"),
+                OsString::from("-c"),
+                OsString::from(format!("printf changed > a/b/c/d/{name}")),
+            ]);
+            let out = run(args);
+            assert!(
+                !out.success(),
+                "wrote {name} with allow_edits={allow_edits}"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), secret);
+        }
+    }
+    sb.assert_stayed_local();
+}
+
 /// The variables Codex needs for the mock provider.
 fn codex_env(sb: &Sandbox) -> Vec<(OsString, OsString)> {
     sb.env_with(&[("MOCK_API_KEY", "test-key-not-real".into())])
@@ -341,6 +420,8 @@ fn serve_profile_canaries_and_resume_dash() {
         "sub/deploy.key",
         "sub/id_ed25519",
         ".git/config",
+        "a/b/c/d/.env",
+        "a/b/c/d/deploy.key",
     ];
     let secrets: Vec<String> = secret_files
         .iter()

@@ -1,5 +1,5 @@
 //! Where the control socket lives and how the daemon claims it (6.1): the socket path, the lock, stale socket
-//! removal, binding 0600 under a strict umask, `run/socket`, uid checks, and starting a daemon from a client.
+//! removal, binding the socket 0600, `run/socket`, uid checks, and starting a daemon from a client.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, TryLockError};
@@ -7,7 +7,6 @@ use std::io::{self, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::paths::{
@@ -165,23 +164,56 @@ pub fn write_socket_path(home: &Home, socket: &Path) -> io::Result<()> {
     write_atomic(&home.socket_file(), &text).map_err(io::Error::other)
 }
 
-// umask is per process; this keeps two binds in one process (tests) from restoring each other's mask.
-static UMASK: Mutex<()> = Mutex::new(());
-
-#[allow(unsafe_code)]
-fn set_umask(mask: libc::mode_t) -> libc::mode_t {
-    // SAFETY: umask has no preconditions, can't fail and touches only the process's file mode mask.
-    unsafe { libc::umask(mask) }
+/// Binds the control socket so it is 0600 before any other account can reach it (6.1 asks for at least 077). It
+/// is bound in a new 0700 folder beside `path`, set to 0600 there and renamed into place. The process umask is
+/// left alone because every thread shares it, and a chmod at `path` itself could be raced onto another file in a
+/// shared runtime folder. Something already at `path` is an error, as it is for a plain bind; clear a stale
+/// socket first.
+pub fn bind_private(path: &Path) -> io::Result<tokio::net::UnixListener> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("{} already exists", path.display()),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staging = staging_dir(parent)?;
+    let inner = staging.join("s");
+    let bound = tokio::net::UnixListener::bind(&inner).and_then(|listener| {
+        crate::paths::set_mode(&inner, 0o600)?;
+        std::fs::rename(&inner, path)?;
+        Ok(listener)
+    });
+    if bound.is_err() {
+        let _ = std::fs::remove_file(&inner);
+    }
+    let _ = std::fs::remove_dir(&staging);
+    bound
 }
 
-/// Binds the control socket under umask 177, so it is created 0600 (6.1 asks for at least 077). No chmod
-/// follows: in a shared runtime folder a chmod by path could be raced onto another file.
-pub fn bind_private(path: &Path) -> io::Result<tokio::net::UnixListener> {
-    let _guard = UMASK.lock().unwrap_or_else(|e| e.into_inner());
-    let old = set_umask(0o177);
-    let bound = tokio::net::UnixListener::bind(path);
-    set_umask(old);
-    bound
+// A new folder made 0700, named `.` and 6 random characters so the socket path inside it, `<folder>/s`, is one
+// byte longer than `<home>/run/ipc.sock` at most, which 6.1 keeps under 100 bytes of the system's 104.
+fn staging_dir(parent: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    for _ in 0..8 {
+        let dir = parent.join(format!(".{}", random_base32(6)?));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other(format!(
+        "can't make a private folder in {}",
+        parent.display()
+    )))
 }
 
 /// This process's effective user id.
@@ -416,6 +448,14 @@ mod tests {
         let path = tmp.path().join("ipc.sock");
         let listener = bind_private(&path).unwrap();
         assert_eq!(crate::paths::mode_of(&path).unwrap(), Some(0o600));
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["ipc.sock"], "the folder it was bound in is gone");
+        assert!(tokio::net::UnixStream::connect(&path).await.is_ok());
+        let again = bind_private(&path).map(drop).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AddrInUse);
         drop(listener);
         assert!(path.exists());
         remove_stale_socket(&path).unwrap();

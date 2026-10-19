@@ -414,9 +414,11 @@ retries (the message stays queued); `invalid`, `no-such-session`, `session-ended
 - The daemon listens on a Unix domain socket. It uses `<home>/run/ipc.sock` when that full path is shorter than
   100 bytes. Otherwise it uses `spew-mesh-<10 random base32 characters>.sock` in the first of
   `$XDG_RUNTIME_DIR`, `$TMPDIR` or `/tmp` that exists.
-- Start order: take the lock (below); remove a stale socket file; bind with umask 177, so the socket is 0600 from
-  the start (a socket takes 0777 minus the umask); write the chosen path to `<home>/run/socket` (mode 0600); then accept. A daemon that can't take
-  the lock exits without touching `run/socket` or any socket file.
+- Start order: take the lock (below); remove a stale socket file; bind the socket in a new 0700 folder beside the
+  chosen path, set it to 0600 there and rename it into place, so it is 0600 before another account can reach it
+  and the process umask, which every thread shares, never changes; write the chosen path to `<home>/run/socket`
+  (mode 0600); then accept. A daemon that can't take the lock exits without touching `run/socket` or any socket
+  file.
 - Clients read `<home>/run/socket` and connect. Both ends check the other's uid with the socket's peer
   credentials: the daemon drops connections from other users, and a client refuses a socket owned by another
   user.
@@ -1422,7 +1424,7 @@ checked on crates.io on 2026-10-17; newer compatible releases are fine:
 | `reqwest` 0.13 with `default-features = false, features = ["json", "rustls-no-provider"]` | spew API client, matching iroh's own reqwest so no second TLS provider is built |
 | `rustls` 0.23 with `ring` | the process-wide crypto provider |
 | `ulid`, `sha2`, `base64`, `getrandom` | ids, PKCE, tokens |
-| `libc` | process start times, umask, setsid |
+| `libc` | process start times, uids and peer credentials, setsid, descriptor flags |
 | `anyhow`, `thiserror`, `tracing`, `tracing-subscriber` | errors and logs |
 
 `main` installs `rustls::crypto::ring::default_provider()` once at process start, before any reqwest client

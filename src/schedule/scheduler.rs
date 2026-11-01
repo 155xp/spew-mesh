@@ -212,9 +212,10 @@ where
         let kick = self.handle.kick.clone();
         loop {
             tokio::select! {
-                _ = every.tick() => self.tick().await,
-                _ = kick.notified() => self.tick().await,
-                Some(done) = self.done_rx.recv() => self.finished(done).await,
+                // boxed: a tick's future is too large for a worker's stack in a debug build
+                _ = every.tick() => Box::pin(self.tick()).await,
+                _ = kick.notified() => Box::pin(self.tick()).await,
+                Some(done) = self.done_rx.recv() => Box::pin(self.finished(done)).await,
             }
         }
     }

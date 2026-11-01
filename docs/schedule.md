@@ -92,7 +92,7 @@ The prompt goes on stdin, so it never shows in the process list. The run starts 
 
 | Agent | Command |
 |---|---|
-| Claude Code | `claude -p --model <model> --effort <effort> --output-format json --permission-mode acceptEdits --permission-prompts none` |
+| Claude Code | `claude -p --model <model> --effort <effort> --output-format json --permission-mode auto --permission-prompts none --allowedTools mcp__spew,mcp__claude_ai_spew,mcp__plugin_spew_spew` |
 | Codex | `codex exec --json --skip-git-repo-check --model <model> -c model_reasoning_effort="<effort>" -c approval_policy="never" --sandbox workspace-write -C <folder> -` |
 | OpenCode | `opencode run --model <model>` |
 
@@ -105,8 +105,9 @@ A scheduled run is your own request: spew only hands a computer the runs its own
 your normal agent settings, MCP servers and sign-in, unlike `spew mesh serve`, which answers other people
 read-only.
 
-- Claude Code may edit files (`acceptEdits`). Anything else that would need your approval is denied at once,
-  because nobody is there to answer. Your own allow rules still apply.
+- Claude Code runs in `auto` mode: its safety checks decide each action, so it can edit, run tests and use git.
+  spew's MCP tools are allowed so it can claim the card and move it to review. Anything that would still need your
+  approval is denied at once, because nobody is there to answer. Your own allow and deny rules still apply.
 - Codex runs in its `workspace-write` sandbox and never stops to ask for approval.
 - OpenCode runs with your OpenCode config.
 - Nothing skips permission checks. No run uses `--dangerously-skip-permissions` or a bypass flag.

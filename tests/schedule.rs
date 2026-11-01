@@ -245,9 +245,11 @@ async fn due_runs_are_started_run_and_finished() {
             "--output-format",
             "json",
             "--permission-mode",
-            "acceptEdits",
+            "auto",
             "--permission-prompts",
-            "none"
+            "none",
+            "--allowedTools",
+            "mcp__spew,mcp__claude_ai_spew,mcp__plugin_spew_spew"
         ]
     );
     assert!(

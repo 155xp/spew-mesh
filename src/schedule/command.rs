@@ -2,9 +2,9 @@
 //!
 //! Scheduled runs are the person's own requests (spew only hands a device runs its own person created), so they
 //! run with the person's normal agent settings and MCP servers, unlike serve, which answers other people
-//! read-only. Each CLI may edit files in the project folder and can't stop to ask for approval: Claude Code in
-//! `acceptEdits` mode with prompts denied, Codex in its `workspace-write` sandbox with approvals off. Nothing
-//! skips permission checks. The prompt goes on stdin, so it never shows in the process list.
+//! read-only. Each CLI can work in the project folder and can't stop to ask for approval: Claude Code in `auto`
+//! mode with prompts denied and spew's MCP tools allowed, Codex in its `workspace-write` sandbox with approvals
+//! off. Nothing skips permission checks. The prompt goes on stdin, so it never shows in the process list.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -93,11 +93,15 @@ pub fn args(agent: AgentKind, model: &str, effort: &str, folder: &Path) -> Vec<O
                 "--output-format",
                 "json",
                 "--permission-mode",
-                "acceptEdits",
-                // Nobody is there to answer a prompt: anything outside acceptEdits and the person's allow rules
-                // is denied at once instead of waiting.
+                "auto",
+                // Nobody is there to answer a prompt: anything auto mode and the person's allow rules don't let
+                // through is denied at once instead of waiting.
                 "--permission-prompts",
                 "none",
+                // The run exists to work a spew card, and with prompts off an unlisted MCP call is denied. These
+                // are the names spew's server has when added by hand, as a claude.ai connector and from the plugin.
+                "--allowedTools",
+                "mcp__spew,mcp__claude_ai_spew,mcp__plugin_spew_spew",
             ] {
                 push(s);
             }
@@ -283,9 +287,11 @@ mod tests {
                 "--output-format",
                 "json",
                 "--permission-mode",
-                "acceptEdits",
+                "auto",
                 "--permission-prompts",
-                "none"
+                "none",
+                "--allowedTools",
+                "mcp__spew,mcp__claude_ai_spew,mcp__plugin_spew_spew"
             ]
         );
         assert!(!strings(&a).iter().any(|s| s.contains("dangerously")));

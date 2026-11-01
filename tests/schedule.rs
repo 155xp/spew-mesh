@@ -1,5 +1,5 @@
 //! Scheduled runs (spew#237) against a mock spew: capabilities, due runs, start (with 409), finish, and the runs
-//! that are skipped (past the deadline, agent missing, no folder, agent busy).
+//! that are skipped (past the deadline, agent missing, no folder, a run already going in that folder).
 
 mod spew_api_mock;
 
@@ -113,6 +113,10 @@ async fn fixture(settings_extra: &str) -> Fixture {
 
     let folder = dir.path().join("code").join("spew");
     std::fs::create_dir_all(&folder).unwrap();
+    // a second project nobody configured: found by its .spew.json under the home folder
+    let app = dir.path().join("code").join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join(".spew.json"), r#"{"project": "app"}"#).unwrap();
     let home = Home::at(dir.path().join("mesh")).unwrap();
     home.ensure().unwrap();
     std::fs::write(
@@ -166,7 +170,7 @@ async fn due_runs_are_started_run_and_finished() {
         s.due = vec![
             due("r3", "spew", "claude", T0 + HOUR),
             due("r1", "spew", "claude", T0 + HOUR),
-            due("r2", "spew", "codex", T0 + HOUR),
+            due("r2", "app", "codex", T0 + HOUR),
             due("r4", "spew", "claude", T0 - 1),
             due("r5", "spew", "opencode", T0 + HOUR),
             due("r6", "web", "claude", T0 + HOUR),
@@ -177,17 +181,17 @@ async fn due_runs_are_started_run_and_finished() {
     f.scheduler.tick().await;
     f.scheduler.wait_runs().await;
 
-    // Capabilities went first, with the agents and the one project that has a folder here.
+    // Capabilities went first, with the agents and the projects that have a folder here (app was found on its own).
     let caps = f.mock.with(|s| s.capabilities.clone());
     assert_eq!(caps.len(), 1);
-    assert_eq!(caps[0]["projects"], json!(["spew"]));
+    assert_eq!(caps[0]["projects"], json!(["app", "spew"]));
     assert_eq!(caps[0]["reportedAt"], json!(T0));
     assert_eq!(caps[0]["agents"][0]["kind"], "claude");
     assert_eq!(caps[0]["agents"][0]["models"][0]["defaultEffort"], "high");
     assert_eq!(caps[0]["agents"][1]["kind"], "codex");
 
-    // r1 and r2 ran; r3 was taken (409); r4 is past its deadline; r5's agent and r6's folder aren't here; r7 waits
-    // for the Claude Code run.
+    // r1 (spew) and r2 (app) ran side by side; r3 was taken (409); r4 is past its deadline; r5's agent and r6's
+    // folder aren't here; r7 waits for the run in spew's folder.
     let (started, finished) = f.mock.with(|s| (s.started.clone(), s.finished.clone()));
     assert_eq!(started, ["r1", "r2"]);
     assert_eq!(finished.len(), 2);
@@ -215,7 +219,7 @@ async fn due_runs_are_started_run_and_finished() {
     assert_eq!(note("r4"), "past its deadline; spew marks it missed");
     assert_eq!(note("r5"), "OpenCode isn't installed here");
     assert_eq!(note("r6"), "no folder for project web here");
-    assert_eq!(note("r7"), "waiting: a Claude Code run is going");
+    assert_eq!(note("r7"), "waiting: a run in spew is going");
 
     // The command lines: the CLI in the project folder, the prompt on stdin.
     let specs = f.runner.specs.lock().unwrap().clone();
@@ -258,9 +262,14 @@ async fn due_runs_are_started_run_and_finished() {
         .find(|s| s.program == f.bin.join("codex"))
         .unwrap();
     assert!(codex.args.iter().any(|a| a == "workspace-write"));
-    assert!(codex.args.iter().any(|a| a == f.folder.as_os_str()));
+    assert!(
+        codex
+            .args
+            .iter()
+            .any(|a| a == f.folder.with_file_name("app").as_os_str())
+    );
 
-    // The next minute: r7 runs now that Claude Code is free. Capabilities didn't change, so they aren't sent again.
+    // The next minute: r7 runs now that spew's folder is free. Capabilities didn't change, so they aren't sent again.
     f.scheduler.tick().await;
     f.scheduler.wait_runs().await;
     assert_eq!(f.mock.with(|s| s.started.clone()), ["r1", "r2", "r7"]);
@@ -318,8 +327,8 @@ async fn nothing_happens_when_scheduling_is_off() {
     let status = f.scheduler.handle().status();
     assert!(!status.enabled);
     assert_eq!(status.state, "off");
-    // Folders still show, so `spew mesh schedule` can say where runs would go.
-    assert_eq!(status.folders.len(), 1);
+    // Folders still show, so `spew mesh schedule` can say where runs would go (spew from settings, app found).
+    assert_eq!(status.folders.len(), 2);
     f.mock.with(|s| {
         assert!(s.capabilities.is_empty());
         assert!(s.started.is_empty());

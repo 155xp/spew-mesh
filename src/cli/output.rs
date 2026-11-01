@@ -472,6 +472,7 @@ pub fn schedule(s: &ScheduleStatus, now: u64) -> String {
         let source = match f.source {
             FolderSource::Settings => "from settings.toml",
             FolderSource::Sessions => "from agent sessions",
+            FolderSource::Found => "found under your home folder",
         };
         let _ = writeln!(
             out,

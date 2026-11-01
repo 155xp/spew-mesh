@@ -15,9 +15,20 @@ spew mesh schedule on
 
 - spew mesh signed in to spew (`spew mesh login`).
 - The agent's CLI on `PATH` and signed in, the same way you use it by hand.
-- A folder for the card's project. The daemon learns it on its own: any agent session that works in a folder whose
-  `.spew.json` names the project teaches it that folder. The most recently used folder wins. You can set it
-  yourself in `settings.toml`, and that wins over what was learned:
+- A folder for the card's project. The daemon finds it on its own, two ways:
+  - every 10 minutes it looks up to three levels under your home folder (`~/Code/spew`, `~/Code/org/web`) for a
+    `.spew.json` naming a project, skipping hidden folders, `node_modules`, build output and media folders;
+  - any agent session that works in a folder whose `.spew.json` names the project teaches it that folder.
+
+  A folder an agent worked in wins over one that was only found, and the most recently used wins among those.
+  To pick the folder yourself, run this in it (or pass the path); it wins over both:
+
+```console
+$ cd ~/Code/spew && spew mesh schedule folder spew
+Scheduled spew cards run in /Users/sam/Code/spew on this computer.
+```
+
+That writes `[schedule.folders]` in `settings.toml`, which you can also edit by hand:
 
 ```toml
 [schedule.folders]
@@ -58,7 +69,8 @@ Recent runs here:
    meant for this computer or for any of your computers.
 3. For each due run whose agent is installed here and whose project has a folder here, it takes the run. If
    another of your computers took it first, spew says so and this one skips it.
-4. It runs the agent in the project folder, at most one run at a time per agent.
+4. It runs the agent in the project folder. Different projects run side by side, up to three runs at once; a
+   project's own cards run one at a time, so two runs never edit the same folder together.
 5. When the run ends, it tells spew how: done or failed, the exit status, and the last 2000 characters of what the
    agent said. If spew can't be reached then, it tries again every minute.
 

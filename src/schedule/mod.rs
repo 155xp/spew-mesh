@@ -211,6 +211,8 @@ pub enum FolderSource {
     Settings,
     /// An agent session worked there.
     Sessions,
+    /// A `.spew.json` under the home folder names the project.
+    Found,
 }
 
 /// A project and the folder its cards run in.

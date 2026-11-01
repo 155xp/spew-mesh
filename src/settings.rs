@@ -686,6 +686,44 @@ pub fn set_schedule_enabled(
     })
 }
 
+/// Sets `[schedule.folders] <project> = "<folder>"` in `<home>/settings.toml`: the folder this computer runs that
+/// project's scheduled cards in. Like `set_schedule_enabled`, the edit is checked before it is written.
+pub fn set_schedule_folder(
+    home: &Home,
+    user_home: Option<&Path>,
+    project: &str,
+    folder: &Path,
+) -> Result<(), SettingsError> {
+    let path = home.settings_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(SettingsError::Read { path, error }),
+    };
+    Settings::parse(&text, &path, home, user_home)?;
+    let invalid = |message: String| SettingsError::Invalid {
+        path: path.clone(),
+        message,
+    };
+    let folder = folder
+        .to_str()
+        .ok_or_else(|| invalid("the folder path isn't UTF-8".into()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| invalid(e.message().to_string()))?;
+    if !doc.contains_table("schedule") {
+        doc["schedule"] = toml_edit::table();
+    }
+    if doc["schedule"].get("folders").is_none() {
+        doc["schedule"]["folders"] = toml_edit::table();
+    }
+    doc["schedule"]["folders"][project] = toml_edit::value(folder);
+    let edited = doc.to_string();
+    Settings::parse(&edited, &path, home, user_home)?;
+    home.ensure().map_err(|e| invalid(e.to_string()))?;
+    crate::paths::write_atomic(&path, edited.as_bytes()).map_err(|e| invalid(e.to_string()))
+}
+
 /// The spew mesh variables from an environment (11).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Env {
@@ -1274,5 +1312,30 @@ max_budget_usd = 1
             std::fs::read_to_string(home.settings_file()).unwrap(),
             "[schedule]\nenabled = \"maybe\"\n"
         );
+    }
+
+    #[test]
+    fn schedule_folder_is_set_and_kept_beside_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("mesh")).unwrap();
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(
+            home.settings_file(),
+            "# mine\n[schedule]\ntimeout_minutes = 45\n",
+        )
+        .unwrap();
+        let web = tmp.path().join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        set_schedule_folder(&home, None, "web", &web).unwrap();
+        set_schedule_folder(&home, None, "spew", tmp.path()).unwrap();
+        let text = std::fs::read_to_string(home.settings_file()).unwrap();
+        assert!(text.starts_with("# mine\n"), "{text}");
+        let s = Settings::parse(&text, Path::new("s"), &home, None).unwrap();
+        assert_eq!(s.schedule.timeout_minutes, 45);
+        assert_eq!(s.schedule.folders["web"], web);
+        assert_eq!(s.schedule.folders["spew"], tmp.path());
+        // a key settings.toml refuses leaves the file alone
+        assert!(set_schedule_folder(&home, None, "Bad Key", &web).is_err());
+        assert_eq!(std::fs::read_to_string(home.settings_file()).unwrap(), text);
     }
 }

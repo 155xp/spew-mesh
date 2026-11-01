@@ -38,6 +38,11 @@ pub const RECENT_RUNS: usize = 10;
 
 const NOTE_CHARS: usize = 160;
 
+/// Runs going at once on one computer, across projects.
+pub const MAX_PARALLEL: usize = 3;
+/// How often the home folder is searched for project folders.
+pub const DISCOVER_EVERY_MS: u64 = 10 * 60 * 1000;
+
 /// What the scheduler needs besides spew, the store and the runner.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -78,6 +83,7 @@ impl SchedulerHandle {
 // A run that ended, sent from its task back to the loop.
 struct Finished {
     id: String,
+    project: String,
     agent: AgentKind,
     finish: RunFinish,
 }
@@ -96,8 +102,11 @@ pub struct Scheduler<R, D> {
     detected_at: u64,
     sent: Option<(Vec<AgentCapability>, Vec<String>)>,
     sent_at: u64,
-    running: HashSet<AgentKind>,
+    /// Projects with a run going: one per project folder at a time, projects side by side.
+    running: HashSet<String>,
     started: HashSet<String>,
+    /// When the home folder was last searched for `.spew.json` files, ms.
+    discovered_at: std::sync::atomic::AtomicU64,
     done_tx: mpsc::UnboundedSender<Finished>,
     done_rx: mpsc::UnboundedReceiver<Finished>,
     handle: SchedulerHandle,
@@ -157,6 +166,7 @@ where
             sent_at: 0,
             running: HashSet::new(),
             started: HashSet::new(),
+            discovered_at: std::sync::atomic::AtomicU64::new(0),
             done_tx,
             done_rx,
             handle,
@@ -231,6 +241,20 @@ where
         if let Err(e) = folders::learn(&self.store()) {
             tracing::warn!(error = %e, "scheduled runs: can't learn project folders");
         }
+        // the home folder's projects, looked for every few minutes
+        let now = self.clock.now_ms();
+        let last = self
+            .discovered_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(root) = &self.cfg.user_home
+            && (last == 0 || now.saturating_sub(last) >= DISCOVER_EVERY_MS)
+        {
+            self.discovered_at
+                .store(now.max(1), std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = folders::discover(&self.store(), root) {
+                tracing::warn!(error = %e, "scheduled runs: can't look for project folders");
+            }
+        }
         folders::resolve(&self.settings.folders, &self.store()).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "scheduled runs: can't read project folders");
             Vec::new()
@@ -239,7 +263,7 @@ where
 
     fn refresh_recent(&self) {
         let recent = self.store().schedule_runs(RECENT_RUNS).unwrap_or_default();
-        let mut running: Vec<String> = self.running.iter().map(|k| k.to_string()).collect();
+        let mut running: Vec<String> = self.running.iter().cloned().collect();
         running.sort();
         let mut status = self.status();
         status.recent = recent;
@@ -396,8 +420,11 @@ where
         let Some(folder) = folders.iter().find(|f| f.project == run.project) else {
             return format!("no folder for project {} here", run.project);
         };
-        if self.running.contains(&run.agent) {
-            return format!("waiting: a {label} run is going");
+        if self.running.contains(&run.project) {
+            return format!("waiting: a run in {} is going", run.project);
+        }
+        if self.running.len() >= MAX_PARALLEL {
+            return format!("waiting: {MAX_PARALLEL} runs are going");
         }
         let started = match self.api.start_run::<Value>(&run.id).await {
             Ok(RunStart::Started(v)) => v,
@@ -452,7 +479,7 @@ where
             timeout_minutes = self.settings.timeout_minutes,
             "starting a scheduled run"
         );
-        self.running.insert(run.agent);
+        self.running.insert(run.project.clone());
         self.started.insert(run.id.clone());
         let runner = self.runner.clone();
         let env = self.cfg.env.clone();
@@ -498,6 +525,7 @@ where
             };
             let _ = done.send(Finished {
                 id: run.id,
+                project: run.project,
                 agent: run.agent,
                 finish,
             });
@@ -506,7 +534,7 @@ where
     }
 
     async fn finished(&mut self, done: Finished) {
-        self.running.remove(&done.agent);
+        self.running.remove(&done.project);
         let now = self.clock.now_ms();
         if let Err(e) = self.store().finish_schedule_run(
             &done.id,

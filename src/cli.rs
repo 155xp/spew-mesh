@@ -26,7 +26,7 @@ use crate::daemon::status::NetworkDetails;
 use crate::identity::DeviceIdentity;
 use crate::paths::{Home, user_home_from_env};
 use crate::schedule::ScheduleStatus;
-use crate::settings::{Env, PROJECT_ENV, Settings, set_schedule_enabled};
+use crate::settings::{Env, PROJECT_ENV, Settings, set_schedule_enabled, set_schedule_folder};
 use crate::spew_api::{Clock, OpenBrowser, SystemBrowser, SystemClock};
 use crate::wire::SessionKind;
 
@@ -208,6 +208,13 @@ enum ScheduleCommand {
     On,
     /// Stop taking scheduled runs on this computer.
     Off,
+    /// Run a project's scheduled cards in this folder (found on its own when it holds a .spew.json).
+    Folder {
+        /// The spew project key, such as `spew`.
+        project: String,
+        /// The folder; the current one when left out.
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -737,6 +744,36 @@ async fn schedule(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let user_home = user_home_from_env();
+    if let Some(ScheduleCommand::Folder { project, path }) = &command {
+        let folder = match path {
+            Some(p) => p.clone(),
+            None => std::env::current_dir()?,
+        };
+        let folder = std::fs::canonicalize(&folder)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", folder.display()))?;
+        if !folder.is_dir() {
+            anyhow::bail!("{} isn't a folder", folder.display());
+        }
+        if project.is_empty()
+            || project.len() > 80
+            || !project
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("{project:?} isn't a spew project key (letters, digits, - and _)");
+        }
+        set_schedule_folder(home, user_home.as_deref(), project, &folder)?;
+        if let Ok(client) = Client::connect(home, &ConnectOptions::existing()).await {
+            let _ = client
+                .call_value(method::SCHEDULE_KICK, serde_json::json!({}))
+                .await;
+        }
+        println!(
+            "Scheduled {project} cards run in {} on this computer.",
+            folder.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(command) = command {
         let on = matches!(command, ScheduleCommand::On);
         set_schedule_enabled(home, user_home.as_deref(), on)?;

@@ -2,7 +2,9 @@
 //!
 //! The daemon already knows where agent sessions work and which project their `.spew.json` names. Each project's
 //! folders are remembered in the store (the folder holding the `.spew.json`, with when a session last worked
-//! there), so they outlive the sessions. `[schedule.folders]` in settings.toml wins over what was learned.
+//! there), so they outlive the sessions. Folders are also found by looking for `.spew.json` files a few levels under
+//! the home folder, so a project scheduled before any agent worked in it here still has somewhere to run.
+//! `[schedule.folders]` in settings.toml (`spew mesh schedule folder`) wins over both.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,74 @@ pub fn learn(store: &Store) -> Result<(), StoreError> {
         store.put_project_folder(&s.project, folder, s.last_seen_at)?;
     }
     Ok(())
+}
+
+/// How deep under the home folder `discover` looks: `~/Code/spew` is 2, `~/Code/org/spew` 3.
+pub const DISCOVER_DEPTH: usize = 3;
+/// At most this many folders are opened per look, so a huge home folder can't stall the daemon.
+pub const DISCOVER_MAX_DIRS: usize = 20_000;
+// Folders never worth opening: hidden ones, build output, dependencies and the big media folders.
+const SKIP: [&str; 14] = [
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "Library",
+    "Applications",
+    "Pictures",
+    "Music",
+    "Movies",
+    "Videos",
+    "Downloads",
+    "snap",
+    "go",
+];
+
+/// Remembers every folder up to `DISCOVER_DEPTH` under `root` holding a `.spew.json` that names a project. Found
+/// folders are remembered as never used (time 0), so one an agent session actually worked in wins.
+pub fn discover(store: &Store, root: &Path) -> Result<usize, StoreError> {
+    let mut found = 0;
+    let mut opened = 0;
+    let mut level = vec![root.to_path_buf()];
+    for depth in 0..=DISCOVER_DEPTH {
+        let mut next = Vec::new();
+        for dir in level {
+            if opened >= DISCOVER_MAX_DIRS {
+                return Ok(found);
+            }
+            opened += 1;
+            if depth > 0 {
+                let file = dir.join(SPEW_JSON);
+                if let (Ok(project), Some(folder)) = (read_spew_json(&file), dir.to_str()) {
+                    store.put_project_folder(&project, folder, 0)?;
+                    found += 1;
+                    // a project's own folders aren't searched for more projects
+                    continue;
+                }
+            }
+            if depth == DISCOVER_DEPTH {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let Some(name) = name.to_str() else { continue };
+                // symlinks aren't followed, so a loop can't trap the walk
+                if name.starts_with('.')
+                    || SKIP.contains(&name)
+                    || !e.file_type().is_ok_and(|t| t.is_dir())
+                {
+                    continue;
+                }
+                next.push(e.path());
+            }
+        }
+        level = next;
+    }
+    Ok(found)
 }
 
 // Whether `folder` still holds a `.spew.json` naming `project`.
@@ -63,7 +133,11 @@ pub fn resolve(
             ProjectFolderInfo {
                 project: f.project,
                 folder: f.folder,
-                source: FolderSource::Sessions,
+                source: if f.last_used_at == 0 {
+                    FolderSource::Found
+                } else {
+                    FolderSource::Sessions
+                },
             },
         );
     }
@@ -100,6 +174,49 @@ mod tests {
             last_seen_at: seen,
             ended_at: Some(seen),
         }
+    }
+
+    #[test]
+    fn discover_finds_projects_under_home_and_skips_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |rel: &str, project: &str| {
+            let d = dir.path().join(rel);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(SPEW_JSON), format!(r#"{{"project": "{project}"}}"#)).unwrap();
+        };
+        put("Code/spew", "spew");
+        put("Code/org/web", "web");
+        put("Code/spew/packages/inner", "inner"); // inside a project: not searched
+        put("Code/org/web/node_modules/x", "dep");
+        put(".config/hidden", "hidden");
+        put("a/b/c/too-deep", "deep");
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(discover(&store, dir.path()).unwrap(), 2);
+        let found = resolve(&BTreeMap::new(), &store).unwrap();
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| (f.project.as_str(), f.source))
+            .collect();
+        assert_eq!(
+            names,
+            [("spew", FolderSource::Found), ("web", FolderSource::Found)]
+        );
+        // a folder an agent session worked in wins over a found one for the same project
+        let other = dir.path().join("work/spew");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(SPEW_JSON), r#"{"project": "spew"}"#).unwrap();
+        store
+            .put_project_folder("spew", other.to_str().unwrap(), 5)
+            .unwrap();
+        let spew = resolve(&BTreeMap::new(), &store)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.project == "spew")
+            .unwrap();
+        assert_eq!(
+            (spew.folder.as_str(), spew.source),
+            (other.to_str().unwrap(), FolderSource::Sessions)
+        );
     }
 
     #[test]

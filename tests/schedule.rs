@@ -75,6 +75,7 @@ fn agent(kind: AgentKind, model: &str) -> AgentCapability {
             default_effort: Some("high".into()),
         }],
         usage: None,
+        limits: Vec::new(),
     }
 }
 

@@ -124,9 +124,13 @@ pub struct AgentCapability {
     pub plan: Option<String>,
     /// The models it takes.
     pub models: Vec<ModelOption>,
-    /// Usage the CLI last reported, when it reports any.
+    /// Usage the CLI last reported, when it reports any: its main window.
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// Every usage window the CLI reports (Claude's 5-hour and weekly, Codex's primary and secondary), so the
+    /// Schedule page can mark each reset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<Usage>,
 }
 
 /// What this computer can run, as sent to spew.

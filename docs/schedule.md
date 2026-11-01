@@ -109,7 +109,8 @@ Only lists and names:
 
 - each agent's kind and version, its model ids and labels, and the effort levels each model takes;
 - the plan name each CLI is signed in with, such as `Max 20x` or `Pro`;
-- the usage the CLI last reported, as a percent, a window length and a reset time;
+- every usage window the CLI last reported (Claude's 5-hour and weekly, Codex's primary and secondary), each as a
+  percent, a window length and a reset time, so the Schedule page can mark each reset;
 - the project keys this computer has a folder for (not the folder paths);
 - for each run: done or failed, the exit status, and the end of the agent's output.
 
@@ -123,10 +124,11 @@ Tokens never leave the computer and are never logged. To find the plan, the daem
 Where the rest comes from:
 
 - Claude Code: `claude --version`, the effort levels on the `--effort` line of `claude --help`, model names from
-  Claude Code's model catalog cache (`~/.claude/cache/model-catalog/`), and the 5-hour usage Claude Code cached in
-  `~/.claude.json`, only when it was fetched in the last hour.
-- Codex: `codex --version`, `codex debug models` (models marked to list), and `rate_limits` in the newest session
-  log under `~/.codex/sessions/`.
+  Claude Code's model catalog cache (`~/.claude/cache/model-catalog/`), and the usage Claude Code cached in
+  `~/.claude.json`: the 5-hour window when it was fetched in the last hour, the weekly windows when fetched in the
+  last day.
+- Codex: `codex --version`, `codex debug models` (models marked to list), and `rate_limits` (`primary` and `secondary`) in the
+  newest session log under `~/.codex/sessions/`.
 - OpenCode: `opencode --version` and `opencode models`.
 
 Each command has a 30-second timeout. A CLI that is missing or doesn't answer is left out.

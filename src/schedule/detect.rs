@@ -119,15 +119,17 @@ impl<R: ProcessRunner> SystemDetect<R> {
             .as_deref()
             .and_then(|dir| read_small(&dir.join(".credentials.json")))
             .and_then(|text| parse_claude_plan(&text));
-        let usage = claude_state_file(&self.env)
+        let limits = claude_state_file(&self.env)
             .and_then(|path| read_small(&path))
-            .and_then(|text| parse_claude_usage(&text, self.clock.now_ms()));
+            .map(|text| parse_claude_limits(&text, self.clock.now_ms()))
+            .unwrap_or_default();
         Some(AgentCapability {
             kind: AgentKind::Claude,
             version,
             plan,
             models: claude_models(&efforts, &catalog),
-            usage,
+            usage: limits.iter().find(|u| u.window_minutes == 300).cloned(),
+            limits,
         })
     }
 
@@ -147,15 +149,17 @@ impl<R: ProcessRunner> SystemDetect<R> {
             .and_then(|dir| read_small(&dir.join("auth.json")))
             .and_then(|text| parse_codex_plan(&text));
         let now = self.clock.now_ms();
-        let usage = home
+        let limits = home
             .as_deref()
-            .and_then(|dir| codex_usage(&dir.join("sessions"), now));
+            .map(|dir| codex_limits(&dir.join("sessions"), now))
+            .unwrap_or_default();
         Some(AgentCapability {
             kind: AgentKind::Codex,
             version,
             plan,
             models,
-            usage,
+            usage: limits.first().cloned(),
+            limits,
         })
     }
 
@@ -173,6 +177,7 @@ impl<R: ProcessRunner> SystemDetect<R> {
             plan: None,
             models,
             usage: None,
+            limits: Vec::new(),
         })
     }
 }
@@ -424,6 +429,54 @@ pub fn claude_plan_label(subscription: &str, tier: &str) -> Option<String> {
     Some(label(&text)).filter(|t| !t.is_empty())
 }
 
+/// Claude's weekly windows in `cachedUsageUtilization`, each reported with its own length.
+const CLAUDE_WEEKLY: [&str; 3] = ["seven_day", "seven_day_opus", "seven_day_sonnet"];
+/// A cached weekly window older than this isn't reported (its reset time stays true longer than its percent).
+pub const CLAUDE_WEEKLY_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Every usage window Claude Code cached in `~/.claude.json`: the 5-hour one (fresh within the last hour) and the
+/// weekly ones (fresh within a day), each only while its window hasn't reset. Empty when there's nothing to trust.
+pub fn parse_claude_limits(text: &str, now_ms: u64) -> Vec<Usage> {
+    let mut out: Vec<Usage> = parse_claude_usage(text, now_ms).into_iter().collect();
+    let Some(cached) = serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("cachedUsageUtilization").cloned())
+    else {
+        return out;
+    };
+    let Some(fetched) = cached.get("fetchedAtMs").and_then(Value::as_u64) else {
+        return out;
+    };
+    if now_ms.saturating_sub(fetched) > CLAUDE_WEEKLY_MAX_AGE_MS {
+        return out;
+    }
+    for key in CLAUDE_WEEKLY {
+        let Some(w) = cached.get("utilization").and_then(|u| u.get(key)) else {
+            continue;
+        };
+        let (Some(used), Some(resets_at)) = (
+            w.get("utilization").and_then(Value::as_f64),
+            w.get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_ms),
+        ) else {
+            continue;
+        };
+        if resets_at > now_ms
+            && !out
+                .iter()
+                .any(|u| u.resets_at == Some(resets_at) && u.window_minutes == 10080)
+        {
+            out.push(Usage {
+                used_pct: used.clamp(0.0, 100.0),
+                window_minutes: 10080,
+                resets_at: Some(resets_at),
+            });
+        }
+    }
+    out
+}
+
 /// The 5-hour usage Claude Code cached in `~/.claude.json` (`cachedUsageUtilization`), when it was fetched within
 /// the last hour and its window hasn't reset since. None otherwise: no guess.
 pub fn parse_claude_usage(text: &str, now_ms: u64) -> Option<Usage> {
@@ -565,22 +618,22 @@ pub fn parse_codex_plan(text: &str) -> Option<String> {
     (!plan.is_empty() && plan.len() <= 32).then(|| capitalize(&plan))
 }
 
-/// The newest `rate_limits.primary` in Codex session log lines, when its window hasn't reset yet.
-pub fn parse_codex_usage(text: &str, now_ms: u64) -> Option<Usage> {
-    let limits = text.lines().rev().find_map(|line| {
-        if !line.contains("\"rate_limits\"") {
-            return None;
-        }
-        let v: Value = serde_json::from_str(line).ok()?;
-        let limits = v
-            .pointer("/payload/rate_limits")
-            .or_else(|| v.get("rate_limits"))?;
-        limits.is_object().then(|| limits.clone())
-    })?;
-    let primary = limits.get("primary")?;
-    let used = primary.get("used_percent")?.as_f64()?;
-    let window = primary.get("window_minutes")?.as_u64()?;
-    let resets_at = primary
+/// The newest `rate_limits` in Codex session log lines: `primary` then `secondary`, each while its window hasn't
+/// reset yet.
+pub fn parse_codex_limits(text: &str, now_ms: u64) -> Vec<Usage> {
+    let Some(limits) = newest_rate_limits(text) else {
+        return Vec::new();
+    };
+    ["primary", "secondary"]
+        .iter()
+        .filter_map(|key| codex_window(limits.get(*key)?, now_ms))
+        .collect()
+}
+
+fn codex_window(w: &Value, now_ms: u64) -> Option<Usage> {
+    let used = w.get("used_percent")?.as_f64()?;
+    let window = w.get("window_minutes")?.as_u64()?;
+    let resets_at = w
         .get("resets_at")
         .and_then(Value::as_u64)
         .map(|s| s.saturating_mul(1000));
@@ -592,6 +645,24 @@ pub fn parse_codex_usage(text: &str, now_ms: u64) -> Option<Usage> {
         window_minutes: window,
         resets_at,
     })
+}
+
+fn newest_rate_limits(text: &str) -> Option<Value> {
+    text.lines().rev().find_map(|line| {
+        if !line.contains("\"rate_limits\"") {
+            return None;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        let limits = v
+            .pointer("/payload/rate_limits")
+            .or_else(|| v.get("rate_limits"))?;
+        limits.is_object().then(|| limits.clone())
+    })
+}
+
+/// The newest `rate_limits.primary` in Codex session log lines, when its window hasn't reset yet.
+pub fn parse_codex_usage(text: &str, now_ms: u64) -> Option<Usage> {
+    codex_window(newest_rate_limits(text)?.get("primary")?, now_ms)
 }
 
 // Folders of `dir` with numeric names (the year, month and day folders of Codex's session logs), newest first.
@@ -655,13 +726,14 @@ fn read_tail(path: &Path, max: u64) -> Option<String> {
     })
 }
 
-/// Codex usage from the newest session logs that report rate limits.
-pub fn codex_usage(sessions: &Path, now_ms: u64) -> Option<Usage> {
+/// Every Codex usage window from the newest session logs that report rate limits.
+pub fn codex_limits(sessions: &Path, now_ms: u64) -> Vec<Usage> {
     newest_rollouts(sessions, ROLLOUT_FILES)
         .iter()
         .filter_map(|path| read_tail(path, ROLLOUT_TAIL))
         .find(|text| text.contains("\"rate_limits\""))
-        .and_then(|text| parse_codex_usage(&text, now_ms))
+        .map(|text| parse_codex_limits(&text, now_ms))
+        .unwrap_or_default()
 }
 
 /// OpenCode's models from `opencode models`: one `provider/model` per line.
@@ -839,6 +911,32 @@ Options:
     }
 
     #[test]
+    fn claude_limits_include_the_weekly_windows() {
+        let now = parse_rfc3339_ms("2026-11-01T00:00:00Z").unwrap();
+        let text = |fetched: u64| {
+            serde_json::json!({ "cachedUsageUtilization": { "fetchedAtMs": fetched, "utilization": {
+                "five_hour": { "utilization": 30, "resets_at": "2026-11-01T02:00:00Z" },
+                "seven_day": { "utilization": 18, "resets_at": "2026-11-07T04:00:00.417802+00:00" },
+                "seven_day_opus": null
+            } } })
+            .to_string()
+        };
+        let limits = parse_claude_limits(&text(now - 60_000), now);
+        assert_eq!(
+            limits.iter().map(|u| u.window_minutes).collect::<Vec<_>>(),
+            vec![300, 10080]
+        );
+        assert_eq!(limits[1].used_pct, 18.0);
+        // three hours old: the 5-hour percent is stale, the weekly reset still counts
+        let older = parse_claude_limits(&text(now - 3 * 3_600_000), now);
+        assert_eq!(
+            older.iter().map(|u| u.window_minutes).collect::<Vec<_>>(),
+            vec![10080]
+        );
+        assert!(parse_claude_limits(&text(now - 2 * 24 * 3_600_000), now).is_empty());
+    }
+
+    #[test]
     fn rfc3339() {
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(
@@ -957,9 +1055,27 @@ Options:
         fs::create_dir_all(dir.path().join("2025").join("12").join("01")).unwrap();
         fs::write(day.join("rollout-a.jsonl"), &text).unwrap();
         fs::write(day.join("notes.txt"), "x").unwrap();
-        let usage = codex_usage(dir.path(), now).unwrap();
-        assert_eq!(usage.used_pct, 40.0);
-        assert_eq!(codex_usage(&dir.path().join("missing"), now), None);
+        let limits = codex_limits(dir.path(), now);
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].used_pct, 40.0);
+        assert!(codex_limits(&dir.path().join("missing"), now).is_empty());
+    }
+
+    #[test]
+    fn codex_limits_primary_then_secondary() {
+        let now = 1_793_500_000_000;
+        let line = serde_json::json!({ "payload": { "rate_limits": {
+            "primary": { "used_percent": 12.0, "window_minutes": 300, "resets_at": 1_793_510_000 },
+            "secondary": { "used_percent": 40.0, "window_minutes": 10080, "resets_at": 1_793_900_677 }
+        } } })
+        .to_string();
+        let limits = parse_codex_limits(&line, now);
+        assert_eq!(
+            limits.iter().map(|u| u.window_minutes).collect::<Vec<_>>(),
+            vec![300, 10080]
+        );
+        // a window that already reset is left out
+        assert_eq!(parse_codex_limits(&line, 1_793_600_000_000).len(), 1);
     }
 
     #[test]

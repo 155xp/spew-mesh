@@ -212,6 +212,7 @@ where
             stdin,
             timeout: self.cfg.timeout,
             stdout_cap: self.cfg.stdout_cap,
+            keep_tail: false,
         }
     }
 

@@ -884,6 +884,7 @@ impl Sandbox {
             stdin: stdin.as_bytes().to_vec(),
             timeout,
             stdout_cap: 16 << 20,
+            keep_tail: false,
         }))
         .unwrap()
     }

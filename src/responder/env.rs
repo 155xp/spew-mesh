@@ -36,6 +36,13 @@ impl HostEnv {
         HostEnv::new(std::env::vars_os())
     }
 
+    /// The variables whose names `keep` accepts.
+    pub fn filtered(&self, keep: impl Fn(&OsStr) -> bool) -> Self {
+        HostEnv {
+            vars: self.vars.iter().filter(|(k, _)| keep(k)).cloned().collect(),
+        }
+    }
+
     /// The value of one variable.
     pub fn get(&self, key: &str) -> Option<&OsStr> {
         self.vars

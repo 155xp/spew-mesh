@@ -48,6 +48,8 @@ const CHALLENGE_PATH: &str = "/api/mesh/v1/devices/challenge";
 const DEVICES_PATH: &str = "/api/mesh/v1/devices";
 const DEVICE_SELF_PATH: &str = "/api/mesh/v1/devices/self";
 const PEERS_PATH: &str = "/api/mesh/v1/peers";
+const CAPABILITIES_PATH: &str = "/api/mesh/v1/devices/self/capabilities";
+const RUNS_PATH: &str = "/api/mesh/v1/runs";
 
 // Refresh this long before the access token's stated expiry, so a request doesn't race it.
 const REFRESH_MARGIN_MS: u64 = 30_000;
@@ -781,6 +783,32 @@ enum ErrorField {
     Code(String),
 }
 
+/// What `start_run` got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStart<T> {
+    /// This device has the run now.
+    Started(T),
+    /// Another device started it first (409 `run-taken`).
+    Taken,
+}
+
+/// A run id spew handed out, checked before it goes into a request path.
+fn run_id(id: &str) -> Result<&str, ApiError> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(id)
+    } else {
+        Err(ApiError::InvalidResponse(format!(
+            "run id {:?} isn't a plain id",
+            clean(id)
+        )))
+    }
+}
+
 /// Keeps server-provided text to one short printable line before it reaches a terminal or log.
 fn clean(s: &str) -> String {
     let mut out: String = s
@@ -1489,6 +1517,67 @@ impl SpewApi {
                 Ok(PeersFetch::Modified { etag, peers })
             }
             _ => Err(error_from(resp).await),
+        }
+    }
+
+    /// `PUT /api/mesh/v1/devices/self/capabilities`: what this computer can run on a schedule (spew#237).
+    pub async fn put_capabilities<T: Serialize>(&self, capabilities: &T) -> Result<(), ApiError> {
+        let body = serde_json::to_value(capabilities)
+            .map_err(|e| ApiError::InvalidResponse(format!("can't encode capabilities: {e}")))?;
+        let resp = self
+            .send(Method::PUT, CAPABILITIES_PATH, Body::Json(&body), None)
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(error_from(resp).await)
+        }
+    }
+
+    /// `GET /api/mesh/v1/runs/due`: this person's scheduled runs that are due on this device. Each run comes back
+    /// as raw JSON so one malformed run doesn't hide the others.
+    pub async fn due_runs(&self) -> Result<Vec<serde_json::Value>, ApiError> {
+        let path = format!("{RUNS_PATH}/due");
+        let resp = self.send(Method::GET, &path, Body::None, None).await?;
+        if !resp.status().is_success() {
+            return Err(error_from(resp).await);
+        }
+        #[derive(Deserialize)]
+        struct DueList {
+            runs: Vec<serde_json::Value>,
+        }
+        Ok(read_json::<DueList>(resp).await?.runs)
+    }
+
+    /// `POST /api/mesh/v1/runs/<id>/start`: takes a due run. [`RunStart::Taken`] when another device started it
+    /// first (409).
+    pub async fn start_run<T: DeserializeOwned>(&self, id: &str) -> Result<RunStart<T>, ApiError> {
+        let path = format!("{RUNS_PATH}/{}/start", run_id(id)?);
+        let empty = serde_json::json!({});
+        let resp = self
+            .send(Method::POST, &path, Body::Json(&empty), None)
+            .await?;
+        if resp.status() == StatusCode::CONFLICT {
+            return Ok(RunStart::Taken);
+        }
+        if !resp.status().is_success() {
+            return Err(error_from(resp).await);
+        }
+        Ok(RunStart::Started(read_json(resp).await?))
+    }
+
+    /// `POST /api/mesh/v1/runs/<id>/finish`: how a run this device started ended.
+    pub async fn finish_run<T: Serialize>(&self, id: &str, finish: &T) -> Result<(), ApiError> {
+        let path = format!("{RUNS_PATH}/{}/finish", run_id(id)?);
+        let body = serde_json::to_value(finish)
+            .map_err(|e| ApiError::InvalidResponse(format!("can't encode the run's end: {e}")))?;
+        let resp = self
+            .send(Method::POST, &path, Body::Json(&body), None)
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(error_from(resp).await)
         }
     }
 

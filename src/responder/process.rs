@@ -34,8 +34,11 @@ pub struct RunSpec {
     pub stdin: Vec<u8>,
     /// After this long the process group is killed.
     pub timeout: Duration,
-    /// Printing more than this on stdout kills the process group.
+    /// Printing more than this on stdout kills the process group, unless `keep_tail` is set.
     pub stdout_cap: usize,
+    /// Keep only the last `stdout_cap` bytes of stdout instead of killing the run when it prints more. For long
+    /// runs whose end is what matters (scheduled runs).
+    pub keep_tail: bool,
 }
 
 /// How a run ended.
@@ -258,6 +261,7 @@ async fn run_tracked(spec: RunSpec, groups: Option<RunGroups>) -> io::Result<Run
     let finished = {
         let input = spec.stdin.as_slice();
         let cap = spec.stdout_cap;
+        let keep_tail = spec.keep_tail;
         let out_buf = &mut out_buf;
         let err_buf = &mut err_buf;
         let overflow = &overflow;
@@ -272,11 +276,13 @@ async fn run_tracked(spec: RunSpec, groups: Option<RunGroups>) -> io::Result<Run
                 }
             };
             let read_out = async move {
-                if let Some(pipe) = stdout
-                    && read_capped(pipe, out_buf, cap).await
-                {
-                    overflow.store(true, Ordering::SeqCst);
-                    guard.kill();
+                if let Some(pipe) = stdout {
+                    if keep_tail {
+                        read_keep_last(pipe, out_buf, cap).await;
+                    } else if read_capped(pipe, out_buf, cap).await {
+                        overflow.store(true, Ordering::SeqCst);
+                        guard.kill();
+                    }
                 }
             };
             let read_err = async move {
@@ -351,6 +357,29 @@ async fn read_capped<R: AsyncRead + Unpin>(mut r: R, buf: &mut Vec<u8>, cap: usi
     }
 }
 
+/// Reads until EOF, keeping the last `cap` bytes.
+async fn read_keep_last<R: AsyncRead + Unpin>(mut r: R, buf: &mut Vec<u8>, cap: usize) {
+    let mut chunk = [0u8; 8192];
+    // Trimmed only once the buffer holds twice the cap, so each byte is copied O(1) times.
+    let slack = cap.saturating_mul(2).max(chunk.len());
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > slack {
+                    let cut = buf.len() - cap;
+                    buf.drain(..cut);
+                }
+            }
+        }
+    }
+    if buf.len() > cap {
+        let cut = buf.len() - cap;
+        buf.drain(..cut);
+    }
+}
+
 /// Reads until EOF, keeping the first `cap` bytes.
 async fn read_keep_first<R: AsyncRead + Unpin>(mut r: R, buf: &mut Vec<u8>, cap: usize) {
     let mut chunk = [0u8; 8192];
@@ -390,11 +419,31 @@ mod tests {
             stdin: vec![],
             timeout: Duration::from_secs(10),
             stdout_cap: 1024 * 1024,
+            keep_tail: false,
         }
     }
 
     #[tokio::test]
+    async fn keep_tail_keeps_the_end_and_lets_the_run_finish() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = script(
+            dir.path(),
+            "talk",
+            "i=0; while [ $i -lt 3000 ]; do printf 'line %05d\\n' $i; i=$((i+1)); done",
+        );
+        let mut s = spec(program, dir.path());
+        s.stdout_cap = 1000;
+        s.keep_tail = true;
+        let out = SystemRunner.run(s).await.unwrap();
+        assert_eq!(out.exit, Exit::Code(0));
+        assert_eq!(out.stdout.len(), 1000);
+        assert!(out.stdout_text().ends_with("line 02999\n"));
+    }
+
+    #[tokio::test]
     async fn passes_stdin_args_env_and_cwd() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
@@ -425,6 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_in_its_own_process_group() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
@@ -440,6 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_the_whole_group() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
@@ -463,6 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_leftover_child_holding_the_pipes_does_not_stall_the_run() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
@@ -484,6 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_over_the_cap_kills_the_run() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
@@ -499,6 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn stderr_is_drained_past_its_cap() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let program = script(
             dir.path(),
@@ -513,6 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_all_stops_the_runs_in_flight_and_forgets_finished_ones() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let groups = RunGroups::default();
         let runner = TrackedRunner::new(groups.clone());
@@ -553,6 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_program_is_a_start_error() {
+        let _forks = crate::control::place::TEST_FORKS.read().await;
         let dir = tempfile::tempdir().unwrap();
         let s = spec(dir.path().join("nope"), dir.path());
         assert!(SystemRunner.run(s).await.is_err());

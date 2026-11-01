@@ -21,6 +21,11 @@ The first release.
 
 ### Added
 
+- Scheduled runs (spew#237): the daemon runs the spew cards you schedule on the app's Schedule page, headless, in
+  the project's folder, with the agent, model and effort you picked. It tells spew which agents, models, effort
+  levels, plans and usage this computer has (never tokens), learns each project's folder from agent sessions or
+  `[schedule.folders]`, and keeps a local run history. `spew mesh schedule` shows it all; `spew mesh schedule
+  on|off` turns it on or off; `doctor` shows its state. See [docs/schedule.md](docs/schedule.md).
 - `spew mesh`, one binary with a daemon per computer that starts on demand.
 - Agent sessions on one computer ask, tell and answer each other with no sign-in and no network.
 - Peer-to-peer links between computers over iroh, admitted only by a roster: `local` (this computer only),

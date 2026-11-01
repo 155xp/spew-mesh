@@ -128,6 +128,28 @@ Serving claude in /Users/sam/code/api, read-only as sam@sam-mac/claude. Ctrl-C s
 More: `spew mesh` alone prints the daemon state and the listing; `spew mesh doctor` checks everything and says
 what to fix; `spew mesh --help` lists the rest.
 
+## Run cards on a schedule
+
+On the spew app's Schedule page, drop a card into a 5-hour session and pick the agent, model and effort. While
+your computer is on, the spew mesh daemon runs that card headless at that time, in the project's folder, and tells
+spew how it went. It is on by default once you sign in.
+
+```console
+$ spew mesh schedule
+Scheduled runs are on. While this computer is on, it runs the cards you schedule for it on the app's Schedule page.
+
+Agents:
+  Claude Code 2.1.312, Max 20x plan
+    opus (Opus 5.5): low, medium, high, xhigh, max (default medium)
+    ...
+Project folders:
+  spew  /Users/sam/Code/spew  (from agent sessions)
+```
+
+The daemon tells spew which agents, models and effort levels this computer has, and the plan each CLI is signed
+in with. It never sends tokens. `spew mesh schedule off` turns it off. [docs/schedule.md](docs/schedule.md) has
+the exact commands each agent runs and what they may do.
+
 ## How it works
 
 ```text
@@ -215,6 +237,7 @@ Codex, OpenCode), that interface is public and documented by its owner. Contribu
 - [docs/agents.md](docs/agents.md): what setup changes in Claude Code, Codex and OpenCode, how messages reach each
   one, other MCP clients, and uninstalling.
 - [docs/serve.md](docs/serve.md): answering questions with headless runs.
+- [docs/schedule.md](docs/schedule.md): running spew cards on a schedule.
 - [docs/network.md](docs/network.md): network modes, relays, mDNS, the roster file and `doctor`.
 - [docs/spew-directory.md](docs/spew-directory.md): the spew API, for anyone running their own directory.
 - [docs/protocol.md](docs/protocol.md): calls between devices and the local control socket.

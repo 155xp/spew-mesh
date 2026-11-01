@@ -41,9 +41,14 @@ use crate::identity::{DeviceIdentity, default_device_name, platform};
 use crate::link::{LinkEvent, LinkStatus, Links};
 use crate::paths::Home;
 use crate::presence::{DEBOUNCE_MS, REFRESH_MS};
+use crate::responder::env::HostEnv;
+use crate::responder::process::SystemRunner;
 use crate::roster::local::{local_username, os_user_name};
 use crate::roster::spew::UnknownPeerRefresh;
 use crate::roster::{ActiveRoster, file::POLL_SECONDS};
+use crate::schedule::detect::SystemDetect;
+use crate::schedule::scheduler::SchedulerHandle;
+use crate::schedule::{Scheduler, SchedulerConfig};
 use crate::settings::{Env, NetworkMode, Settings};
 use crate::spew_api::{ApiError, BaseUrl, Clock, SpewApi};
 use crate::store::{RosterProvider, Store};
@@ -296,8 +301,37 @@ where
         (Ok(api), NetworkMode::N0 | NetworkMode::Own) => Some(api.clone()),
         _ => None,
     };
+    // Scheduled runs (spew#237) keep their own connection to the store, so a long step never holds the courier.
+    let scheduler = match &api {
+        Ok(api) => match Store::open(&home.store_file()) {
+            Ok(store) => {
+                let process = HostEnv::from_process();
+                let env = crate::schedule::command::base_env(&process);
+                let detect = SystemDetect::new(&process, SystemRunner, opts.clock.clone());
+                Some(Scheduler::new(
+                    api.clone(),
+                    store,
+                    SystemRunner,
+                    detect,
+                    opts.clock.clone(),
+                    SchedulerConfig {
+                        home: home.clone(),
+                        user_home: opts.user_home.clone(),
+                        env,
+                    },
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "scheduled runs are off: can't open the store for them");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let schedule = scheduler.as_ref().map(Scheduler::handle);
     let control = Arc::new(Control {
         courier: courier.clone(),
+        schedule,
         api,
         identity,
         registration_pending,
@@ -319,6 +353,9 @@ where
     ];
     if let Some(api) = relay_api {
         tasks.push(tokio::spawn(relay_task(courier.clone(), api)));
+    }
+    if let Some(scheduler) = scheduler {
+        tasks.push(tokio::spawn(scheduler.run()));
     }
     tracing::info!(socket = %socket.display(), "listening");
     Ok(Some(Daemon {
@@ -645,6 +682,7 @@ struct StatusBase {
 // The control socket's request handler (6.2).
 struct Control<L: Links> {
     courier: Arc<Courier<L>>,
+    schedule: Option<SchedulerHandle>,
     api: Result<SpewApi, String>,
     identity: DeviceIdentity,
     registration_pending: Arc<AtomicBool>,
@@ -673,6 +711,14 @@ impl<L: Links> Control<L> {
         self.api
             .as_ref()
             .map_err(|e| RpcError::unavailable(format!("the spew URL can't be used: {e}")))
+    }
+
+    fn schedule(&self) -> Result<&SchedulerHandle, RpcError> {
+        self.schedule.as_ref().ok_or_else(|| {
+            RpcError::unavailable(
+                "scheduled runs aren't running in this daemon (see the daemon log)",
+            )
+        })
     }
 
     async fn roster(&self, make: fn(oneshot::Sender<()>) -> RosterCmd) -> Result<(), RpcError> {
@@ -763,6 +809,10 @@ impl<L: Links> Control<L> {
             tracing::info!(error = %e.message, "roster not refreshed after sign-in");
         }
         tracing::info!(person = %signed_in.me.username, "signed in to spew");
+        // Scheduled runs start at once instead of at the next minute.
+        if let Some(schedule) = &self.schedule {
+            schedule.kick();
+        }
         Ok(LoginResult {
             username: signed_in.me.username,
             display: signed_in.me.display,
@@ -846,6 +896,15 @@ impl<L: Links> Control<L> {
             method::AUTH_LOGOUT => {
                 let _: Empty = p(params)?;
                 r(&self.logout().await?)
+            }
+            method::SCHEDULE_STATUS => {
+                let _: Empty = p(params)?;
+                r(&self.schedule()?.status())
+            }
+            method::SCHEDULE_KICK => {
+                let _: Empty = p(params)?;
+                self.schedule()?.kick();
+                empty()
             }
             method::DAEMON_SHUTDOWN => {
                 let _: Empty = p(params)?;

@@ -84,6 +84,15 @@ pub struct State {
     pub etag: String,
     pub if_none_match: Vec<Option<String>>,
     pub log: Vec<String>,
+    /// Scheduled runs (spew#237): every capabilities body PUT, the runs `/runs/due` lists until started, the ids
+    /// whose start answers 409, and the starts and finishes received.
+    pub capabilities: Vec<Value>,
+    pub due: Vec<Value>,
+    pub taken: Vec<String>,
+    pub started: Vec<String>,
+    pub finished: Vec<(String, Value)>,
+    /// Answer finishes with 503 while set.
+    pub fail_finish: bool,
     next: u32,
 }
 
@@ -179,6 +188,12 @@ impl MockSpew {
             etag: "\"v1\"".into(),
             if_none_match: Vec::new(),
             log: Vec::new(),
+            capabilities: Vec::new(),
+            due: Vec::new(),
+            taken: Vec::new(),
+            started: Vec::new(),
+            finished: Vec::new(),
+            fail_finish: false,
             next: 0,
         }));
         let shared = state.clone();
@@ -445,6 +460,7 @@ async fn serve(mut stream: TcpStream, state: Arc<Mutex<State>>) {
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let mut out = format!("HTTP/1.1 {} {reason}\r\n", reply.status);
@@ -753,6 +769,52 @@ fn mesh_api(s: &mut State, r: &Request, grant: u32) -> Resp {
                 s.kill_grant(g);
             }
             resp(204, Value::Null)
+        }
+        ("PUT", "/api/mesh/v1/devices/self/capabilities") => {
+            s.capabilities.push(body);
+            resp(200, json!({ "ok": true }))
+        }
+        ("GET", "/api/mesh/v1/runs/due") => {
+            let runs: Vec<Value> = s
+                .due
+                .iter()
+                .filter(|r| {
+                    let id = r["id"].as_str().unwrap_or("");
+                    !s.started.iter().any(|x| x == id)
+                })
+                .cloned()
+                .collect();
+            resp(200, json!({ "runs": runs }))
+        }
+        ("POST", path) if path.starts_with("/api/mesh/v1/runs/") => {
+            let rest = path.trim_start_matches("/api/mesh/v1/runs/");
+            let Some((id, action)) = rest.split_once('/') else {
+                return api_error(404, "not-found", "no such route");
+            };
+            let id = id.to_string();
+            match action {
+                "start" => {
+                    if s.taken.contains(&id) || s.started.contains(&id) {
+                        return api_error(409, "run-taken", "another device started this run");
+                    }
+                    let Some(run) = s.due.iter().find(|r| r["id"] == id.as_str()).cloned() else {
+                        return api_error(404, "not-found", "no such run");
+                    };
+                    s.started.push(id);
+                    resp(200, run)
+                }
+                "finish" => {
+                    if s.fail_finish {
+                        return api_error(503, "unavailable", "try again later");
+                    }
+                    if !s.started.contains(&id) {
+                        return api_error(404, "not-found", "no such run");
+                    }
+                    s.finished.push((id, body));
+                    resp(200, json!({ "ok": true }))
+                }
+                _ => api_error(404, "not-found", "no such route"),
+            }
         }
         ("GET", "/api/mesh/v1/peers") => {
             let inm = r.headers.get("if-none-match").cloned();

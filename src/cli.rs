@@ -25,7 +25,8 @@ use crate::daemon::DaemonOptions;
 use crate::daemon::status::NetworkDetails;
 use crate::identity::DeviceIdentity;
 use crate::paths::{Home, user_home_from_env};
-use crate::settings::{Env, PROJECT_ENV, Settings};
+use crate::schedule::ScheduleStatus;
+use crate::settings::{Env, PROJECT_ENV, Settings, set_schedule_enabled, set_schedule_folder};
 use crate::spew_api::{Clock, OpenBrowser, SystemBrowser, SystemClock};
 use crate::wire::SessionKind;
 
@@ -135,6 +136,14 @@ enum Command {
     },
     /// Answer questions with a headless agent (a responder).
     Serve(ServeArgs),
+    /// Run spew cards on a schedule: show what this computer can run, or turn it on or off.
+    Schedule {
+        #[command(subcommand)]
+        command: Option<ScheduleCommand>,
+        /// Print the status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List your devices from spew, or revoke one.
     Devices {
         #[command(subcommand)]
@@ -190,6 +199,21 @@ enum DevicesCommand {
     Revoke {
         /// Its name, endpoint id or short id.
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScheduleCommand {
+    /// Run the cards you schedule for this computer (the default once signed in).
+    On,
+    /// Stop taking scheduled runs on this computer.
+    Off,
+    /// Run a project's scheduled cards in this folder (found on its own when it holds a .spew.json).
+    Folder {
+        /// The spew project key, such as `spew`.
+        project: String,
+        /// The folder; the current one when left out.
+        path: Option<PathBuf>,
     },
 }
 
@@ -271,6 +295,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Command::Tell { to, text, card }) => block_on(tell(&home, to, text_arg(text)?, card)),
         Some(Command::Reply { id, text }) => block_on(reply(&home, id, text_arg(text)?)),
         Some(Command::Messages { wait }) => block_on(messages(&home, wait)),
+        Some(Command::Schedule { command, json }) => block_on(schedule(&home, command, json)),
         Some(Command::Devices { command }) => block_on(devices(&home, command)),
         Some(Command::Doctor) => block_on(doctor(&home)),
         Some(Command::Daemon { command }) => daemon(&home, command),
@@ -704,6 +729,107 @@ async fn devices(home: &Home, command: Option<DevicesCommand>) -> anyhow::Result
     Ok(ExitCode::SUCCESS)
 }
 
+// How long `spew mesh schedule` waits for a daemon that just started to finish its first look at the agents.
+const SCHEDULE_FIRST_LOOK: Duration = Duration::from_secs(15);
+
+async fn schedule_status(client: &Client) -> anyhow::Result<ScheduleStatus> {
+    Ok(client
+        .call(method::SCHEDULE_STATUS, &serde_json::json!({}))
+        .await?)
+}
+
+async fn schedule(
+    home: &Home,
+    command: Option<ScheduleCommand>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let user_home = user_home_from_env();
+    if let Some(ScheduleCommand::Folder { project, path }) = &command {
+        let folder = match path {
+            Some(p) => p.clone(),
+            None => std::env::current_dir()?,
+        };
+        let folder = std::fs::canonicalize(&folder)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", folder.display()))?;
+        if !folder.is_dir() {
+            anyhow::bail!("{} isn't a folder", folder.display());
+        }
+        if project.is_empty()
+            || project.len() > 80
+            || !project
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("{project:?} isn't a spew project key (letters, digits, - and _)");
+        }
+        set_schedule_folder(home, user_home.as_deref(), project, &folder)?;
+        if let Ok(client) = Client::connect(home, &ConnectOptions::existing()).await {
+            let _ = client
+                .call_value(method::SCHEDULE_KICK, serde_json::json!({}))
+                .await;
+        }
+        println!(
+            "Scheduled {project} cards run in {} on this computer.",
+            folder.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(command) = command {
+        let on = matches!(command, ScheduleCommand::On);
+        set_schedule_enabled(home, user_home.as_deref(), on)?;
+        // A running daemon picks the change up within a minute; this makes it now.
+        let client = if on {
+            Some(connect(home).await?)
+        } else {
+            Client::connect(home, &ConnectOptions::existing())
+                .await
+                .ok()
+        };
+        if let Some(client) = &client {
+            let _ = client
+                .call_value(method::SCHEDULE_KICK, serde_json::json!({}))
+                .await;
+        }
+        if !on {
+            println!(
+                "Scheduled runs are off. This computer takes no scheduled runs until `spew mesh schedule on`."
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        println!("Scheduled runs are on.");
+        let signed_in = match &client {
+            Some(client) => schedule_status(client)
+                .await
+                .map(|s| s.signed_in)
+                .unwrap_or(true),
+            None => true,
+        };
+        if !signed_in {
+            println!("Sign in with `spew mesh login` so this computer can take runs.");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let client = connect(home).await?;
+    let mut status = schedule_status(&client).await?;
+    // A daemon that just started may still be looking at the agents.
+    if status.enabled && status.capabilities.is_none() {
+        let _ = client
+            .call_value(method::SCHEDULE_KICK, serde_json::json!({}))
+            .await;
+        let until = Instant::now() + SCHEDULE_FIRST_LOOK;
+        while status.capabilities.is_none() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            status = schedule_status(&client).await?;
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print!("{}", output::schedule(&status, now_ms()));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
     let mut fixes = 0usize;
     println!("spew mesh {}", crate::control::client::own_version());
@@ -745,6 +871,7 @@ async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
             println!("fix: {e}");
         }
     }
+    let mut schedule_shown = false;
     match Client::connect(home, &ConnectOptions::existing()).await {
         Ok(client) => {
             let (status, network) = full_status(&client).await?;
@@ -761,6 +888,14 @@ async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
             if status.roster.problem.is_some() {
                 fixes += 1;
             }
+            // An older daemon doesn't know the method; the version line above already says to restart it.
+            schedule_shown = true;
+            if let Ok(s) = schedule_status(&client).await {
+                println!("{}", output::schedule_line(&s, now_ms()));
+                if let Some(e) = &s.last_error {
+                    println!("schedule: last problem: {e}");
+                }
+            }
         }
         Err(ClientError::NotRunning) if home.is_stopped() => {
             println!(
@@ -774,6 +909,12 @@ async fn doctor(home: &Home) -> anyhow::Result<ExitCode> {
             fixes += 1;
             println!("fix: {e}");
         }
+    }
+    if !schedule_shown && let Some(s) = &settings {
+        println!(
+            "schedule: {} in settings.toml; the daemon runs scheduled cards while it runs and you're signed in",
+            if s.schedule.enabled { "on" } else { "off" }
+        );
     }
     let runner = SystemRunner::from_process_env();
     match wiring_setup(home, &runner).and_then(|s| s.doctor()) {

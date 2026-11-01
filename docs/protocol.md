@@ -154,6 +154,7 @@ The protocol is JSON-RPC 2.0, one JSON object per line in each direction. Reques
 | `directory.refresh` | Re-reads the roster now |
 | `devices.list` / `devices.revoke` | Your devices from spew |
 | `auth.login` / `auth.logout` | spew sign-in (the daemon sends the page to open as an `auth.login.url` notification) |
+| `schedule.status` / `schedule.kick` | Scheduled runs: on or off, the agents found, folders and runs / re-read settings and poll now ([schedule.md](schedule.md)) |
 | `daemon.shutdown` | Stops the daemon |
 
 - Every method that acts as a session needs the 128-bit token `session.open` returned. A session can read and

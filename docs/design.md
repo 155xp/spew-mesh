@@ -464,6 +464,7 @@ JSON-RPC error objects with codes in the -32000 range and `data.reason` set to o
 | `directory.refresh` | none | {} |
 | `devices.list` / `devices.revoke` | none / name or endpoint id | your devices from spew (14.3) / {} |
 | `auth.login` / `auth.logout` | none | the sign-in URL and then the result (14.1) / {} |
+| `schedule.status` / `schedule.kick` | none | scheduled runs: state, agents, folders, due and recent runs ([schedule.md](schedule.md)) / {} |
 | `daemon.shutdown` | none | {}, then exit |
 
 - **Tokens.** `session.open` returns a random 128-bit token. Every method that acts as a session needs it, and a
@@ -1152,6 +1153,7 @@ environment on (Codex hands MCP servers a scrubbed one).
 | `spew mesh reply <id> [text...]` | Answer a message the terminal session received. |
 | `spew mesh messages [--wait SECONDS]` | Show the terminal session's messages. |
 | `spew mesh serve <client> [...]` | Section 9. |
+| `spew mesh schedule [--json]` / `schedule on` / `schedule off` | Scheduled runs: what this computer can run, project folders and runs, or turn them on or off ([schedule.md](schedule.md)). |
 | `spew mesh devices` / `devices revoke <name>` | List your devices from spew, or revoke one you no longer control (14.3). |
 | `spew mesh doctor` | Version (and the daemon's), paths, endpoint id, roster and network state, relay status, links, wired agents and their versions, and what to fix. |
 | `spew mesh daemon run` / `daemon start` / `daemon stop` / `daemon status` | Run in the foreground, start it in the background (6.1), ask it to exit (`daemon.shutdown`), or show its state. |

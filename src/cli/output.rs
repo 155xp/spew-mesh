@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use crate::control::protocol::{Directory, Fetched, SendResult, SendStatus, SessionRow, Status};
 use crate::daemon::status::NetworkDetails;
+use crate::schedule::{FolderSource, ScheduleStatus};
 use crate::spew_api::DeviceInfo;
 use crate::text::{sanitize_line, sanitize_text};
 use crate::wire::{ActivityState, Reach, SessionKind};
@@ -357,6 +358,191 @@ pub fn devices(list: &[DeviceInfo], now: u64) -> String {
         let _ = writeln!(out, "{}", parts.join("  "));
     }
     out
+}
+
+fn window(minutes: u64) -> String {
+    match minutes {
+        300 => "5-hour".into(),
+        10_080 => "7-day".into(),
+        m if m % 1440 == 0 => format!("{}-day", m / 1440),
+        m if m % 60 == 0 => format!("{}-hour", m / 60),
+        m => format!("{m}-minute"),
+    }
+}
+
+/// How many models `spew mesh schedule` lists per agent before it says how many more there are.
+const MODELS_SHOWN: usize = 12;
+
+/// One line on scheduled runs, for `doctor`.
+pub fn schedule_line(s: &ScheduleStatus, now: u64) -> String {
+    let mut text = format!("schedule: {}", line(&s.state));
+    if s.enabled && s.signed_in {
+        if let Some(c) = &s.capabilities {
+            let agents: Vec<&str> = c.agents.iter().map(|a| a.kind.label()).collect();
+            let agents = if agents.is_empty() {
+                "no agents found".to_string()
+            } else {
+                agents.join(", ")
+            };
+            let _ = write!(
+                text,
+                ", {agents}, {} project folder{}",
+                s.folders.len(),
+                plural(s.folders.len())
+            );
+        }
+        if let Some(t) = s.polled_at {
+            let _ = write!(text, ", checked spew {} ago", age(now, t));
+        }
+    }
+    text
+}
+
+/// `spew mesh schedule`: whether scheduling is on, the agents with their plan, models, efforts and usage, the
+/// folder per project, and the due and recent runs.
+pub fn schedule(s: &ScheduleStatus, now: u64) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        match (s.enabled, s.signed_in) {
+            (false, _) => "Scheduled runs are off. `spew mesh schedule on` turns them on.".to_string(),
+            (true, false) => "Scheduled runs are on, but this computer isn't signed in to spew. Run `spew mesh login`.".to_string(),
+            (true, true) => "Scheduled runs are on. While this computer is on, it runs the cards you schedule for it on the app's Schedule page.".to_string(),
+        }
+    );
+    if let Some(caps) = &s.capabilities {
+        out.push_str("\nAgents:\n");
+        if caps.agents.is_empty() {
+            out.push_str("  none found (Claude Code, Codex and OpenCode are looked up on PATH)\n");
+        }
+        for a in &caps.agents {
+            let mut head = format!("  {} {}", a.kind.label(), line(&a.version));
+            if let Some(plan) = &a.plan {
+                let _ = write!(head, ", {} plan", line(plan));
+            }
+            let _ = writeln!(out, "{head}");
+            match &a.usage {
+                Some(u) => {
+                    let mut text = format!(
+                        "    usage: {:.0}% of the {} window",
+                        u.used_pct,
+                        window(u.window_minutes)
+                    );
+                    if let Some(r) = u.resets_at {
+                        let _ = write!(text, ", resets in {}", age(r, now));
+                    }
+                    let _ = writeln!(out, "{text}");
+                }
+                None => out.push_str("    usage: not reported\n"),
+            }
+            if a.models.is_empty() {
+                out.push_str("    models: none listed\n");
+            }
+            for m in a.models.iter().take(MODELS_SHOWN) {
+                let mut row = format!("    {}", line(&m.id));
+                if m.label != m.id {
+                    let _ = write!(row, " ({})", line(&m.label));
+                }
+                if !m.efforts.is_empty() {
+                    let efforts: Vec<String> = m.efforts.iter().map(|e| line(e)).collect();
+                    let _ = write!(row, ": {}", efforts.join(", "));
+                    if let Some(d) = &m.default_effort {
+                        let _ = write!(row, " (default {})", line(d));
+                    }
+                }
+                let _ = writeln!(out, "{row}");
+            }
+            if a.models.len() > MODELS_SHOWN {
+                let _ = writeln!(
+                    out,
+                    "    and {} more (`spew mesh schedule --json` lists them all)",
+                    a.models.len() - MODELS_SHOWN
+                );
+            }
+        }
+    }
+    out.push_str("\nProject folders:\n");
+    if s.folders.is_empty() {
+        out.push_str(
+            "  none yet. Start an agent in a folder whose .spew.json names the project, or set it under [schedule.folders] in settings.toml.\n",
+        );
+    }
+    for f in &s.folders {
+        let source = match f.source {
+            FolderSource::Settings => "from settings.toml",
+            FolderSource::Sessions => "from agent sessions",
+            FolderSource::Found => "found under your home folder",
+        };
+        let _ = writeln!(
+            out,
+            "  {}  {}  ({source})",
+            line(&f.project),
+            line(&f.folder)
+        );
+    }
+    if !s.due.is_empty() {
+        out.push_str("\nDue now:\n");
+        for r in &s.due {
+            let _ = writeln!(
+                out,
+                "  {} \"{}\"  {} {} {}: {}",
+                line(&r.issue),
+                line(&r.title),
+                line(&r.agent),
+                line(&r.model),
+                line(&r.effort),
+                line(&r.note)
+            );
+        }
+    }
+    if !s.recent.is_empty() {
+        out.push_str("\nRecent runs here:\n");
+        for r in &s.recent {
+            let mut row = format!(
+                "  {} ago  {} \"{}\"  {} {} {}: {}",
+                age(now, r.started_at),
+                line(&r.issue),
+                line(&r.title),
+                line(&r.agent),
+                line(&r.model),
+                line(&r.effort),
+                line(&r.status)
+            );
+            if let Some(code) = r.exit_code {
+                let _ = write!(row, " (exit {code})");
+            }
+            if !r.reported && r.status != "running" {
+                row.push_str(", not yet told to spew");
+            }
+            let _ = writeln!(out, "{row}");
+        }
+    }
+    let mut times = Vec::new();
+    if let Some(t) = s.reported_at {
+        times.push(format!(
+            "told spew what this computer can run {} ago",
+            age(now, t)
+        ));
+    }
+    if let Some(t) = s.polled_at {
+        times.push(format!("checked for due runs {} ago", age(now, t)));
+    }
+    if !times.is_empty() {
+        let _ = writeln!(out, "\n{}.", capitalize_first(&times.join("; ")));
+    }
+    if let Some(e) = &s.last_error {
+        let _ = writeln!(out, "Last problem: {}", line(e));
+    }
+    out
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]

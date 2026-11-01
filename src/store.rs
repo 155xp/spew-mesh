@@ -155,8 +155,41 @@ const V2: &str = r#"
 ALTER TABLE sessions ADD COLUMN had_connection INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// Scheduled runs (spew#237): the folder this computer uses for each spew project, learned from agent sessions, and
+// the runs the daemon started.
+const V3: &str = r#"
+CREATE TABLE project_folders (
+    project      TEXT NOT NULL,
+    folder       TEXT NOT NULL,
+    last_used_at INTEGER NOT NULL,
+    PRIMARY KEY (project, folder)
+) WITHOUT ROWID;
+
+CREATE TABLE schedule_runs (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    issue       TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    agent       TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    effort      TEXT NOT NULL,
+    folder      TEXT NOT NULL,
+    run_at      INTEGER NOT NULL,
+    started_at  INTEGER NOT NULL,
+    finished_at INTEGER,
+    status      TEXT NOT NULL CHECK (status IN ('running', 'done', 'failed')),
+    exit_code   INTEGER,
+    summary     TEXT,
+    reported    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX schedule_runs_started ON schedule_runs (started_at);
+"#;
+
 /// The migration steps; step `n` takes `user_version` from `n` to `n + 1`. Steps are only ever appended.
-const MIGRATIONS: &[&str] = &[V1, V2];
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
+
+/// How long the local history of scheduled runs is kept.
+pub const SCHEDULE_RUN_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The schema version this build writes.
 pub fn schema_version() -> u32 {
@@ -540,7 +573,64 @@ pub struct Swept {
     pub serve_conversations: usize,
 }
 
-/// SHA-256 of a session token as lowercase hex, the only form of a token the store keeps.
+/// A folder an agent session worked in whose `.spew.json` named a project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFolder {
+    /// The project key.
+    pub project: String,
+    /// The session's working directory.
+    pub cwd: String,
+    /// When the session was last seen, ms.
+    pub last_seen_at: u64,
+}
+
+/// A remembered project folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFolder {
+    /// The project key.
+    pub project: String,
+    /// The folder holding the project's `.spew.json`.
+    pub folder: String,
+    /// When an agent session last worked there, ms.
+    pub last_used_at: u64,
+}
+
+/// One scheduled run this device started (spew#237).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRunRecord {
+    /// spew's run id.
+    pub id: String,
+    /// The project key.
+    pub project: String,
+    /// The card, `spew#42`.
+    pub issue: String,
+    /// The card's title.
+    pub title: String,
+    /// claude, codex or opencode.
+    pub agent: String,
+    /// The model the CLI was given.
+    pub model: String,
+    /// The effort the CLI was given.
+    pub effort: String,
+    /// Where it ran.
+    pub folder: String,
+    /// When spew scheduled it, ms.
+    pub run_at: u64,
+    /// When it started here, ms.
+    pub started_at: u64,
+    /// When it ended, ms.
+    pub finished_at: Option<u64>,
+    /// running, done or failed.
+    pub status: String,
+    /// The CLI's exit status, when it exited by itself.
+    pub exit_code: Option<i32>,
+    /// The end of what it printed, or why it failed.
+    pub summary: Option<String>,
+    /// Whether spew has heard how it ended.
+    pub reported: bool,
+}
+
+/// SHA-256 of a session token as lowercase hex, the only form of a token the store keeps./// SHA-256 of a session token as lowercase hex, the only form of a token the store keeps.
 pub fn hash_token(token: &str) -> String {
     Sha256::digest(token.as_bytes())
         .iter()
@@ -1444,6 +1534,186 @@ impl Store {
             )
             .optional()
             .ctx("read a roster")
+    }
+
+    /// The working folders of agent sessions whose room came from a `.spew.json`, newest first.
+    pub fn session_folders(&self) -> Result<Vec<SessionFolder>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT room, cwd, MAX(last_seen_at) AS seen FROM sessions \
+                 WHERE room_source = 'spew-json' AND room IS NOT NULL AND cwd IS NOT NULL \
+                 GROUP BY room, cwd ORDER BY seen DESC",
+            )
+            .ctx("prepare a session folder query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SessionFolder {
+                    project: row.get(0)?,
+                    cwd: row.get(1)?,
+                    last_seen_at: uint(row.get(2)?),
+                })
+            })
+            .ctx("read session folders")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .ctx("read session folders")
+    }
+
+    /// Remembers that an agent worked on `project` in `folder` at `at`; an older time never replaces a newer one.
+    pub fn put_project_folder(
+        &self,
+        project: &str,
+        folder: &str,
+        at: u64,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO project_folders (project, folder, last_used_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (project, folder) DO UPDATE SET \
+                 last_used_at = MAX(last_used_at, excluded.last_used_at)",
+                params![project, folder, int(at)],
+            )
+            .ctx("store a project folder")?;
+        Ok(())
+    }
+
+    /// Every remembered project folder, the most recently used first.
+    pub fn project_folders(&self) -> Result<Vec<ProjectFolder>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT project, folder, last_used_at FROM project_folders \
+                 ORDER BY last_used_at DESC, project, folder",
+            )
+            .ctx("prepare a project folder query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProjectFolder {
+                    project: row.get(0)?,
+                    folder: row.get(1)?,
+                    last_used_at: uint(row.get(2)?),
+                })
+            })
+            .ctx("read project folders")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .ctx("read project folders")
+    }
+
+    /// Records a scheduled run that just started, or replaces the record of one with the same id.
+    pub fn put_schedule_run(&self, r: &ScheduleRunRecord) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO schedule_runs (id, project, issue, title, agent, model, effort, folder, \
+                 run_at, started_at, finished_at, status, exit_code, summary, reported) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    r.id,
+                    r.project,
+                    r.issue,
+                    r.title,
+                    r.agent,
+                    r.model,
+                    r.effort,
+                    r.folder,
+                    int(r.run_at),
+                    int(r.started_at),
+                    r.finished_at.map(int),
+                    r.status,
+                    r.exit_code,
+                    r.summary,
+                    r.reported,
+                ],
+            )
+            .ctx("store a scheduled run")?;
+        Ok(())
+    }
+
+    /// Records how a scheduled run ended.
+    pub fn finish_schedule_run(
+        &self,
+        id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        summary: &str,
+        at: u64,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE schedule_runs SET status = ?2, exit_code = ?3, summary = ?4, finished_at = ?5 \
+                 WHERE id = ?1",
+                params![id, status, exit_code, summary, int(at)],
+            )
+            .ctx("finish a scheduled run")?;
+        Ok(())
+    }
+
+    /// Marks a scheduled run's end as told to spew.
+    pub fn mark_schedule_run_reported(&self, id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE schedule_runs SET reported = 1 WHERE id = ?1",
+                params![id],
+            )
+            .ctx("mark a scheduled run reported")?;
+        Ok(())
+    }
+
+    /// The most recent scheduled runs, newest first.
+    pub fn schedule_runs(&self, limit: usize) -> Result<Vec<ScheduleRunRecord>, StoreError> {
+        self.schedule_runs_where("1 = 1", limit)
+    }
+
+    /// Scheduled runs that ended (or were left running by an earlier daemon) and spew hasn't heard about.
+    pub fn unreported_schedule_runs(&self) -> Result<Vec<ScheduleRunRecord>, StoreError> {
+        self.schedule_runs_where("reported = 0", 1000)
+    }
+
+    fn schedule_runs_where(
+        &self,
+        filter: &str,
+        limit: usize,
+    ) -> Result<Vec<ScheduleRunRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT id, project, issue, title, agent, model, effort, folder, run_at, started_at, \
+                 finished_at, status, exit_code, summary, reported FROM schedule_runs WHERE {filter} \
+                 ORDER BY started_at DESC LIMIT ?1"
+            ))
+            .ctx("prepare a scheduled run query")?;
+        let rows = stmt
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(ScheduleRunRecord {
+                    id: row.get(0)?,
+                    project: row.get(1)?,
+                    issue: row.get(2)?,
+                    title: row.get(3)?,
+                    agent: row.get(4)?,
+                    model: row.get(5)?,
+                    effort: row.get(6)?,
+                    folder: row.get(7)?,
+                    run_at: uint(row.get(8)?),
+                    started_at: uint(row.get(9)?),
+                    finished_at: row.get::<_, Option<i64>>(10)?.map(uint),
+                    status: row.get(11)?,
+                    exit_code: row.get(12)?,
+                    summary: row.get(13)?,
+                    reported: row.get(14)?,
+                })
+            })
+            .ctx("read scheduled runs")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .ctx("read scheduled runs")
+    }
+
+    /// Deletes scheduled runs that started more than 30 days ago and whose end spew has heard.
+    pub fn sweep_schedule_runs(&self, now: u64) -> Result<usize, StoreError> {
+        self.conn
+            .execute(
+                "DELETE FROM schedule_runs WHERE reported = 1 AND started_at < ?1",
+                params![int(now.saturating_sub(SCHEDULE_RUN_RETENTION_MS))],
+            )
+            .ctx("sweep scheduled runs")
     }
 
     /// The daily sweep (11.1): messages and receipts older than 30 days, sessions that ended more than 30 days ago,

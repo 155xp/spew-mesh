@@ -340,6 +340,13 @@ fn new_session(command: &mut Command) {
     }
 }
 
+/// A fork holds a copy of every descriptor of the test process until its child closes them or execs, and
+/// `new_session` closes them one at a time. Tests that need a dropped lock, socket or pipe end to be gone at once
+/// hold this: the slow fork and the tests that check a lock or socket is released take it exclusively, tests that
+/// spawn runs take it shared.
+#[cfg(test)]
+pub(crate) static TEST_FORKS: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +386,7 @@ mod tests {
 
     #[test]
     fn the_lock_is_exclusive() {
+        let _forks = TEST_FORKS.blocking_write();
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::at(tmp.path()).unwrap();
         assert!(lock_is_free(&home));
@@ -395,6 +403,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn a_new_session_keeps_no_inherited_descriptors() {
+        let _forks = TEST_FORKS.blocking_write();
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
@@ -445,6 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_is_private_and_stale_sockets_go() {
+        let _forks = TEST_FORKS.write().await;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("ipc.sock");
         let listener = bind_private(&path).unwrap();
@@ -470,6 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_crashed_daemons_socket_is_removed_and_nothing_else() {
+        let _forks = TEST_FORKS.write().await;
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::at(tmp.path().join("h")).unwrap();
         home.ensure().unwrap();
@@ -487,6 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_socket_another_daemon_answers_on_stays() {
+        let _forks = TEST_FORKS.write().await;
         // A copied home names the other home's socket in run/socket; that daemon is still listening.
         let tmp = tempfile::tempdir().unwrap();
         let home = Home::at(tmp.path().join("copy")).unwrap();

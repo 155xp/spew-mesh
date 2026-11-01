@@ -49,6 +49,10 @@ pub mod method {
     pub const AUTH_LOGOUT: &str = "auth.logout";
     /// Asks the daemon to exit.
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
+    /// Scheduled runs: on or off, the agents found, folders and runs (spew#237).
+    pub const SCHEDULE_STATUS: &str = "schedule.status";
+    /// Asks the scheduler to re-read settings and poll spew now.
+    pub const SCHEDULE_KICK: &str = "schedule.kick";
     /// Notification the daemon sends during `auth.login` with the page to open.
     pub const AUTH_LOGIN_URL: &str = "auth.login.url";
 }

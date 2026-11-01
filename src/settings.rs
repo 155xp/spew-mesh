@@ -1,5 +1,6 @@
 //! settings.toml (11): loading, fail-closed validation, defaults, environment overrides, and a session's room.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
@@ -157,6 +158,21 @@ pub struct ServeSettings {
     pub max_budget_usd: f64,
 }
 
+/// `[schedule]`: running spew cards on a schedule (spew#237).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSettings {
+    /// Whether the daemon runs scheduled cards once signed in to spew.
+    pub enabled: bool,
+    /// How long one scheduled run may take before its process group is killed.
+    pub timeout_minutes: u64,
+    /// `[schedule.folders]`: the folder to run each project's cards in, absolute. These win over the folders the
+    /// daemon learns from agent sessions.
+    pub folders: BTreeMap<String, PathBuf>,
+}
+
+/// The default `[schedule] timeout_minutes`.
+pub const SCHEDULE_TIMEOUT_MINUTES: u64 = 120;
+
 /// Validated settings (11).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -174,6 +190,8 @@ pub struct Settings {
     pub presence: PresenceSettings,
     /// `[serve]`.
     pub serve: ServeSettings,
+    /// `[schedule]`.
+    pub schedule: ScheduleSettings,
 }
 
 /// Why settings or the environment are unusable. The daemon refuses to start on any of these (11).
@@ -220,6 +238,8 @@ struct RawSettings {
     presence: RawPresence,
     #[serde(default)]
     serve: RawServe,
+    #[serde(default)]
+    schedule: RawSchedule,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -265,6 +285,14 @@ struct RawServe {
     max_runs_per_person_per_hour: Option<u32>,
     max_runs_per_hour: Option<u32>,
     max_budget_usd: Option<Number>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSchedule {
+    enabled: Option<bool>,
+    timeout_minutes: Option<u64>,
+    folders: Option<BTreeMap<String, String>>,
 }
 
 // TOML keeps integers and floats apart; `max_budget_usd = 1` should still mean one dollar.
@@ -368,6 +396,11 @@ impl Settings {
                 max_runs_per_person_per_hour: 10,
                 max_runs_per_hour: 30,
                 max_budget_usd: 0.50,
+            },
+            schedule: ScheduleSettings {
+                enabled: true,
+                timeout_minutes: SCHEDULE_TIMEOUT_MINUTES,
+                folders: BTreeMap::new(),
             },
         }
     }
@@ -564,6 +597,38 @@ impl Settings {
             max_budget_usd: budget,
         };
 
+        let mut folders = BTreeMap::new();
+        for (project, folder) in raw.schedule.folders.unwrap_or_default() {
+            if !is_room(&project) {
+                return Err(format!(
+                    "[schedule.folders] {project} is not a project key ({PERSON_RULE})"
+                ));
+            }
+            if (folder == "~" || folder.starts_with("~/")) && user_home.is_none() {
+                return Err(format!(
+                    "[schedule.folders] {project} = \"{folder}\" starts with ~ but HOME is not set"
+                ));
+            }
+            let path = expand_tilde(&folder, user_home);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "[schedule.folders] {project} = \"{folder}\" must be an absolute path or start with ~/"
+                ));
+            }
+            folders.insert(project, path);
+        }
+        let schedule = ScheduleSettings {
+            enabled: raw.schedule.enabled.unwrap_or(true),
+            timeout_minutes: in_range(
+                raw.schedule.timeout_minutes,
+                SCHEDULE_TIMEOUT_MINUTES,
+                1,
+                24 * 60,
+                "[schedule] timeout_minutes",
+            )?,
+            folders,
+        };
+
         Ok(Settings {
             username,
             device_name,
@@ -572,6 +637,7 @@ impl Settings {
             network,
             presence,
             serve,
+            schedule,
         })
     }
 
@@ -581,6 +647,81 @@ impl Settings {
             self.network.mdns = false;
         }
     }
+}
+
+/// Sets `[schedule] enabled` in `<home>/settings.toml`, keeping the rest of the file as it is. The edited text is
+/// checked before it is written, so a broken file stays untouched and the error says why.
+pub fn set_schedule_enabled(
+    home: &Home,
+    user_home: Option<&Path>,
+    enabled: bool,
+) -> Result<(), SettingsError> {
+    let path = home.settings_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(SettingsError::Read { path, error }),
+    };
+    // Checked first, so the error is about the person's file rather than the edit.
+    Settings::parse(&text, &path, home, user_home)?;
+    let mut doc: toml_edit::DocumentMut =
+        text.parse()
+            .map_err(|e: toml_edit::TomlError| SettingsError::Invalid {
+                path: path.clone(),
+                message: e.message().to_string(),
+            })?;
+    if !doc.contains_table("schedule") {
+        doc["schedule"] = toml_edit::table();
+    }
+    doc["schedule"]["enabled"] = toml_edit::value(enabled);
+    let edited = doc.to_string();
+    Settings::parse(&edited, &path, home, user_home)?;
+    home.ensure().map_err(|e| SettingsError::Invalid {
+        path: path.clone(),
+        message: e.to_string(),
+    })?;
+    crate::paths::write_atomic(&path, edited.as_bytes()).map_err(|e| SettingsError::Invalid {
+        path: path.clone(),
+        message: e.to_string(),
+    })
+}
+
+/// Sets `[schedule.folders] <project> = "<folder>"` in `<home>/settings.toml`: the folder this computer runs that
+/// project's scheduled cards in. Like `set_schedule_enabled`, the edit is checked before it is written.
+pub fn set_schedule_folder(
+    home: &Home,
+    user_home: Option<&Path>,
+    project: &str,
+    folder: &Path,
+) -> Result<(), SettingsError> {
+    let path = home.settings_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(SettingsError::Read { path, error }),
+    };
+    Settings::parse(&text, &path, home, user_home)?;
+    let invalid = |message: String| SettingsError::Invalid {
+        path: path.clone(),
+        message,
+    };
+    let folder = folder
+        .to_str()
+        .ok_or_else(|| invalid("the folder path isn't UTF-8".into()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| invalid(e.message().to_string()))?;
+    if !doc.contains_table("schedule") {
+        doc["schedule"] = toml_edit::table();
+    }
+    if doc["schedule"].get("folders").is_none() {
+        doc["schedule"]["folders"] = toml_edit::table();
+    }
+    doc["schedule"]["folders"][project] = toml_edit::value(folder);
+    let edited = doc.to_string();
+    Settings::parse(&edited, &path, home, user_home)?;
+    home.ensure().map_err(|e| invalid(e.to_string()))?;
+    crate::paths::write_atomic(&path, edited.as_bytes()).map_err(|e| invalid(e.to_string()))
 }
 
 /// The spew mesh variables from an environment (11).
@@ -693,7 +834,8 @@ struct SpewJson {
     project: Option<String>,
 }
 
-fn read_spew_json(path: &Path) -> Result<String, String> {
+/// The project key a `.spew.json` names, or why it names none.
+pub fn read_spew_json(path: &Path) -> Result<String, String> {
     let meta =
         std::fs::metadata(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
     if meta.len() > SPEW_JSON_MAX_BYTES {
@@ -1117,5 +1259,83 @@ max_budget_usd = 1
             resolve_room(None, tmp.path(), None).source,
             RoomSource::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn schedule_settings() {
+        let s = parse("").unwrap();
+        assert!(s.schedule.enabled);
+        assert_eq!(s.schedule.timeout_minutes, 120);
+        assert!(s.schedule.folders.is_empty());
+        let s = parse(
+            "[schedule]\nenabled = false\ntimeout_minutes = 30\n[schedule.folders]\nspew = \"~/Code/spew\"\nweb = \"/srv/web\"\n",
+        )
+        .unwrap();
+        assert!(!s.schedule.enabled);
+        assert_eq!(s.schedule.timeout_minutes, 30);
+        assert_eq!(s.schedule.folders["spew"], Path::new("/home/sam/Code/spew"));
+        assert_eq!(s.schedule.folders["web"], Path::new("/srv/web"));
+        assert!(error("[schedule]\ntimeout_minutes = 0\n").contains("timeout_minutes"));
+        assert!(error("[schedule.folders]\nspew = \"relative/path\"\n").contains("absolute"));
+        assert!(error("[schedule.folders]\n\"Bad Key\" = \"/x\"\n").contains("project key"));
+        assert!(error("[schedule]\nauto = true\n").contains("auto"));
+    }
+
+    #[test]
+    fn schedule_on_and_off_keep_the_rest_of_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path()).unwrap();
+        set_schedule_enabled(&home, None, false).unwrap();
+        let text = std::fs::read_to_string(home.settings_file()).unwrap();
+        assert!(
+            !Settings::parse(&text, Path::new("s"), &home, None)
+                .unwrap()
+                .schedule
+                .enabled
+        );
+
+        std::fs::write(
+            home.settings_file(),
+            "# mine\nusername = \"sam\"\n\n[schedule]\nenabled = false # keep\ntimeout_minutes = 45\n",
+        )
+        .unwrap();
+        set_schedule_enabled(&home, None, true).unwrap();
+        let text = std::fs::read_to_string(home.settings_file()).unwrap();
+        assert!(text.starts_with("# mine\nusername = \"sam\"\n"), "{text}");
+        assert!(text.contains("timeout_minutes = 45"), "{text}");
+        let s = Settings::parse(&text, Path::new("s"), &home, None).unwrap();
+        assert!(s.schedule.enabled);
+
+        std::fs::write(home.settings_file(), "[schedule]\nenabled = \"maybe\"\n").unwrap();
+        assert!(set_schedule_enabled(&home, None, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.settings_file()).unwrap(),
+            "[schedule]\nenabled = \"maybe\"\n"
+        );
+    }
+
+    #[test]
+    fn schedule_folder_is_set_and_kept_beside_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = Home::at(tmp.path().join("mesh")).unwrap();
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(
+            home.settings_file(),
+            "# mine\n[schedule]\ntimeout_minutes = 45\n",
+        )
+        .unwrap();
+        let web = tmp.path().join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        set_schedule_folder(&home, None, "web", &web).unwrap();
+        set_schedule_folder(&home, None, "spew", tmp.path()).unwrap();
+        let text = std::fs::read_to_string(home.settings_file()).unwrap();
+        assert!(text.starts_with("# mine\n"), "{text}");
+        let s = Settings::parse(&text, Path::new("s"), &home, None).unwrap();
+        assert_eq!(s.schedule.timeout_minutes, 45);
+        assert_eq!(s.schedule.folders["web"], web);
+        assert_eq!(s.schedule.folders["spew"], tmp.path());
+        // a key settings.toml refuses leaves the file alone
+        assert!(set_schedule_folder(&home, None, "Bad Key", &web).is_err());
+        assert_eq!(std::fs::read_to_string(home.settings_file()).unwrap(), text);
     }
 }

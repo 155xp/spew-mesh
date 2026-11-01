@@ -655,6 +655,7 @@ pub async fn canary_check<R: ProcessRunner>(runner: &R, c: &Canary<'_>) -> Resul
         stdin: Vec::new(),
         timeout: c.timeout,
         stdout_cap: 64 * 1024,
+        keep_tail: false,
     };
     let run = |file: &Path| {
         let spec = read(file);

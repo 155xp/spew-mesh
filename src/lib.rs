@@ -14,6 +14,7 @@ pub mod presence;
 pub mod resolve;
 pub mod responder;
 pub mod roster;
+pub mod schedule;
 pub mod sessions;
 pub mod settings;
 pub mod spew_api;
